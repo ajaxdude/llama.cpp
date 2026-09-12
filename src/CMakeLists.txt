@@ -19,6 +19,7 @@ add_library(llama
             llama-cparams.cpp
             llama-dsv41.cpp
             llama-dsv41-engram.cpp
+            llama-expert-store.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

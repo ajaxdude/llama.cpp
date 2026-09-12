@@ -1720,12 +1720,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // With the n-gram table left on disk, a populated mapping would pull the table's
     // third of the file resident for nothing; readahead alone carries the sequential load.
-    ml.init_mappings(!params.ple_on_disk, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    llama_mlocks * mmap_locks = use_mlock && !ml.external.any() ? &pimpl->mlock_mmaps : nullptr;
+    ml.init_mappings(!params.ple_on_disk, mmap_locks);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
+    bool keep_mappings = false;
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
@@ -1761,9 +1763,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        bool context_mmap_safe = true;
+        if (ml.use_mmap && ml.external.any() && !is_lazy_mapped) {
+            for (uint32_t idx = 0; idx < ml.files.size(); ++idx) {
+                void * addr = nullptr;
+                size_t first;
+                size_t last;
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first < last && ml.external.intersects(idx, first, last)) {
+                    context_mmap_safe = false;
+                    break;
+                }
+            }
+        }
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && (use_mmap_buffer || is_lazy_mapped) &&
+                context_mmap_safe && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            keep_mappings = true;
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
@@ -1857,12 +1874,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, mmap_locks, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    if (use_mmap_buffer) {
+    if (keep_mappings) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
