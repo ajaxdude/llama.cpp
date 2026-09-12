@@ -499,6 +499,114 @@ class TestWatchdogBehavior(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertFalse(self._process_is_running(process_id))
 
+    def test_soft_limit_descendant_escalation_is_grace_timeout(self) -> None:
+        child_code = (
+            "import os,signal,sys,time\n"
+            "def stop(_signal,_frame):\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM,stop)\n"
+            "grandchild=os.fork()\n"
+            "if grandchild == 0:\n"
+            " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            " time.sleep(30)\n"
+            "else:\n"
+            " open(sys.argv[1],'w').write("
+            "f'{os.getpid()} {grandchild}\\n')\n"
+            " time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pid_file = root / "pids"
+            audit_path = root / "audit.jsonl"
+            (root / "meminfo").write_text(
+                "MemTotal: 3145728 kB\n"
+                "MemAvailable: 2621440 kB\n",
+                encoding="utf-8",
+            )
+            (root / "swaps").write_text(
+                "Filename Type Size Used Priority\n",
+                encoding="utf-8",
+            )
+            with audit_path.open("w", encoding="utf-8") as audit:
+                wrapper = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--procfs-root",
+                        str(root),
+                        "--soft-gib",
+                        "1",
+                        "--emergency-gib",
+                        "2",
+                        "--grace-seconds",
+                        "0.2",
+                        "--sample-interval-seconds",
+                        "0.05",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(pid_file),
+                    ],
+                    stderr=audit,
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not pid_file.exists():
+                    if time.monotonic() >= deadline:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                        self.fail("soft-limit process group did not start")
+                    time.sleep(0.01)
+                child_pid, grandchild_pid = (
+                    int(value)
+                    for value in pid_file.read_text(
+                        encoding="utf-8"
+                    ).split()
+                )
+                next_meminfo = root / "meminfo.next"
+                next_meminfo.write_text(
+                    "MemTotal: 3145728 kB\n"
+                    "MemAvailable: 1572864 kB\n",
+                    encoding="utf-8",
+                )
+                next_meminfo.replace(root / "meminfo")
+                try:
+                    wrapper.wait(timeout=5)
+                finally:
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            forwarded = [
+                record["signal"]
+                for record in records
+                if record["event"] == "process_group_signal"
+            ]
+            final = records[-1]
+            self.assertEqual(wrapper.returncode, watchdog.EXIT_GRACE_TIMEOUT)
+            self.assertEqual(final["classification"], "grace_timeout")
+            self.assertEqual(final["child_returncode"], 0)
+            self.assertEqual(forwarded, ["SIGTERM", "SIGKILL"])
+            for process_id in (child_pid, grandchild_pid):
+                deadline = time.monotonic() + 2
+                while (
+                    self._process_is_running(process_id)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertFalse(self._process_is_running(process_id))
+
     def test_configuration_rejects_non_finite_timing(self) -> None:
         config = watchdog.WatchdogConfig(
             command=("fake-command",),

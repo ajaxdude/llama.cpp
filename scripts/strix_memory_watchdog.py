@@ -385,8 +385,10 @@ def _graceful_cleanup(
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
     process_group_status: str = "active",
+    escalation_result: tuple[str, int, str] | None = None,
     error: str | None = None,
 ) -> int:
+    escalated = False
     try:
         if graceful_signal is not None:
             process_group_status = signal_group(
@@ -412,8 +414,14 @@ def _graceful_cleanup(
             sleeper(min(0.05, deadline - monotonic()))
         child.poll()
         if group_alive(child.pid):
+            escalated = True
             process_group_status = signal_group(
                 child.pid, signal.SIGKILL
+            )
+            signal_reason = (
+                escalation_result[2]
+                if escalation_result is not None
+                else reason
             )
             audit.emit(
                 "process_group_signal",
@@ -423,7 +431,7 @@ def _graceful_cleanup(
                     child,
                     child.poll(),
                     process_group_status,
-                    reason,
+                    signal_reason,
                 ),
                 signal="SIGKILL",
             )
@@ -459,6 +467,8 @@ def _graceful_cleanup(
                 str(exc),
             )
 
+    if escalated and escalation_result is not None:
+        classification, exit_code, reason = escalation_result
     return _emit_final(
         audit,
         classification,
@@ -528,6 +538,16 @@ def _monitor_child(
                     monotonic,
                     sleeper,
                     group_status,
+                    (
+                        (
+                            "grace_timeout",
+                            EXIT_GRACE_TIMEOUT,
+                            "soft-threshold grace period expired with "
+                            "process group members still running",
+                        )
+                        if soft_stop
+                        else None
+                    ),
                 )
             return _emit_final(
                 audit,
