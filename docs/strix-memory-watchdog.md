@@ -13,6 +13,8 @@ The wrapper performs these checks and actions:
 - It sends `SIGTERM` to the process group at 116 GiB used.
 - It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.
 - It sends `SIGKILL` and fails if swap appears or required procfs data becomes unavailable during execution.
+- It forwards wrapper `SIGINT` or `SIGTERM` to the process group, waits the configured grace period, then sends `SIGKILL` if any group member remains.
+- It applies the same bounded process-group cleanup if an unexpected post-launch error occurs.
 - It propagates an unmonitored child exit code. A signal exit uses the shell convention `128 + signal`.
 
 The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 120 GiB ceiling. The default sample interval is one second. This margin cannot guarantee the ceiling for a workload that can allocate more than 2 GiB between samples. Lower `--emergency-gib` or shorten `--sample-interval-seconds` for such a workload.
@@ -31,6 +33,7 @@ Exit classifications are authoritative in the final JSON record. Operational fai
 | 5 | emergency threshold reached |
 | 6 | soft-threshold grace period expired |
 | 7 | process-group signaling or termination failure |
+| 70 | unexpected post-launch error |
 | 127 | command launch failure |
 
 No model, backend, or ROCm package is required to run the unit tests:

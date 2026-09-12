@@ -5,10 +5,12 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +115,9 @@ class Harness:
             self.signal_handler(self.process, signal_number)
         return f"{signal.Signals(signal_number).name.lower()}_sent"
 
+    def group_alive(self, process_group_id: int) -> bool:
+        return self.process.returncode is None
+
     def run(self, **overrides: Any) -> int:
         config = watchdog.WatchdogConfig(
             command=("fake-command",),
@@ -128,6 +133,7 @@ class Harness:
             audit=self.audit,
             launcher=self.launcher,
             signal_group=self.signal_group,
+            group_alive=self.group_alive,
             monotonic=self.clock.monotonic,
             sleeper=self.clock.sleep,
         )
@@ -196,6 +202,128 @@ class TestProcfsParsing(unittest.TestCase):
 
 
 class TestWatchdogBehavior(unittest.TestCase):
+    @staticmethod
+    def _process_is_running(process_id: int) -> bool:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(process_id)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        return result.returncode == 0 and not result.stdout.lstrip().startswith(
+            "Z"
+        )
+
+    def test_parent_signals_leave_no_child_or_grandchild(self) -> None:
+        child_code = (
+            "import os,signal,sys,time;"
+            "signal.signal(signal.SIGINT,signal.SIG_IGN);"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "grandchild=os.fork();"
+            "\nif grandchild == 0:\n"
+            " time.sleep(30)\n"
+            "else:\n"
+            " open(sys.argv[1],'w').write("
+            "f'{os.getpid()} {grandchild}\\n');"
+            " time.sleep(30)\n"
+        )
+        for signal_number in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=signal.Signals(signal_number).name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    pid_file = root / "pids"
+                    (root / "meminfo").write_text(
+                        "MemTotal: 131072 kB\n"
+                        "MemAvailable: 65536 kB\n",
+                        encoding="utf-8",
+                    )
+                    (root / "swaps").write_text(
+                        "Filename Type Size Used Priority\n",
+                        encoding="utf-8",
+                    )
+                    audit_path = root / "audit.jsonl"
+                    with audit_path.open("w", encoding="utf-8") as audit:
+                        wrapper = subprocess.Popen(
+                            [
+                                sys.executable,
+                                str(SCRIPT_PATH),
+                                "--procfs-root",
+                                str(root),
+                                "--grace-seconds",
+                                "0.2",
+                                "--sample-interval-seconds",
+                                "0.05",
+                                "--",
+                                sys.executable,
+                                "-c",
+                                child_code,
+                                str(pid_file),
+                            ],
+                            stderr=audit,
+                            text=True,
+                        )
+                        child_pid = None
+                        grandchild_pid = None
+                        try:
+                            deadline = time.monotonic() + 5
+                            while not pid_file.exists():
+                                if time.monotonic() >= deadline:
+                                    self.fail(
+                                        "child process group did not start"
+                                    )
+                                time.sleep(0.01)
+                            child_pid, grandchild_pid = (
+                                int(value)
+                                for value in pid_file.read_text(
+                                    encoding="utf-8"
+                                ).split()
+                            )
+                            time.sleep(0.05)
+                            wrapper.send_signal(signal_number)
+                            wrapper.wait(timeout=5)
+                        finally:
+                            if wrapper.poll() is None:
+                                wrapper.kill()
+                                wrapper.wait(timeout=5)
+                            if child_pid is not None:
+                                try:
+                                    os.killpg(child_pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+
+                    self.assertEqual(
+                        wrapper.returncode, 128 + signal_number
+                    )
+                    records = [
+                        json.loads(line)
+                        for line in audit_path.read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+                    ]
+                    self.assertEqual(
+                        records[-1]["classification"], "parent_signal"
+                    )
+                    forwarded = [
+                        record["signal"]
+                        for record in records
+                        if record["event"] == "process_group_signal"
+                    ]
+                    self.assertEqual(
+                        forwarded[0],
+                        signal.Signals(signal_number).name,
+                    )
+                    self.assertEqual(forwarded[-1], "SIGKILL")
+                    for process_id in (child_pid, grandchild_pid):
+                        deadline = time.monotonic() + 2
+                        while (
+                            self._process_is_running(process_id)
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertFalse(
+                            self._process_is_running(process_id)
+                        )
+
     def test_configuration_rejects_non_finite_timing(self) -> None:
         config = watchdog.WatchdogConfig(
             command=("fake-command",),
@@ -383,6 +511,28 @@ class TestWatchdogBehavior(unittest.TestCase):
         self.assertEqual(
             harness.records()[-1]["classification"], "procfs_error"
         )
+
+    def test_unexpected_monitor_error_cleans_up_process_group(self) -> None:
+        def exit_on_kill(process: FakeProcess, signal_number: int) -> None:
+            if signal_number == signal.SIGKILL:
+                process.returncode = -signal.SIGKILL
+
+        harness = Harness(
+            [snapshot(50), RuntimeError("unexpected")],
+            FakeProcess(),
+            signal_handler=exit_on_kill,
+        )
+
+        result = harness.run()
+
+        self.assertEqual(result, watchdog.EXIT_INTERNAL_ERROR)
+        self.assertEqual(
+            harness.signals,
+            [signal.SIGTERM, signal.SIGKILL],
+        )
+        final = harness.records()[-1]
+        self.assertEqual(final["classification"], "internal_error")
+        self.assertIn("RuntimeError: unexpected", final["error"])
 
     def test_launch_failure_is_explicit(self) -> None:
         harness = Harness([snapshot(50)], FakeProcess())
