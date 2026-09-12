@@ -145,8 +145,15 @@ struct expert_file {
     bool direct = false;
     std::unique_ptr<llama_file> file;
 
-    expert_file(const std::string & fname, bool direct_io) : fname(fname) {
+    expert_file(const std::string & fname, bool direct_io, bool allow_buffered_io) : fname(fname) {
         reopen(direct_io);
+        if (direct_io && !direct && !allow_buffered_io) {
+            throw std::runtime_error(format("llama_expert_store: direct I/O is required but unavailable for %s", fname.c_str()));
+        }
+        if (direct_io && !direct) {
+            LLAMA_LOG_WARN("%s: direct I/O is unavailable for %s; using explicitly allowed buffered reads\n",
+                    __func__, fname.c_str());
+        }
     }
 
     expert_file(const expert_file &) = delete;
@@ -156,9 +163,6 @@ struct expert_file {
         file = std::make_unique<llama_file>(fname.c_str(), "rb", direct_io);
         size = file->size();
         direct = direct_io && file->has_direct_io();
-        if (direct_io && !direct) {
-            LLAMA_LOG_WARN("%s: direct I/O is unavailable for %s; using buffered reads\n", __func__, fname.c_str());
-        }
     }
 
     size_t pread_at_least(void * dst, size_t len, uint64_t offset, size_t need) const {
@@ -166,7 +170,7 @@ struct expert_file {
             throw std::runtime_error("llama_expert_store: invalid read requirement");
         }
         size_t total = 0;
-        while (total < len) {
+        while (total < need) {
 #if defined(_WIN32)
             file->seek(offset + total, SEEK_SET);
             file->read_raw(static_cast<uint8_t *>(dst) + total, len - total);
@@ -318,7 +322,7 @@ struct llama_expert_store::impl {
             auto file_it = files.find(tensor.fname);
             if (file_it == files.end()) {
                 file_it = files.emplace(tensor.fname,
-                        std::make_unique<expert_file>(tensor.fname, params.direct_io)).first;
+                        std::make_unique<expert_file>(tensor.fname, params.direct_io, params.allow_buffered_io)).first;
             }
             if (file_it->second->size != tensor.file_size) {
                 throw std::runtime_error(format("llama_expert_store: source file size changed for %s", tensor.fname.c_str()));
@@ -381,6 +385,10 @@ struct llama_expert_store::impl {
                 *bytes_read += file.pread_at_least(bounce.data, read.size, read.offset, read.prefix + tensor.nb[2]);
                 memcpy(payload.data, bounce.data + read.prefix, tensor.nb[2]);
             } catch (const std::runtime_error & e) {
+                if (!params.allow_buffered_io) {
+                    throw std::runtime_error(format("llama_expert_store: direct I/O failed for %s and buffered fallback is disabled: %s",
+                            tensor.fname.c_str(), e.what()));
+                }
                 LLAMA_LOG_WARN("%s: direct read failed for %s; retrying with buffered I/O: %s\n",
                         __func__, tensor.fname.c_str(), e.what());
                 file.reopen(false);
@@ -629,4 +637,14 @@ size_t llama_expert_store::resident_entries() const {
         result += slot.occupied ? 1 : 0;
     }
     return result;
+}
+
+bool llama_expert_store::direct_io_active() const {
+    std::lock_guard<std::mutex> lock(pimpl->mutex);
+    for (const auto & item : pimpl->files) {
+        if (!item.second->direct) {
+            return false;
+        }
+    }
+    return true;
 }

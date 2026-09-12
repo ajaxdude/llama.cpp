@@ -31,6 +31,7 @@ struct llama_expert_store_params {
     size_t cache_slots = 0;
     size_t io_alignment = 4096;
     bool   direct_io = true;
+    bool   allow_buffered_io = false; // opt-in only; page-cache bytes are outside cache_bytes
 };
 
 struct llama_expert_store_request {
@@ -96,6 +97,7 @@ struct llama_expert_store {
     llama_expert_store_stats stats() const;
     size_t resident_bytes() const;
     size_t resident_entries() const;
+    bool direct_io_active() const;
 
 private:
     struct impl;
