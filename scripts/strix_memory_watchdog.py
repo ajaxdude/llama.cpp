@@ -31,10 +31,12 @@ EXIT_SOFT_LIMIT = 4
 EXIT_EMERGENCY_LIMIT = 5
 EXIT_GRACE_TIMEOUT = 6
 EXIT_SIGNAL_ERROR = 7
+EXIT_INTERNAL_ERROR = 70
 EXIT_LAUNCH_ERROR = 127
 
 MEMINFO_VALUE_RE = re.compile(r"([0-9]+) kB")
 SWAPS_HEADER = ["Filename", "Type", "Size", "Used", "Priority"]
+PARENT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class ProcfsError(RuntimeError):
@@ -43,6 +45,12 @@ class ProcfsError(RuntimeError):
 
 class ProcessGroupError(RuntimeError):
     pass
+
+
+class ParentSignal(RuntimeError):
+    def __init__(self, signal_number: int):
+        self.signal_number = signal_number
+        super().__init__(signal.Signals(signal_number).name)
 
 
 class ProcessHandle(Protocol):
@@ -64,6 +72,12 @@ class HostSnapshot:
     @property
     def used_bytes(self) -> int:
         return self.total_bytes - self.available_bytes
+
+
+@dataclass
+class RuntimeState:
+    snapshot: HostSnapshot
+    peak_used_bytes: int
 
 
 @dataclass(frozen=True)
@@ -257,6 +271,39 @@ def _signal_process_group(process_group_id: int, signal_number: int) -> str:
     return f"{signal.Signals(signal_number).name.lower()}_sent"
 
 
+def _process_group_alive(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise ProcessGroupError(
+            f"cannot inspect process group {process_group_id}: {detail}"
+        ) from exc
+    return True
+
+
+def _raise_parent_signal(signal_number: int, _frame: object) -> None:
+    raise ParentSignal(signal_number)
+
+
+def _set_parent_signal_handlers(
+    handler: signal.Handlers,
+) -> dict[int, signal.Handlers]:
+    previous: dict[int, signal.Handlers] = {}
+    for signal_number in PARENT_SIGNALS:
+        previous[signal_number] = signal.signal(signal_number, handler)
+    return previous
+
+
+def _restore_parent_signal_handlers(
+    previous: dict[int, signal.Handlers],
+) -> None:
+    for signal_number, handler in previous.items():
+        signal.signal(signal_number, handler)
+
+
 def _kill_and_finish(
     audit: AuditLogger,
     child: ProcessHandle,
@@ -323,18 +370,105 @@ def _kill_and_finish(
     )
 
 
+def _graceful_cleanup(
+    audit: AuditLogger,
+    child: ProcessHandle,
+    snapshot: HostSnapshot,
+    peak_used_bytes: int,
+    classification: str,
+    exit_code: int,
+    reason: str,
+    graceful_signal: int,
+    grace_seconds: float,
+    signal_group: Callable[[int, int], str],
+    group_alive: Callable[[int], bool],
+    monotonic: Callable[[], float],
+    sleeper: Callable[[float], None],
+    error: str | None = None,
+) -> int:
+    signal_events: list[tuple[int, str]] = []
+    try:
+        group_status = signal_group(child.pid, graceful_signal)
+        signal_events.append((graceful_signal, group_status))
+        deadline = monotonic() + grace_seconds
+        while monotonic() < deadline:
+            child.poll()
+            if not group_alive(child.pid):
+                break
+            sleeper(min(0.05, deadline - monotonic()))
+        child.poll()
+        if group_alive(child.pid):
+            group_status = signal_group(child.pid, signal.SIGKILL)
+            signal_events.append((signal.SIGKILL, group_status))
+    except ProcessGroupError as exc:
+        return _emit_final(
+            audit,
+            "signal_error",
+            EXIT_SIGNAL_ERROR,
+            reason,
+            snapshot,
+            peak_used_bytes,
+            child,
+            child.poll(),
+            "signal_error",
+            str(exc),
+        )
+
+    child_returncode = child.poll()
+    if child_returncode is None:
+        try:
+            child_returncode = child.wait(timeout=5.0)
+        except subprocess.TimeoutExpired as exc:
+            return _emit_final(
+                audit,
+                "termination_timeout",
+                EXIT_SIGNAL_ERROR,
+                reason,
+                snapshot,
+                peak_used_bytes,
+                child,
+                child.poll(),
+                "termination_timeout",
+                str(exc),
+            )
+
+    for signal_number, status in signal_events:
+        audit.emit(
+            "process_group_signal",
+            **_state_fields(
+                snapshot,
+                peak_used_bytes,
+                child,
+                child_returncode,
+                status,
+                reason,
+            ),
+            signal=signal.Signals(signal_number).name,
+        )
+    return _emit_final(
+        audit,
+        classification,
+        exit_code,
+        reason,
+        snapshot,
+        peak_used_bytes,
+        child,
+        child_returncode,
+        signal_events[-1][1],
+        error,
+    )
+
+
 def _monitor_child(
     config: WatchdogConfig,
     reader: ProcfsReader,
     audit: AuditLogger,
     child: ProcessHandle,
-    initial_snapshot: HostSnapshot,
+    state: RuntimeState,
     signal_group: Callable[[int, int], str],
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
 ) -> int:
-    snapshot = initial_snapshot
-    peak = snapshot.used_bytes
     soft_deadline: float | None = None
 
     while True:
@@ -354,8 +488,8 @@ def _monitor_child(
                     if soft_stop
                     else "child exited"
                 ),
-                snapshot,
-                peak,
+                state.snapshot,
+                state.peak_used_bytes,
                 child,
                 child_returncode,
                 "leader_exited",
@@ -366,8 +500,8 @@ def _monitor_child(
             return _kill_and_finish(
                 audit,
                 child,
-                snapshot,
-                peak,
+                state.snapshot,
+                state.peak_used_bytes,
                 "grace_timeout",
                 EXIT_GRACE_TIMEOUT,
                 "soft-threshold grace period expired",
@@ -375,50 +509,60 @@ def _monitor_child(
             )
 
         try:
-            snapshot = reader.read_snapshot()
+            state.snapshot = reader.read_snapshot()
         except ProcfsError as exc:
             return _kill_and_finish(
                 audit,
                 child,
-                snapshot,
-                peak,
+                state.snapshot,
+                state.peak_used_bytes,
                 "procfs_error",
                 EXIT_PROCFS_ERROR,
                 str(exc),
                 signal_group,
             )
 
-        peak = max(peak, snapshot.used_bytes)
+        state.peak_used_bytes = max(
+            state.peak_used_bytes, state.snapshot.used_bytes
+        )
         audit.emit(
             "sample",
             **_state_fields(
-                snapshot, peak, child, None, "active", "none"
+                state.snapshot,
+                state.peak_used_bytes,
+                child,
+                None,
+                "active",
+                "none",
             ),
         )
 
-        if snapshot.active_swaps:
+        if state.snapshot.active_swaps:
             return _kill_and_finish(
                 audit,
                 child,
-                snapshot,
-                peak,
+                state.snapshot,
+                state.peak_used_bytes,
                 "swap_appeared",
                 EXIT_SWAP_ACTIVE,
                 "active swap appeared during execution",
                 signal_group,
             )
-        if snapshot.used_bytes >= config.emergency_bytes:
+        if state.snapshot.used_bytes >= config.emergency_bytes:
             return _kill_and_finish(
                 audit,
                 child,
-                snapshot,
-                peak,
+                state.snapshot,
+                state.peak_used_bytes,
                 "emergency_limit",
                 EXIT_EMERGENCY_LIMIT,
                 "used_bytes >= emergency_bytes",
                 signal_group,
             )
-        if soft_deadline is None and snapshot.used_bytes >= config.soft_bytes:
+        if (
+            soft_deadline is None
+            and state.snapshot.used_bytes >= config.soft_bytes
+        ):
             try:
                 group_status = signal_group(child.pid, signal.SIGTERM)
             except ProcessGroupError as exc:
@@ -427,8 +571,8 @@ def _monitor_child(
                     "signal_error",
                     EXIT_SIGNAL_ERROR,
                     "used_bytes >= soft_bytes",
-                    snapshot,
-                    peak,
+                    state.snapshot,
+                    state.peak_used_bytes,
                     child,
                     child.poll(),
                     "signal_error",
@@ -438,8 +582,8 @@ def _monitor_child(
             audit.emit(
                 "process_group_signal",
                 **_state_fields(
-                    snapshot,
-                    peak,
+                    state.snapshot,
+                    state.peak_used_bytes,
                     child,
                     child.poll(),
                     group_status,
@@ -465,6 +609,7 @@ def run_watchdog(
     audit: AuditLogger | None = None,
     launcher: Callable[..., ProcessHandle] | None = None,
     signal_group: Callable[[int, int], str] | None = None,
+    group_alive: Callable[[int], bool] | None = None,
     monotonic: Callable[[], float] | None = None,
     sleeper: Callable[[float], None] | None = None,
 ) -> int:
@@ -473,6 +618,7 @@ def run_watchdog(
     audit = audit or AuditLogger(sys.stderr)
     launcher = launcher or subprocess.Popen
     signal_group = signal_group or _signal_process_group
+    group_alive = group_alive or _process_group_alive
     monotonic = monotonic or time.monotonic
     sleeper = sleeper or time.sleep
 
@@ -532,42 +678,95 @@ def run_watchdog(
             snapshot.used_bytes,
         )
 
+    previous_mask: set[signal.Signals] | None = signal.pthread_sigmask(
+        signal.SIG_BLOCK, PARENT_SIGNALS
+    )
+    previous_handlers: dict[int, signal.Handlers] = {}
+    child: ProcessHandle | None = None
+    state = RuntimeState(snapshot, snapshot.used_bytes)
     try:
-        child = launcher(config.command, start_new_session=True)
-    except (OSError, ValueError) as exc:
-        detail = getattr(exc, "strerror", None) or str(exc)
-        return _emit_final(
-            audit,
-            "launch_error",
-            EXIT_LAUNCH_ERROR,
-            "command launch failed",
-            snapshot,
-            snapshot.used_bytes,
-            error=detail,
-        )
+        try:
+            child = launcher(config.command, start_new_session=True)
+        except (OSError, ValueError) as exc:
+            detail = getattr(exc, "strerror", None) or str(exc)
+            return _emit_final(
+                audit,
+                "launch_error",
+                EXIT_LAUNCH_ERROR,
+                "command launch failed",
+                snapshot,
+                snapshot.used_bytes,
+                error=detail,
+            )
 
-    audit.emit(
-        "child_started",
-        **_state_fields(
-            snapshot,
-            snapshot.used_bytes,
+        previous_handlers = _set_parent_signal_handlers(
+            _raise_parent_signal
+        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        previous_mask = None
+        audit.emit(
+            "child_started",
+            **_state_fields(
+                state.snapshot,
+                state.peak_used_bytes,
+                child,
+                None,
+                "active",
+                "none",
+            ),
+            command=list(config.command),
+        )
+        return _monitor_child(
+            config,
+            reader,
+            audit,
             child,
-            None,
-            "active",
-            "none",
-        ),
-        command=list(config.command),
-    )
-    return _monitor_child(
-        config,
-        reader,
-        audit,
-        child,
-        snapshot,
-        signal_group,
-        monotonic,
-        sleeper,
-    )
+            state,
+            signal_group,
+            monotonic,
+            sleeper,
+        )
+    except ParentSignal as exc:
+        _set_parent_signal_handlers(signal.SIG_IGN)
+        signal_name = signal.Signals(exc.signal_number).name
+        return _graceful_cleanup(
+            audit,
+            child,
+            state.snapshot,
+            state.peak_used_bytes,
+            "parent_signal",
+            128 + exc.signal_number,
+            f"wrapper received {signal_name}",
+            exc.signal_number,
+            config.grace_seconds,
+            signal_group,
+            group_alive,
+            monotonic,
+            sleeper,
+        )
+    except Exception as exc:
+        _set_parent_signal_handlers(signal.SIG_IGN)
+        return _graceful_cleanup(
+            audit,
+            child,
+            state.snapshot,
+            state.peak_used_bytes,
+            "internal_error",
+            EXIT_INTERNAL_ERROR,
+            "unexpected post-launch exception",
+            signal.SIGTERM,
+            config.grace_seconds,
+            signal_group,
+            group_alive,
+            monotonic,
+            sleeper,
+            f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if previous_handlers:
+            _restore_parent_signal_handlers(previous_handlers)
 
 
 def _positive_int(value: str) -> int:
