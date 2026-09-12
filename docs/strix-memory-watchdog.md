@@ -12,6 +12,7 @@ The wrapper performs these checks and actions:
 - It calculates used memory as `MemTotal - MemAvailable`. Linux reports these fields in KiB, so the wrapper multiplies each value by 1024 and keeps all accounting as integer bytes.
 - It sends `SIGTERM` to the process group at 116 GiB used.
 - It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.
+- It reports `grace_timeout` if any descendant requires `SIGKILL` after the soft-threshold grace period, even when the direct child exited earlier.
 - It sends `SIGKILL` and fails if swap appears or required procfs data becomes unavailable during execution.
 - It forwards wrapper `SIGINT` or `SIGTERM` to the process group, waits the configured grace period, then sends `SIGKILL` if any group member remains.
 - It checks the process group after the direct child exits and cleans up remaining descendants before returning the child's classification.
