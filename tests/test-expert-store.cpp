@@ -345,6 +345,7 @@ void test_direct_io(const fixture & f) {
     params.cache_bytes = f.max_plane_size();
     params.io_alignment = 4096;
     params.direct_io = true;
+    params.allow_buffered_io = true;
 
     llama_expert_store store(f.tensors, params);
     auto lease = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 3 } } });
@@ -354,6 +355,28 @@ void test_direct_io(const fixture & f) {
     REQUIRE(store.stats().bytes_read >= payloads[0].size);
     REQUIRE(store.stats().bytes_read <= payloads[0].size + 2 * params.io_alignment);
 }
+
+#if defined(__linux__)
+void test_direct_io_file_tail(const fixture & f) {
+    const auto & down = f.tensors[2];
+    REQUIRE(down.file_offset + down.nb[2] * down.ne[2] == down.file_size);
+
+    llama_expert_store_params params;
+    params.cache_slots = 1;
+    params.cache_bytes = f.max_plane_size();
+    params.io_alignment = 4096;
+    params.direct_io = true;
+    params.allow_buffered_io = false;
+
+    llama_expert_store store(f.tensors, params);
+    REQUIRE(store.direct_io_active());
+    auto lease = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_DOWN, { fixture::n_expert - 1 } } });
+    const auto payloads = lease.payloads();
+    REQUIRE(payloads.size() == 1);
+    REQUIRE(payloads[0].data[payloads[0].size - 1] == 0x33);
+    REQUIRE(store.direct_io_active());
+}
+#endif
 
 void test_pins_and_atomic_failure(const fixture & f) {
     llama_expert_store store = f.make_store(1, f.max_plane_size());
@@ -491,6 +514,9 @@ int main() {
         test_large_offset_read();
         test_cache_and_remapping(f);
         test_direct_io(f);
+#if defined(__linux__)
+        test_direct_io_file_tail(f);
+#endif
         test_pins_and_atomic_failure(f);
         test_limits_and_validation(f);
         test_payload_validation(f);
