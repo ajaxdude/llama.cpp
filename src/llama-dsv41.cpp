@@ -75,10 +75,39 @@ void llama_dsv41_validate_config(const llama_dsv41_config & config) {
     dsv41_require(config.engram_token_map_size == LLAMA_DSV41_N_VOCAB, "engram.token_map must contain 129280 entries");
     dsv41_require(config.engram_primes_size == LLAMA_DSV41_ENGRAM_PRIMES_COUNT, "engram.primes must contain 48 entries");
     dsv41_require(config.engram_multipliers_size == LLAMA_DSV41_ENGRAM_MULTIPLIERS_COUNT, "engram.multipliers must contain 8 entries");
+    if (!config.engram_token_map.empty() || !config.engram_primes.empty() || !config.engram_multipliers.empty()) {
+        llama_dsv41_make_engram_layout(config);
+    }
+}
+
+llama_engram_layout llama_dsv41_make_engram_layout(const llama_dsv41_config & config) {
+    dsv41_require(config.engram_token_map.size() == LLAMA_DSV41_N_VOCAB, "engram.token_map data must contain 129280 entries");
+    dsv41_require(config.engram_primes.size() == LLAMA_DSV41_ENGRAM_PRIMES_COUNT, "engram.primes data must contain 48 entries");
+    dsv41_require(config.engram_multipliers.size() == LLAMA_DSV41_ENGRAM_MULTIPLIERS_COUNT, "engram.multipliers data must contain 8 entries");
+
+    llama_engram_layout layout;
+    layout.encoding = config.engram_encoding;
+    std::copy(config.engram_layers.begin(), config.engram_layers.end(), layout.layer_ids.begin());
+    layout.token_map = config.engram_token_map;
+    layout.compressed_vocab_size = config.engram_compressed_vocab_size;
+    layout.pad_id = config.engram_pad_id;
+    std::copy(config.engram_rows.begin(), config.engram_rows.end(), layout.rows.begin());
+    for (size_t layer = 0; layer < LLAMA_ENGRAM_LAYERS; ++layer) {
+        std::copy_n(
+                config.engram_primes.begin() + layer*LLAMA_ENGRAM_COLS,
+                LLAMA_ENGRAM_COLS,
+                layout.primes[layer].begin());
+        std::copy_n(
+                config.engram_multipliers.begin() + layer*LLAMA_ENGRAM_NGRAM,
+                LLAMA_ENGRAM_NGRAM,
+                layout.multipliers[layer].begin());
+    }
+    llama_engram_hasher validate(layout);
+    return layout;
 }
 
 const char * llama_dsv41_runtime_dependency_error() {
-    return "DeepSeek V4.1 execution requires disk-backed Engram and routed-expert streaming support";
+    return "DeepSeek V4.1 execution requires routed-expert streaming support";
 }
 
 static int32_t dsv41_source_layer(const int32_t * sources, size_t n, uint32_t il) {

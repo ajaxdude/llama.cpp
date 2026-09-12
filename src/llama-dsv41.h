@@ -1,7 +1,9 @@
 #pragma once
 
+#include "llama-engram.h"
 #include "llama.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -92,9 +94,13 @@ struct llama_dsv41_config {
     uint32_t engram_token_map_size;
     uint32_t engram_primes_size;
     uint32_t engram_multipliers_size;
+    std::vector<uint32_t> engram_token_map;
+    std::vector<uint32_t> engram_primes;
+    std::vector<uint64_t> engram_multipliers;
 };
 
 void llama_dsv41_validate_config(const llama_dsv41_config & config);
+llama_engram_layout llama_dsv41_make_engram_layout(const llama_dsv41_config & config);
 const char * llama_dsv41_runtime_dependency_error();
 
 struct llama_dsv41_compression_plan {

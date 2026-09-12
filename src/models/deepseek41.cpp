@@ -1,8 +1,10 @@
 #include "llama-dsv41.h"
+#include "llama-dsv41-engram.h"
 #include "llama-hparams.h"
 #include "models.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -11,6 +13,11 @@
 static float dsv41_rope_attn_factor(float freq_scale) {
     return 1.0f/(1.0f + 0.1f*logf(1.0f/freq_scale));
 }
+
+struct llama_model_deepseek41::engram_model {
+    llama_engram_layout layout;
+    std::array<llama_dsv41_engram_extent, LLAMA_ENGRAM_LAYERS> extents;
+};
 
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_dsv41_config config = {};
@@ -65,9 +72,14 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     ml.get_arr_n(LLM_KV_DSV41_ENGRAM_TOKEN_MAP, config.engram_token_map_size);
     ml.get_arr_n(LLM_KV_DSV41_ENGRAM_PRIMES, config.engram_primes_size);
     ml.get_arr_n(LLM_KV_DSV41_ENGRAM_MULTIPLIERS, config.engram_multipliers_size);
+    ml.get_arr(LLM_KV_DSV41_ENGRAM_TOKEN_MAP, config.engram_token_map);
+    ml.get_arr(LLM_KV_DSV41_ENGRAM_PRIMES, config.engram_primes);
+    ml.get_arr(LLM_KV_DSV41_ENGRAM_MULTIPLIERS, config.engram_multipliers);
 
     config.n_ff_dense = LLAMA_DSV41_N_FF_DENSE;
     llama_dsv41_validate_config(config);
+    engram = std::make_shared<engram_model>();
+    engram->layout = llama_dsv41_make_engram_layout(config);
 
     if (raw_config.empty()) {
         throw std::runtime_error("DeepSeek V4.1 metadata: config must not be empty");
@@ -199,23 +211,42 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", il), { n_embd, n_ff_exp*n_expert_shared }, 0);
 
         if (hparams.dsv41_engram_layers.test(il)) {
-            const llm_tensor engram_tensors[] = {
-                LLM_TENSOR_ENGRAM_EMBD,
-                LLM_TENSOR_ENGRAM_Q_NORM,
-                LLM_TENSOR_ENGRAM_K_NORM,
-                LLM_TENSOR_ENGRAM_KV,
-            };
-            for (llm_tensor tensor : engram_tensors) {
-                const std::string name = tn(tensor, "weight", il).str();
-                if (ml.get_weight(name.c_str()) == nullptr) {
-                    throw std::runtime_error("DeepSeek V4.1 is missing required Engram tensor " + name);
-                }
+            const size_t index = il == (int32_t) engram->layout.layer_ids[0] ? 0 : 1;
+            const std::string table_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il).str();
+            const auto * table = ml.get_weight(table_name.c_str());
+            if (table == nullptr) {
+                throw std::runtime_error("DeepSeek V4.1 is missing required Engram tensor " + table_name);
             }
+            llama_dsv41_engram_extent & extent = engram->extents[index];
+            extent.fname = ml.fnames.at(table->idx);
+            extent.offset = table->offs;
+            extent.rows = engram->layout.rows[index];
+            extent.columns = table->tensor->ne[0];
+            extent.row_count = table->tensor->ne[1];
+            extent.type = table->tensor->type;
+            llama_dsv41_validate_engram_extent(extent);
+
+            create_tensor(
+                    tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il),
+                    { LLAMA_ENGRAM_ROW_BYTES, (int64_t) extent.rows },
+                    TENSOR_SKIP);
+            layer.engram_q_norm = create_tensor(
+                    tn(LLM_TENSOR_ENGRAM_Q_NORM, "weight", il),
+                    { n_embd, hc_mult },
+                    0);
+            layer.engram_k_norm = create_tensor(
+                    tn(LLM_TENSOR_ENGRAM_K_NORM, "weight", il),
+                    { n_embd, hc_mult },
+                    0);
+            layer.engram_kv = create_tensor(
+                    tn(LLM_TENSOR_ENGRAM_KV, "weight", il),
+                    { LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM, (hc_mult + 1)*n_embd },
+                    0);
         }
     }
 
     throw std::runtime_error(
-            std::string("DeepSeek V4.1 tensor metadata is valid, but tensor payloads cannot be mapped: ") +
+            std::string("DeepSeek V4.1 Engram metadata and disk extents are valid, but execution is blocked: ") +
             llama_dsv41_runtime_dependency_error());
 }
 
