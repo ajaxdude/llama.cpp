@@ -14,6 +14,7 @@ The wrapper performs these checks and actions:
 - It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.
 - It sends `SIGKILL` and fails if swap appears or required procfs data becomes unavailable during execution.
 - It forwards wrapper `SIGINT` or `SIGTERM` to the process group, waits the configured grace period, then sends `SIGKILL` if any group member remains.
+- It checks the process group after the direct child exits and cleans up remaining descendants before returning the child's classification.
 - It applies the same bounded process-group cleanup if an unexpected post-launch error occurs.
 - It propagates an unmonitored child exit code. A signal exit uses the shell convention `128 + signal`.
 
@@ -21,7 +22,7 @@ The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 
 
 Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB.
 
-The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Child standard input, standard output, and standard error are inherited unchanged.
+The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Signal records are written immediately after each process-group signal. Child standard input, standard output, and standard error are inherited unchanged.
 
 Exit classifications are authoritative in the final JSON record. Operational failures use these exit codes:
 
