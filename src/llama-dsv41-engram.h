@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml-backend.h"
 #include "llama-engram.h"
 #include "llama.h"
 
@@ -99,11 +100,15 @@ ggml_tensor * llama_dsv41_build_engram_add(
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
         ggml_tensor * text_select,
-        float rms_eps);
+        float rms_eps,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu);
 
 ggml_tensor * llama_dsv41_build_engram_gate(
         ggml_context * ctx,
-        ggml_tensor * dot);
+        ggml_tensor * dot,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu);
 
 ggml_tensor * llama_dsv41_build_engram(
         ggml_context * ctx,
@@ -113,4 +118,6 @@ ggml_tensor * llama_dsv41_build_engram(
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
         ggml_tensor * text_select,
-        float rms_eps);
+        float rms_eps,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu);

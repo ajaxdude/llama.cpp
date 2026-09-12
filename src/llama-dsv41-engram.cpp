@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -299,12 +300,25 @@ static void dsv41_engram_gate_f32(
 
 ggml_tensor * llama_dsv41_build_engram_gate(
         ggml_context * ctx,
-        ggml_tensor * dot) {
-    if (ctx == nullptr || dot == nullptr) {
+        ggml_tensor * dot,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu) {
+    if (ctx == nullptr || dot == nullptr || sched == nullptr || backend_cpu == nullptr) {
         throw std::invalid_argument("DeepSeek V4.1 Engram gate input is null");
     }
-    // This small CPU fallback preserves copysign for signed zero on every scheduler backend.
-    return ggml_map_custom1(ctx, dot, dsv41_engram_gate_f32, GGML_N_TASKS_MAX, nullptr);
+    if (!ggml_backend_is_cpu(backend_cpu)) {
+        throw std::invalid_argument("DeepSeek V4.1 Engram gate backend is not local CPU");
+    }
+    bool found = false;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        found = found || ggml_backend_sched_get_backend(sched, i) == backend_cpu;
+    }
+    if (!found) {
+        throw std::invalid_argument("DeepSeek V4.1 Engram gate CPU backend is not in the scheduler");
+    }
+    ggml_tensor * gate = ggml_map_custom1(ctx, dot, dsv41_engram_gate_f32, GGML_N_TASKS_MAX, nullptr);
+    ggml_backend_sched_set_tensor_backend(sched, gate, backend_cpu);
+    return gate;
 }
 
 ggml_tensor * llama_dsv41_build_engram_add(
@@ -314,7 +328,9 @@ ggml_tensor * llama_dsv41_build_engram_add(
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
         ggml_tensor * text_select,
-        float rms_eps) {
+        float rms_eps,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu) {
     if (ctx == nullptr || residual == nullptr || projected == nullptr || q_norm == nullptr || k_norm == nullptr) {
         throw std::invalid_argument("DeepSeek V4.1 Engram graph input is null");
     }
@@ -350,7 +366,7 @@ ggml_tensor * llama_dsv41_build_engram_add(
         dot = ggml_mul(ctx, dot, key_norm);
         dot = ggml_scale(ctx, ggml_sum_rows(ctx, dot), 1.0f/std::sqrt((float) width));
 
-        ggml_tensor * gate = llama_dsv41_build_engram_gate(ctx, dot);
+        ggml_tensor * gate = llama_dsv41_build_engram_gate(ctx, dot, sched, backend_cpu);
         ggml_tensor * updated = dsv41_bf16_f32(ctx, ggml_add(ctx, hidden, ggml_mul(ctx, value, gate)));
         if (text_select != nullptr) {
             updated = ggml_get_rows(ctx, ggml_concat(ctx, hidden, updated, 1), text_select);
@@ -369,7 +385,9 @@ ggml_tensor * llama_dsv41_build_engram(
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
         ggml_tensor * text_select,
-        float rms_eps) {
+        float rms_eps,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend_cpu) {
     if (ctx == nullptr || residual == nullptr || rows == nullptr || engram_kv == nullptr ||
             rows->ne[0] != LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM ||
             engram_kv->ne[0] != rows->ne[0] ||
@@ -378,5 +396,5 @@ ggml_tensor * llama_dsv41_build_engram(
     }
     ggml_tensor * projected = ggml_mul_mat(ctx, engram_kv, rows);
     return llama_dsv41_build_engram_add(
-            ctx, residual, projected, q_norm, k_norm, text_select, rms_eps);
+            ctx, residual, projected, q_norm, k_norm, text_select, rms_eps, sched, backend_cpu);
 }
