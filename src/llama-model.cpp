@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-dsv41.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -200,6 +201,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
+        case LLM_ARCH_DEEPSEEK41:
+            return new llama_model_deepseek41(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -371,6 +374,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+        ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
@@ -382,7 +386,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
-    static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+    static const std::regex pattern_dsv4_state      ("dsv4(1)?_(csa|hca|lid|comp|index)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -1216,6 +1220,33 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams
     if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {
+        return;
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        std::fill(hparams.n_head_arr.begin(),       hparams.n_head_arr.end(),       0);
+        std::fill(hparams.n_head_kv_arr.begin(),    hparams.n_head_kv_arr.end(),    0);
+        std::fill(hparams.n_ff_arr.begin(),         hparams.n_ff_arr.end(),         0);
+        std::fill(hparams.n_ff_exp_arr.begin(),     hparams.n_ff_exp_arr.end(),     0);
+        std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+        std::fill(hparams.rope_sections.begin(),    hparams.rope_sections.end(),    0);
+        std::fill(hparams.rope_pattern.begin(),     hparams.rope_pattern.end(),     1);
+        std::fill(hparams.is_swa_impl.begin(),      hparams.is_swa_impl.end(),      0);
+        std::fill(hparams.is_recr_impl.begin(),     hparams.is_recr_impl.end(),     0);
+        std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
+        std::fill(hparams.dsv41_kv_source_layer.begin(), hparams.dsv41_kv_source_layer.end(), -1);
+        std::fill(hparams.dsv41_index_source_layer.begin(), hparams.dsv41_index_source_layer.end(), -1);
+        std::fill(hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.end(), 0);
+        std::fill(hparams.swiglu_clamp_exp.begin(), hparams.swiglu_clamp_exp.end(), 0.0f);
+        std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
+        hparams.dsv41_engram_layers.reset();
+
+        load_arch_hparams(ml);
+
+        pimpl->n_bytes = ml.n_bytes;
+        pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+        pimpl->ftype = ml.ftype;
+        hparams.rope_type = llama_model_rope_type(this);
         return;
     }
 
@@ -2463,6 +2494,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 }
             } break;
+        case LLM_ARCH_DEEPSEEK41:
+            throw std::runtime_error(llama_dsv41_runtime_dependency_error());
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
@@ -2821,7 +2854,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;
@@ -2907,6 +2940,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:

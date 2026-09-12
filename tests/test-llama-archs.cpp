@@ -562,7 +562,7 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
     if (arch == LLM_ARCH_DEEPSEEK41) {
-        return false; // GGUF schema only; the runtime graph is added by a dependent PR.
+        return false; // Published-model construction is gated until Engram and expert streaming are available.
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU

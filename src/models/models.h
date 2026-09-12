@@ -1313,6 +1313,14 @@ struct llama_model_deepseek4 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    [[noreturn]] void load_arch_tensors(llama_model_loader & ml) override;
+
+    [[noreturn]] std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 
 struct llama_model_deepseek2ocr : public llama_model_base {
     llama_model_deepseek2ocr(const struct llama_model_params & params) : llama_model_base(params) {}

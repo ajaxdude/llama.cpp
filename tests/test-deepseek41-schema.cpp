@@ -76,6 +76,7 @@ int main() {
     }
 
     const LLM_TN tn(LLM_ARCH_DEEPSEEK41);
+    check(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", 2).str() == "blk.2.attn_kv_a_norm.weight", "V4.1 KV A norm tensor name failed");
     check(tn(LLM_TENSOR_ENGRAM_EMBD,   "weight", 1).str() == "blk.1.engram_embd.weight", "Engram embedding tensor name failed");
     check(tn(LLM_TENSOR_ENGRAM_Q_NORM, "weight", 1).str() == "blk.1.engram_q_norm.weight", "Engram query norm tensor name failed");
     check(tn(LLM_TENSOR_ENGRAM_K_NORM, "weight", 1).str() == "blk.1.engram_k_norm.weight", "Engram key norm tensor name failed");
