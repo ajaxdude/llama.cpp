@@ -1434,6 +1434,7 @@ llama_expert_store_tensor llama_model_loader::register_external_tensor(
     llama_expert_store_tensor result;
     result.name = name;
     result.fname = fnames.at(weight.idx);
+    result.file_index = weight.idx;
     result.layer = layer;
     result.projection = projection;
     result.type = tensor->type;

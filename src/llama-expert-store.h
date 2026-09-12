@@ -17,6 +17,7 @@ enum llama_expert_projection {
 struct llama_expert_store_tensor {
     std::string             name;
     std::string             fname;
+    size_t                  file_index  = 0;
     int32_t                 layer       = -1;
     llama_expert_projection projection  = LLAMA_EXPERT_PROJECTION_GATE;
     ggml_type               type        = GGML_TYPE_COUNT;

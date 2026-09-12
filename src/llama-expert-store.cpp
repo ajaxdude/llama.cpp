@@ -554,8 +554,17 @@ llama_expert_store::lease llama_expert_store::acquire(const std::vector<llama_ex
     target_slots.insert(target_slots.end(), victims.begin(), victims.end());
     std::sort(target_slots.begin(), target_slots.end());
 
+    uint64_t bytes_read = 0;
+    std::vector<aligned_buffer> staged;
+    staged.reserve(misses.size());
+    for (const expert_key & key : misses) {
+        const auto & tensor = pimpl->get_tensor(key);
+        staged.push_back(pimpl->read_expert(tensor, key.expert_id, &bytes_read));
+    }
+
     for (uint32_t victim : victims) {
         auto & entry = pimpl->slots[victim];
+        resident.erase(entry.key);
         pimpl->bytes_resident -= entry.bytes.size;
         entry.bytes.clear();
         entry.occupied = false;
@@ -564,32 +573,17 @@ llama_expert_store::lease llama_expert_store::acquire(const std::vector<llama_ex
         pimpl->counters.evictions++;
     }
 
-    uint64_t bytes_read = 0;
-    size_t loaded = 0;
-    try {
-        for (; loaded < misses.size(); ++loaded) {
-            const expert_key & key = misses[loaded];
-            const auto & tensor = pimpl->get_tensor(key);
-            auto & entry = pimpl->slots[target_slots[loaded]];
-            entry.bytes = pimpl->read_expert(tensor, key.expert_id, &bytes_read);
-            entry.occupied = true;
-            entry.key = key;
-            entry.tensor = &tensor;
-            entry.pins = 0;
-            pimpl->bytes_resident += entry.bytes.size;
-            resident[entry.key] = target_slots[loaded];
-        }
-    } catch (...) {
-        for (size_t i = 0; i < loaded; ++i) {
-            auto & entry = pimpl->slots[target_slots[i]];
-            pimpl->bytes_resident -= entry.bytes.size;
-            resident.erase(entry.key);
-            entry.bytes.clear();
-            entry.occupied = false;
-            entry.tensor = nullptr;
-            entry.last_use = 0;
-        }
-        throw;
+    for (size_t i = 0; i < misses.size(); ++i) {
+        const expert_key & key = misses[i];
+        const auto & tensor = pimpl->get_tensor(key);
+        auto & entry = pimpl->slots[target_slots[i]];
+        entry.bytes = std::move(staged[i]);
+        entry.occupied = true;
+        entry.key = key;
+        entry.tensor = &tensor;
+        entry.pins = 0;
+        pimpl->bytes_resident += entry.bytes.size;
+        resident[entry.key] = target_slots[i];
     }
 
     auto lease_impl = std::make_unique<lease::impl>();

@@ -94,6 +94,7 @@ struct fixture {
         REQUIRE(loader.external.any());
         REQUIRE(loader.ctx_map.empty());
         for (const auto & tensor : tensors) {
+            REQUIRE(tensor.file_index == 0);
             REQUIRE(loader.external.has(loader.require_tensor_meta(tensor.name)));
         }
         loader.init_mappings(true);
@@ -523,6 +524,32 @@ void test_truncated_file(const fixture & f) {
     REQUIRE(store.stats().misses == 0);
 }
 
+void test_failed_replacement_keeps_resident_entry(const fixture & f) {
+    temp_file copy { ".gguf" };
+    std::filesystem::copy_file(f.file.path, copy.path);
+    auto tensors = f.tensors;
+    for (auto & tensor : tensors) {
+        tensor.fname = copy.path.string();
+        tensor.file_size = std::filesystem::file_size(copy.path);
+    }
+
+    llama_expert_store_params params { f.max_plane_size(), 1, 4096, false };
+    llama_expert_store store(std::move(tensors), params);
+    {
+        auto resident = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 0 } } });
+        REQUIRE(resident.payloads()[0].expert_id == 0);
+    }
+    const llama_expert_store_stats before = store.stats();
+    std::filesystem::resize_file(copy.path, f.tensors[0].file_offset + 2*f.tensors[0].nb[2] - 1);
+    require_throws([&] {
+        store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 1 } } });
+    });
+    REQUIRE(store.resident_entries() == 1);
+    REQUIRE(store.stats().evictions == before.evictions);
+    auto hit = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 0 } } });
+    REQUIRE(hit.payloads()[0].expert_id == 0);
+}
+
 }
 
 int main() {
@@ -544,6 +571,7 @@ int main() {
         test_limits_and_validation(f);
         test_payload_validation(f);
         test_truncated_file(f);
+        test_failed_replacement_keeps_resident_entry(f);
     } catch (const std::exception & e) {
         fprintf(stderr, "test-expert-store: %s\n", e.what());
         return 1;

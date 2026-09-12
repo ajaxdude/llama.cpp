@@ -9,6 +9,7 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+struct llama_dsv41_expert_runtime;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
@@ -1318,9 +1319,15 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
     struct engram_model;
     std::shared_ptr<engram_model> engram;
+    std::shared_ptr<llama_dsv41_expert_runtime> experts;
 
     void load_arch_hparams(llama_model_loader & ml) override;
-    [[noreturn]] void load_arch_tensors(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    bool requires_synchronous_graph() const override;
+    std::string consume_runtime_error() const override;
+    void release_runtime_work() const override;
+    void acquire_runtime_context() const override;
+    void release_runtime_context() const override;
 
     [[noreturn]] std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

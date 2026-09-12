@@ -481,11 +481,15 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    model.acquire_runtime_context();
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    model.release_runtime_work();
+    model.release_runtime_context();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1420,9 +1424,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        model.release_runtime_work();
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (model.requires_synchronous_graph()) {
+        synchronize();
+        const std::string error = model.consume_runtime_error();
+        if (!error.empty()) {
+            model.release_runtime_work();
+            LLAMA_LOG_ERROR("%s: model runtime failed: %s\n", __func__, error.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
