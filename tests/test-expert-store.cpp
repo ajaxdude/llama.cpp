@@ -378,6 +378,26 @@ void test_direct_io_file_tail(const fixture & f) {
 }
 #endif
 
+#if defined(_WIN32)
+void test_windows_direct_io_policy(const fixture & f) {
+    llama_expert_store_params params;
+    params.cache_slots = 1;
+    params.cache_bytes = f.max_plane_size();
+    params.direct_io = true;
+    params.allow_buffered_io = false;
+
+    require_throws([&] {
+        llama_expert_store store(f.tensors, params);
+    });
+
+    params.allow_buffered_io = true;
+    llama_expert_store store(f.tensors, params);
+    REQUIRE(!store.direct_io_active());
+    auto lease = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 0 } } });
+    REQUIRE(lease.payloads().size() == 1);
+}
+#endif
+
 void test_pins_and_atomic_failure(const fixture & f) {
     llama_expert_store store = f.make_store(1, f.max_plane_size());
     auto pinned = store.acquire({ { 0, LLAMA_EXPERT_PROJECTION_GATE, { 0 } } });
@@ -516,6 +536,9 @@ int main() {
         test_direct_io(f);
 #if defined(__linux__)
         test_direct_io_file_tail(f);
+#endif
+#if defined(_WIN32)
+        test_windows_direct_io_policy(f);
 #endif
         test_pins_and_atomic_failure(f);
         test_limits_and_validation(f);

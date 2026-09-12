@@ -171,7 +171,8 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        // Windows uses cached CRT I/O until FILE_FLAG_NO_BUFFERING support is added.
+        return false;
     }
 
     ~impl() {
