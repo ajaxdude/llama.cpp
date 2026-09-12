@@ -1,3 +1,4 @@
+#include "../src/llama-bounded-file.h"
 #include "../src/llama-engram.h"
 #include "../src/llama-ple-disk.h"
 
@@ -351,6 +352,30 @@ static void test_disk_rows() {
     check(unlink(path) == 0, "failed to remove Engram test file");
 }
 
+#if defined(__linux__)
+static void test_direct_tail_read() {
+    char path[] = "/tmp/llama-direct-tail-XXXXXX";
+    const int fd = mkstemp(path);
+    check(fd >= 0, "failed to create direct tail test file");
+
+    constexpr uint64_t offset = 4096;
+    const uint8_t expected[] = { 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2 };
+    write_full(fd, expected, sizeof(expected), offset);
+    close(fd);
+
+    llama_bounded_file::params params;
+    params.direct_io = true;
+    params.direct_io_required = true;
+    llama_bounded_file file(path, params);
+    check(file.direct_io(), "direct tail test did not use O_DIRECT");
+    llama_bounded_file::buffer scratch = file.make_buffer(sizeof(expected));
+    uint8_t actual[sizeof(expected)] = {};
+    file.read(offset, actual, sizeof(actual), scratch);
+    check(memcmp(actual, expected, sizeof(actual)) == 0, "valid direct tail read failed");
+    check(unlink(path) == 0, "failed to remove direct tail test file");
+}
+#endif
+
 static void test_ple_disk_reader() {
     char path[] = "/tmp/llama-ple-reader-XXXXXX";
     const int fd = mkstemp(path);
@@ -381,6 +406,24 @@ static void test_ple_disk_reader() {
                   "shared bounded reader changed PLE row output");
         }
     }
+
+    llama_ple_disk::params params;
+    params.n_threads = 4;
+    params.cache_bytes = 0;
+    params.direct_io = false;
+    llama_ple_disk disk(path, offset, GGML_TYPE_F32, columns, rows, params);
+    check(truncate(path, (off_t) (offset + sizeof(float))) == 0, "failed to truncate PLE test file");
+    const int32_t ids[] = { 0, 1, 2 };
+    float output[3][columns];
+    expect_runtime([&] { disk.gather(ids, 3, output[0]); }, "threaded PLE read failure did not propagate");
+
+    const int repair_fd = open(path, O_WRONLY);
+    check(repair_fd >= 0, "failed to reopen PLE test file");
+    write_full(repair_fd, table, sizeof(table), offset);
+    close(repair_fd);
+    disk.gather(ids, 3, output[0]);
+    check(memcmp(output, table, sizeof(table)) == 0, "PLE reader did not recover after worker failure");
+
     check(unlink(path) == 0, "failed to remove PLE test file");
 }
 #endif
@@ -391,6 +434,9 @@ int main() {
     test_decode();
 #if !defined(_WIN32)
     test_disk_rows();
+#if defined(__linux__)
+    test_direct_tail_read();
+#endif
     test_ple_disk_reader();
 #endif
     std::puts("Engram layout, hash and bounded disk rows: PASS");

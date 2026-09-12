@@ -134,7 +134,8 @@ struct llama_bounded_file::impl {
     void pread_full(void * dst, size_t len, uint64_t offset, size_t need) const {
         size_t done = 0;
         while (done < len) {
-            const ssize_t n = pread(fd, (uint8_t *) dst + done, len - done, (off_t) (offset + done));
+            const size_t remaining = len - done;
+            const ssize_t n = pread(fd, (uint8_t *) dst + done, remaining, (off_t) (offset + done));
             if (n < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -146,6 +147,12 @@ struct llama_bounded_file::impl {
                 break;
             }
             done += (size_t) n;
+            if (direct && done >= need) {
+                return;
+            }
+            if (direct && (size_t) n < remaining) {
+                break;
+            }
         }
         if (done < need) {
             throw std::runtime_error(format("llama_bounded_file: short read in %s: %zu of %zu bytes at %llu",

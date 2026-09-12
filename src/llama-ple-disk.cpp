@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -47,6 +48,7 @@ struct llama_ple_disk::impl {
     uint64_t                 gen     = 0;
     size_t                   pending = 0;
     std::atomic<size_t>      next{0};
+    std::exception_ptr       worker_error;
     bool                     stop    = false;
 
     uint64_t st_calls = 0, st_rows = 0, st_uniq = 0, st_hits = 0, st_reads = 0, st_bytes = 0;
@@ -119,7 +121,7 @@ struct llama_ple_disk::impl {
     }
 
     void worker() {
-        llama_bounded_file::buffer bounce = file->make_buffer(rs);
+        llama_bounded_file::buffer bounce;
         uint64_t  seen   = 0;
         for (;;) {
             {
@@ -130,15 +132,26 @@ struct llama_ple_disk::impl {
                 }
                 seen = gen;
             }
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= misses.size()) {
-                    break;
+            std::exception_ptr error;
+            try {
+                if (direct && bounce.empty()) {
+                    bounce = file->make_buffer(rs);
                 }
-                read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
+                for (;;) {
+                    const size_t i = next.fetch_add(1);
+                    if (i >= misses.size()) {
+                        break;
+                    }
+                    read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
+                }
+            } catch (...) {
+                error = std::current_exception();
             }
             {
                 std::lock_guard<std::mutex> lk(pm);
+                if (error && !worker_error) {
+                    worker_error = error;
+                }
                 if (--pending == 0) {
                     cv_done.notify_one();
                 }
@@ -166,11 +179,17 @@ struct llama_ple_disk::impl {
             std::lock_guard<std::mutex> lk(pm);
             next    = 0;
             pending = workers.size();
+            worker_error = nullptr;
             ++gen;
         }
         cv_work.notify_all();
         std::unique_lock<std::mutex> lk(pm);
         cv_done.wait(lk, [&] { return pending == 0; });
+        const std::exception_ptr error = worker_error;
+        lk.unlock();
+        if (error) {
+            std::rethrow_exception(error);
+        }
     }
 
     void gather(const int32_t * idx, size_t n, float * dst) {
