@@ -1,0 +1,40 @@
+# Strix host-memory watchdog
+
+`scripts/strix_memory_watchdog.py` is an external Linux command wrapper for headless Strix Halo validation. It does not change model loading or cache sizing. It measures host-wide memory from procfs and controls the launched command's process group.
+
+```sh
+./scripts/strix_memory_watchdog.py -- ./build/bin/llama-server <arguments>
+```
+
+The wrapper performs these checks and actions:
+
+- It refuses to launch if `/proc/swaps` contains any active entry.
+- It calculates used memory as `MemTotal - MemAvailable`. Linux reports these fields in KiB, so the wrapper multiplies each value by 1024 and keeps all accounting as integer bytes.
+- It sends `SIGTERM` to the process group at 116 GiB used.
+- It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.
+- It sends `SIGKILL` and fails if swap appears or required procfs data becomes unavailable during execution.
+- It propagates an unmonitored child exit code. A signal exit uses the shell convention `128 + signal`.
+
+The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 120 GiB ceiling. The default sample interval is one second. This margin cannot guarantee the ceiling for a workload that can allocate more than 2 GiB between samples. Lower `--emergency-gib` or shorten `--sample-interval-seconds` for such a workload.
+
+Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB.
+
+The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Child standard input, standard output, and standard error are inherited unchanged.
+
+Exit classifications are authoritative in the final JSON record. Operational failures use these exit codes:
+
+| Exit code | Classification |
+| ---: | --- |
+| 2 | procfs or configuration error |
+| 3 | swap active at startup or detected during execution |
+| 4 | soft threshold reached |
+| 5 | emergency threshold reached |
+| 6 | soft-threshold grace period expired |
+| 7 | process-group signaling or termination failure |
+| 127 | command launch failure |
+
+No model, backend, or ROCm package is required to run the unit tests:
+
+```sh
+python3 tests/test_strix_memory_watchdog.py
+```
