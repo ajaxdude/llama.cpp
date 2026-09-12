@@ -71,12 +71,12 @@ struct llama_dsv41_config {
     float hc_eps;
     float swiglu_clamp;
     float routed_scale;
-    float rope_theta;
-    float compress_rope_theta;
+    uint32_t rope_theta;
+    uint32_t compress_rope_theta;
     float yarn_factor;
     float yarn_beta_fast;
     float yarn_beta_slow;
-    uint32_t yarn_original_context;
+    float yarn_original_context;
     bool expert_weights_norm;
     std::string hidden_act;
     std::string scoring_func;

@@ -12,7 +12,7 @@
 static constexpr int32_t DSV41_KV_SOURCES[] = { 2, 8, 14, 20 };
 static constexpr int32_t DSV41_INDEX_SOURCES[] = { 2, 8, 14, 20, 24, 28, 32, 36 };
 static constexpr uint32_t DSV41_ENGRAM_LAYERS[] = { 1, 14 };
-static constexpr uint32_t DSV41_ENGRAM_ROWS[] = { 30000000, 5000000 };
+static constexpr uint32_t DSV41_ENGRAM_ROWS[] = { 384006168, 384016682 };
 
 static void dsv41_require(bool condition, const char * message) {
     if (!condition) {
@@ -50,12 +50,12 @@ void llama_dsv41_validate_config(const llama_dsv41_config & config) {
     dsv41_require(config.hc_eps == 1.0e-6f, "hc_eps must be 1e-6");
     dsv41_require(config.swiglu_clamp == 10.0f, "swiglu_clamp_limit must be 10");
     dsv41_require(config.routed_scale == 1.5f, "routed_scaling_factor must be 1.5");
-    dsv41_require(config.rope_theta == 10000.0f, "rope_theta must be 10000");
-    dsv41_require(config.compress_rope_theta == 160000.0f, "compress_rope_theta must be 160000");
+    dsv41_require(config.rope_theta == 10000, "rope_theta must be 10000");
+    dsv41_require(config.compress_rope_theta == 160000, "compress_rope_theta must be 160000");
     dsv41_require(config.yarn_factor == 16.0f, "rope_scaling.factor must be 16");
     dsv41_require(config.yarn_beta_fast == 32.0f, "rope_scaling.beta_fast must be 32");
     dsv41_require(config.yarn_beta_slow == 1.0f, "rope_scaling.beta_slow must be 1");
-    dsv41_require(config.yarn_original_context == 65536, "rope_scaling.original_max_position_embeddings must be 65536");
+    dsv41_require(config.yarn_original_context == 65536.0f, "rope_scaling.original_max_position_embeddings must be 65536");
     dsv41_require(config.expert_weights_norm, "norm_topk_prob must be true");
     dsv41_require(config.hidden_act == "silu", "hidden_act must be silu");
     dsv41_require(config.scoring_func == "sqrtsoftplus", "scoring_func must be sqrtsoftplus");
@@ -68,7 +68,7 @@ void llama_dsv41_validate_config(const llama_dsv41_config & config) {
     dsv41_require(config.kv_sources == std::vector<uint32_t>(std::begin(DSV41_KV_SOURCES), std::end(DSV41_KV_SOURCES)), "kv_source_layers must be [2,8,14,20]");
     dsv41_require(config.index_sources == std::vector<uint32_t>(std::begin(DSV41_INDEX_SOURCES), std::end(DSV41_INDEX_SOURCES)), "index_source_layers must be [2,8,14,20,24,28,32,36]");
     dsv41_require(config.engram_layers == std::vector<uint32_t>(std::begin(DSV41_ENGRAM_LAYERS), std::end(DSV41_ENGRAM_LAYERS)), "engram.layer_ids must be [1,14]");
-    dsv41_require(config.engram_rows == std::vector<uint32_t>(std::begin(DSV41_ENGRAM_ROWS), std::end(DSV41_ENGRAM_ROWS)), "engram.rows must be [30000000,5000000]");
+    dsv41_require(config.engram_rows == std::vector<uint32_t>(std::begin(DSV41_ENGRAM_ROWS), std::end(DSV41_ENGRAM_ROWS)), "engram.rows must be [384006168,384016682]");
     dsv41_require(config.engram_encoding == LLAMA_DSV41_ENGRAM_ENCODING, "engram.encoding must be e4m3_e8m0_32_row264");
     dsv41_require(config.engram_compressed_vocab_size == LLAMA_DSV41_ENGRAM_COMPRESSED_VOCAB, "engram.compressed_vocab_size must be 99092");
     dsv41_require(config.engram_pad_id == LLAMA_DSV41_ENGRAM_PAD_ID, "engram.pad_id must be 2");
@@ -388,9 +388,7 @@ std::vector<int32_t> llama_dsv41_select_candidate_blocks(
         }
     }
 
-    if (n_visible%block_size != 0) {
-        block_scores.back() = std::numeric_limits<float>::infinity();
-    }
+    block_scores.back() = std::numeric_limits<float>::infinity();
 
     std::vector<int32_t> blocks(n_blocks);
     std::iota(blocks.begin(), blocks.end(), 0);

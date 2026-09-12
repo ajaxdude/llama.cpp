@@ -95,7 +95,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     hparams.dsv4_o_lora_rank = config.n_lora_o;
     hparams.dsv4_hc_mult = config.hc_count;
     hparams.dsv4_hc_sinkhorn_iters = config.hc_sinkhorn_iters;
-    hparams.dsv4_compress_rope_base = config.compress_rope_theta;
+    hparams.dsv4_compress_rope_base = (float) config.compress_rope_theta;
     hparams.dsv4_hc_eps = config.hc_eps;
     hparams.dsv41_candidate_source_layer = config.candidate_source_layer;
     hparams.dsv41_candidate_topk_blocks = config.candidate_topk_blocks;
@@ -104,11 +104,11 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     hparams.expert_weights_scale = config.routed_scale;
     hparams.expert_weights_norm = config.expert_weights_norm;
     hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
-    hparams.rope_freq_base_train = config.rope_theta;
-    hparams.rope_freq_base_train_swa = config.rope_theta;
+    hparams.rope_freq_base_train = (float) config.rope_theta;
+    hparams.rope_freq_base_train_swa = (float) config.rope_theta;
     hparams.rope_freq_scale_train = 1.0f/config.yarn_factor;
     hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
-    hparams.n_ctx_orig_yarn = config.yarn_original_context;
+    hparams.n_ctx_orig_yarn = (uint32_t) config.yarn_original_context;
     hparams.yarn_beta_fast = config.yarn_beta_fast;
     hparams.yarn_beta_slow = config.yarn_beta_slow;
     hparams.yarn_ext_factor = 1.0f;

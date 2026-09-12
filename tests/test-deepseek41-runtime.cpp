@@ -10,6 +10,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static void check(bool condition, const std::string & message) {
@@ -75,7 +76,7 @@ static llama_dsv41_config valid_config() {
     config.kv_sources = { 2, 8, 14, 20 };
     config.index_sources = { 2, 8, 14, 20, 24, 28, 32, 36 };
     config.engram_layers = { 1, 14 };
-    config.engram_rows = { 30000000, 5000000 };
+    config.engram_rows = { 384006168, 384016682 };
     config.engram_encoding = LLAMA_DSV41_ENGRAM_ENCODING;
     config.engram_compressed_vocab_size = LLAMA_DSV41_ENGRAM_COMPRESSED_VOCAB;
     config.engram_pad_id = LLAMA_DSV41_ENGRAM_PAD_ID;
@@ -86,7 +87,12 @@ static llama_dsv41_config valid_config() {
 }
 
 static void test_hparams() {
+    static_assert(std::is_same_v<decltype(llama_dsv41_config::rope_theta), uint32_t>);
+    static_assert(std::is_same_v<decltype(llama_dsv41_config::compress_rope_theta), uint32_t>);
+    static_assert(std::is_same_v<decltype(llama_dsv41_config::yarn_original_context), float>);
+
     llama_dsv41_validate_config(valid_config());
+    check(valid_config().engram_rows == std::vector<uint32_t>({ 384006168, 384016682 }), "published Engram rows mismatch");
 
     llama_dsv41_config config = valid_config();
     config.compress_ratios.insert(config.compress_ratios.end(), 3, 0);
@@ -199,14 +205,14 @@ static void test_raw_ring() {
 }
 
 static void test_candidates() {
-    for (uint32_t n_visible : { 1u, 7u, 8u, 9u, 127u, 16385u, 17017u }) {
+    for (uint32_t n_visible : { 1u, 7u, 8u, 9u, 127u, 16385u, 16392u, 17017u }) {
         std::vector<float> scores(n_visible);
         for (uint32_t i = 0; i < n_visible; ++i) {
             scores[i] = -(float) i;
         }
         const auto blocks = llama_dsv41_select_candidate_blocks(scores, n_visible, 8, 2048);
         const int32_t final_block = (int32_t) ((n_visible - 1)/8);
-        check(std::find(blocks.begin(), blocks.end(), final_block) != blocks.end(), "final partial candidate block was dropped");
+        check(std::find(blocks.begin(), blocks.end(), final_block) != blocks.end(), "final visible candidate block was dropped");
         check(blocks.size() == std::min<uint32_t>(2048, (n_visible + 7)/8), "candidate block count mismatch");
         const auto rows = llama_dsv41_candidate_rows(blocks, n_visible, 8);
         check(std::find(rows.begin(), rows.end(), (int32_t) n_visible - 1) != rows.end(), "final visible row was filtered");
@@ -214,12 +220,17 @@ static void test_candidates() {
     }
 
     const auto tie = llama_dsv41_select_candidate_blocks(std::vector<float>(24, 1.0f), 24, 8, 2);
-    check(tie == std::vector<int32_t>({ 0, 1 }), "candidate tie-break mismatch");
+    check(tie == std::vector<int32_t>({ 2, 0 }), "candidate tie-break or final block retention mismatch");
 
     std::vector<float> partial_scores(9, -100.0f);
     partial_scores[0] = 100.0f;
     const auto partial = llama_dsv41_select_candidate_blocks(partial_scores, 9, 8, 1);
     check(partial == std::vector<int32_t>({ 1 }), "final partial candidate block was not forced");
+
+    std::vector<float> full_scores(16392, -100.0f);
+    full_scores[0] = 100.0f;
+    const auto full = llama_dsv41_select_candidate_blocks(full_scores, 16392, 8, 2048);
+    check(std::find(full.begin(), full.end(), 2048) != full.end(), "final full candidate block was not forced");
 }
 
 static void test_output_collapse() {
