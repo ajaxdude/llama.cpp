@@ -378,18 +378,32 @@ def _graceful_cleanup(
     classification: str,
     exit_code: int,
     reason: str,
-    graceful_signal: int,
+    graceful_signal: int | None,
     grace_seconds: float,
     signal_group: Callable[[int, int], str],
     group_alive: Callable[[int], bool],
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
+    process_group_status: str = "active",
     error: str | None = None,
 ) -> int:
-    signal_events: list[tuple[int, str]] = []
     try:
-        group_status = signal_group(child.pid, graceful_signal)
-        signal_events.append((graceful_signal, group_status))
+        if graceful_signal is not None:
+            process_group_status = signal_group(
+                child.pid, graceful_signal
+            )
+            audit.emit(
+                "process_group_signal",
+                **_state_fields(
+                    snapshot,
+                    peak_used_bytes,
+                    child,
+                    child.poll(),
+                    process_group_status,
+                    reason,
+                ),
+                signal=signal.Signals(graceful_signal).name,
+            )
         deadline = monotonic() + grace_seconds
         while monotonic() < deadline:
             child.poll()
@@ -398,8 +412,21 @@ def _graceful_cleanup(
             sleeper(min(0.05, deadline - monotonic()))
         child.poll()
         if group_alive(child.pid):
-            group_status = signal_group(child.pid, signal.SIGKILL)
-            signal_events.append((signal.SIGKILL, group_status))
+            process_group_status = signal_group(
+                child.pid, signal.SIGKILL
+            )
+            audit.emit(
+                "process_group_signal",
+                **_state_fields(
+                    snapshot,
+                    peak_used_bytes,
+                    child,
+                    child.poll(),
+                    process_group_status,
+                    reason,
+                ),
+                signal="SIGKILL",
+            )
     except ProcessGroupError as exc:
         return _emit_final(
             audit,
@@ -432,19 +459,6 @@ def _graceful_cleanup(
                 str(exc),
             )
 
-    for signal_number, status in signal_events:
-        audit.emit(
-            "process_group_signal",
-            **_state_fields(
-                snapshot,
-                peak_used_bytes,
-                child,
-                child_returncode,
-                status,
-                reason,
-            ),
-            signal=signal.Signals(signal_number).name,
-        )
     return _emit_final(
         audit,
         classification,
@@ -454,7 +468,7 @@ def _graceful_cleanup(
         peak_used_bytes,
         child,
         child_returncode,
-        signal_events[-1][1],
+        process_group_status,
         error,
     )
 
@@ -466,6 +480,7 @@ def _monitor_child(
     child: ProcessHandle,
     state: RuntimeState,
     signal_group: Callable[[int, int], str],
+    group_alive: Callable[[int], bool],
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
 ) -> int:
@@ -475,19 +490,50 @@ def _monitor_child(
         child_returncode = child.poll()
         if child_returncode is not None:
             soft_stop = soft_deadline is not None
+            classification = "soft_limit" if soft_stop else "child_exit"
+            exit_code = EXIT_SOFT_LIMIT if soft_stop else (
+                128 - child_returncode
+                if child_returncode < 0
+                else child_returncode
+            )
+            reason = (
+                "child exited during soft-threshold grace period"
+                if soft_stop
+                else "child exited"
+            )
+            if group_alive(child.pid):
+                grace_seconds = config.grace_seconds
+                graceful_signal: int | None = signal.SIGTERM
+                group_status = "active"
+                if soft_stop:
+                    grace_seconds = max(
+                        0.0, soft_deadline - monotonic()
+                    )
+                    graceful_signal = None
+                    group_status = "sigterm_sent"
+                return _graceful_cleanup(
+                    audit,
+                    child,
+                    state.snapshot,
+                    state.peak_used_bytes,
+                    classification,
+                    exit_code,
+                    (
+                        f"{reason}; process group members still running"
+                    ),
+                    graceful_signal,
+                    grace_seconds,
+                    signal_group,
+                    group_alive,
+                    monotonic,
+                    sleeper,
+                    group_status,
+                )
             return _emit_final(
                 audit,
-                "soft_limit" if soft_stop else "child_exit",
-                EXIT_SOFT_LIMIT if soft_stop else (
-                    128 - child_returncode
-                    if child_returncode < 0
-                    else child_returncode
-                ),
-                (
-                    "child exited during soft-threshold grace period"
-                    if soft_stop
-                    else "child exited"
-                ),
+                classification,
+                exit_code,
+                reason,
                 state.snapshot,
                 state.peak_used_bytes,
                 child,
@@ -678,15 +724,25 @@ def run_watchdog(
             snapshot.used_bytes,
         )
 
-    previous_mask: set[signal.Signals] | None = signal.pthread_sigmask(
+    previous_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK, PARENT_SIGNALS
     )
+    mask_restored = False
     previous_handlers: dict[int, signal.Handlers] = {}
     child: ProcessHandle | None = None
     state = RuntimeState(snapshot, snapshot.used_bytes)
     try:
+        launch_mask = previous_mask
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, launch_mask)
+
         try:
-            child = launcher(config.command, start_new_session=True)
+            child = launcher(
+                config.command,
+                start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
+            )
         except (OSError, ValueError) as exc:
             detail = getattr(exc, "strerror", None) or str(exc)
             return _emit_final(
@@ -703,7 +759,7 @@ def run_watchdog(
             _raise_parent_signal
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        previous_mask = None
+        mask_restored = True
         audit.emit(
             "child_started",
             **_state_fields(
@@ -723,6 +779,7 @@ def run_watchdog(
             child,
             state,
             signal_group,
+            group_alive,
             monotonic,
             sleeper,
         )
@@ -760,10 +817,10 @@ def run_watchdog(
             group_alive,
             monotonic,
             sleeper,
-            f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}: {exc}",
         )
     finally:
-        if previous_mask is not None:
+        if not mask_restored:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         if previous_handlers:
             _restore_parent_signal_handlers(previous_handlers)

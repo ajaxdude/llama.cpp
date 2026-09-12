@@ -214,6 +214,17 @@ class TestWatchdogBehavior(unittest.TestCase):
             "Z"
         )
 
+    @staticmethod
+    def _write_procfs_fixture(root: Path) -> None:
+        (root / "meminfo").write_text(
+            "MemTotal: 131072 kB\nMemAvailable: 65536 kB\n",
+            encoding="utf-8",
+        )
+        (root / "swaps").write_text(
+            "Filename Type Size Used Priority\n",
+            encoding="utf-8",
+        )
+
     def test_parent_signals_leave_no_child_or_grandchild(self) -> None:
         child_code = (
             "import os,signal,sys,time;"
@@ -232,15 +243,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     root = Path(temp_dir)
                     pid_file = root / "pids"
-                    (root / "meminfo").write_text(
-                        "MemTotal: 131072 kB\n"
-                        "MemAvailable: 65536 kB\n",
-                        encoding="utf-8",
-                    )
-                    (root / "swaps").write_text(
-                        "Filename Type Size Used Priority\n",
-                        encoding="utf-8",
-                    )
+                    self._write_procfs_fixture(root)
                     audit_path = root / "audit.jsonl"
                     with audit_path.open("w", encoding="utf-8") as audit:
                         wrapper = subprocess.Popen(
@@ -303,16 +306,29 @@ class TestWatchdogBehavior(unittest.TestCase):
                     self.assertEqual(
                         records[-1]["classification"], "parent_signal"
                     )
-                    forwarded = [
-                        record["signal"]
+                    signal_records = [
+                        record
                         for record in records
                         if record["event"] == "process_group_signal"
+                    ]
+                    forwarded = [
+                        record["signal"] for record in signal_records
                     ]
                     self.assertEqual(
                         forwarded[0],
                         signal.Signals(signal_number).name,
                     )
                     self.assertEqual(forwarded[-1], "SIGKILL")
+                    self.assertEqual(
+                        signal_records[0]["child_status"], "running"
+                    )
+                    self.assertIsNone(
+                        signal_records[0]["child_returncode"]
+                    )
+                    self.assertLess(
+                        signal_records[0]["timestamp"],
+                        signal_records[-1]["timestamp"],
+                    )
                     for process_id in (child_pid, grandchild_pid):
                         deadline = time.monotonic() + 2
                         while (
@@ -323,6 +339,165 @@ class TestWatchdogBehavior(unittest.TestCase):
                         self.assertFalse(
                             self._process_is_running(process_id)
                         )
+
+    def test_child_sigterm_handler_exits_without_escalation(self) -> None:
+        child_code = (
+            "import os,signal,sys,time\n"
+            "def stop(_signal,_frame):\n"
+            " open(sys.argv[2],'w').write('handled\\n')\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM,stop)\n"
+            "open(sys.argv[1],'w').write(f'{os.getpid()}\\n')\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ready_path = root / "ready"
+            handled_path = root / "handled"
+            audit_path = root / "audit.jsonl"
+            self._write_procfs_fixture(root)
+            with audit_path.open("w", encoding="utf-8") as audit:
+                wrapper = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--procfs-root",
+                        str(root),
+                        "--grace-seconds",
+                        "0.5",
+                        "--sample-interval-seconds",
+                        "0.05",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(ready_path),
+                        str(handled_path),
+                    ],
+                    stderr=audit,
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not ready_path.exists():
+                    if time.monotonic() >= deadline:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                        self.fail("SIGTERM child did not become ready")
+                    time.sleep(0.01)
+                child_pid = int(
+                    ready_path.read_text(encoding="utf-8").strip()
+                )
+                try:
+                    wrapper.send_signal(signal.SIGTERM)
+                    wrapper.wait(timeout=5)
+                finally:
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            forwarded = [
+                record["signal"]
+                for record in records
+                if record["event"] == "process_group_signal"
+            ]
+            self.assertEqual(wrapper.returncode, 128 + signal.SIGTERM)
+            self.assertTrue(handled_path.exists())
+            self.assertEqual(forwarded, ["SIGTERM"])
+            self.assertEqual(records[-1]["child_returncode"], 0)
+
+    def test_leader_exit_cleans_up_surviving_grandchild(self) -> None:
+        child_code = (
+            "import os,signal,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "grandchild=os.fork();"
+            "\nif grandchild == 0:\n"
+            " time.sleep(30)\n"
+            "else:\n"
+            " open(sys.argv[1],'w').write("
+            "f'{os.getpid()} {grandchild}\\n')\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pid_file = root / "pids"
+            audit_path = root / "audit.jsonl"
+            self._write_procfs_fixture(root)
+            with audit_path.open("w", encoding="utf-8") as audit:
+                wrapper = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--procfs-root",
+                        str(root),
+                        "--grace-seconds",
+                        "0.2",
+                        "--sample-interval-seconds",
+                        "0.05",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(pid_file),
+                    ],
+                    stderr=audit,
+                    text=True,
+                )
+                deadline = time.monotonic() + 5
+                while not pid_file.exists():
+                    if time.monotonic() >= deadline:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                        self.fail("leader process did not write child PIDs")
+                    time.sleep(0.01)
+                child_pid, grandchild_pid = (
+                    int(value)
+                    for value in pid_file.read_text(
+                        encoding="utf-8"
+                    ).split()
+                )
+                try:
+                    wrapper.wait(timeout=5)
+                finally:
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            forwarded = [
+                record["signal"]
+                for record in records
+                if record["event"] == "process_group_signal"
+            ]
+            self.assertEqual(wrapper.returncode, 0)
+            self.assertEqual(records[-1]["classification"], "child_exit")
+            self.assertEqual(records[-1]["child_returncode"], 0)
+            self.assertEqual(forwarded, ["SIGTERM", "SIGKILL"])
+            for process_id in (child_pid, grandchild_pid):
+                deadline = time.monotonic() + 2
+                while (
+                    self._process_is_running(process_id)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertFalse(self._process_is_running(process_id))
 
     def test_configuration_rejects_non_finite_timing(self) -> None:
         config = watchdog.WatchdogConfig(
@@ -335,14 +510,7 @@ class TestWatchdogBehavior(unittest.TestCase):
     def test_cli_fixture_launches_command_and_propagates_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / "meminfo").write_text(
-                "MemTotal: 131072 kB\nMemAvailable: 65536 kB\n",
-                encoding="utf-8",
-            )
-            (root / "swaps").write_text(
-                "Filename Type Size Used Priority\n",
-                encoding="utf-8",
-            )
+            self._write_procfs_fixture(root)
             result = subprocess.run(
                 [
                     sys.executable,
