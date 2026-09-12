@@ -59,7 +59,7 @@ struct llama_dsv41_engram_transaction {
             size_t token_offset,
             size_t token_count,
             ggml_tensor * rows_input,
-            ggml_tensor * text_mask_input) const;
+            ggml_tensor * text_select_input) const;
 
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -91,14 +91,19 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
+// text_select row i keeps the original residual; row tokens+i selects the BF16-updated residual.
 ggml_tensor * llama_dsv41_build_engram_add(
         ggml_context * ctx,
         ggml_tensor * residual,
         ggml_tensor * projected,
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
-        ggml_tensor * text_mask,
+        ggml_tensor * text_select,
         float rms_eps);
+
+ggml_tensor * llama_dsv41_build_engram_gate(
+        ggml_context * ctx,
+        ggml_tensor * dot);
 
 ggml_tensor * llama_dsv41_build_engram(
         ggml_context * ctx,
@@ -107,5 +112,5 @@ ggml_tensor * llama_dsv41_build_engram(
         ggml_tensor * engram_kv,
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
-        ggml_tensor * text_mask,
+        ggml_tensor * text_select,
         float rms_eps);

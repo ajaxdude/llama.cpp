@@ -35,7 +35,6 @@ struct llama_dsv41_engram_transaction::impl {
     std::vector<uint32_t> ids;
     std::array<std::vector<float>, LLAMA_ENGRAM_LAYERS> decoded;
     std::vector<uint8_t> mask;
-    std::vector<float> mask_f32;
     std::map<llama_seq_id, llama_dsv41_engram_sequence_state> next;
 };
 
@@ -71,7 +70,7 @@ void llama_dsv41_engram_transaction::upload_layer(
         size_t token_offset,
         size_t token_count,
         ggml_tensor * rows_input,
-        ggml_tensor * text_mask_input) const {
+        ggml_tensor * text_select_input) const {
     if (!pimpl->active) {
         throw std::invalid_argument("DeepSeek V4.1 Engram transaction is not active");
     }
@@ -80,11 +79,11 @@ void llama_dsv41_engram_transaction::upload_layer(
         throw std::invalid_argument("DeepSeek V4.1 Engram upload range is invalid");
     }
     const int64_t row_width = LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM;
-    if (rows_input == nullptr || text_mask_input == nullptr ||
+    if (rows_input == nullptr || text_select_input == nullptr ||
             rows_input->type != GGML_TYPE_F32 || rows_input->ne[0] != row_width ||
             ggml_nelements(rows_input) != row_width*(int64_t) token_count ||
-            text_mask_input->type != GGML_TYPE_F32 ||
-            ggml_nelements(text_mask_input) != (int64_t) token_count) {
+            text_select_input->type != GGML_TYPE_I32 ||
+            ggml_nelements(text_select_input) != (int64_t) token_count) {
         throw std::invalid_argument("DeepSeek V4.1 Engram input tensor shape mismatch");
     }
 
@@ -94,11 +93,15 @@ void llama_dsv41_engram_transaction::upload_layer(
             pimpl->decoded[layer].data() + row_offset,
             0,
             token_count*row_width*sizeof(float));
+    std::vector<int32_t> select(token_count);
+    for (size_t i = 0; i < token_count; ++i) {
+        select[i] = pimpl->mask[token_offset + i] != 0 ? (int32_t) (token_count + i) : (int32_t) i;
+    }
     ggml_backend_tensor_set(
-            text_mask_input,
-            pimpl->mask_f32.data() + token_offset,
+            text_select_input,
+            select.data(),
             0,
-            token_count*sizeof(float));
+            token_count*sizeof(int32_t));
 }
 
 struct llama_dsv41_engram_runtime::impl {
@@ -114,8 +117,8 @@ struct llama_dsv41_engram_runtime::impl {
             size_t max_tokens) :
         hasher(std::move(layout)),
         max_tokens(max_tokens) {
-        if (max_tokens == 0) {
-            throw std::invalid_argument("DeepSeek V4.1 Engram token bound must be non-zero");
+        if (max_tokens == 0 || max_tokens > (size_t) INT32_MAX/2) {
+            throw std::invalid_argument("DeepSeek V4.1 Engram token bound is invalid");
         }
         for (size_t i = 0; i < LLAMA_ENGRAM_LAYERS; ++i) {
             llama_dsv41_validate_engram_extent(extents[i]);
@@ -148,7 +151,6 @@ llama_dsv41_engram_transaction llama_dsv41_engram_runtime::prepare(
     result.pimpl->count = tokens.size();
     result.pimpl->ids.resize(tokens.size()*LLAMA_ENGRAM_LAYERS*LLAMA_ENGRAM_COLS);
     result.pimpl->mask.resize(tokens.size());
-    result.pimpl->mask_f32.resize(tokens.size());
     result.pimpl->next = pimpl->sequences;
 
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -188,7 +190,6 @@ llama_dsv41_engram_transaction llama_dsv41_engram_runtime::prepare(
                 expected,
                 sizeof(expected));
         result.pimpl->mask[i] = token.text != 0;
-        result.pimpl->mask_f32[i] = token.text != 0 ? 1.0f : 0.0f;
     }
 
     const size_t row_values = tokens.size()*LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM;
@@ -279,13 +280,40 @@ static ggml_tensor * dsv41_bf16_f32(ggml_context * ctx, ggml_tensor * tensor) {
     return ggml_cast(ctx, ggml_cast(ctx, tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
 }
 
+static void dsv41_engram_gate_f32(
+        ggml_tensor * dst,
+        const ggml_tensor * src,
+        int ith,
+        int nth,
+        void *) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src));
+    const float * input = static_cast<const float *>(src->data);
+    float * output = static_cast<float *>(dst->data);
+    const int64_t count = ggml_nelements(src);
+    for (int64_t i = ith; i < count; i += nth) {
+        const float signed_root = std::copysign(std::sqrt(std::max(std::abs(input[i]), 1.0e-6f)), input[i]);
+        output[i] = 1.0f/(1.0f + std::exp(-signed_root));
+    }
+}
+
+ggml_tensor * llama_dsv41_build_engram_gate(
+        ggml_context * ctx,
+        ggml_tensor * dot) {
+    if (ctx == nullptr || dot == nullptr) {
+        throw std::invalid_argument("DeepSeek V4.1 Engram gate input is null");
+    }
+    // This small CPU fallback preserves copysign for signed zero on every scheduler backend.
+    return ggml_map_custom1(ctx, dot, dsv41_engram_gate_f32, GGML_N_TASKS_MAX, nullptr);
+}
+
 ggml_tensor * llama_dsv41_build_engram_add(
         ggml_context * ctx,
         ggml_tensor * residual,
         ggml_tensor * projected,
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
-        ggml_tensor * text_mask,
+        ggml_tensor * text_select,
         float rms_eps) {
     if (ctx == nullptr || residual == nullptr || projected == nullptr || q_norm == nullptr || k_norm == nullptr) {
         throw std::invalid_argument("DeepSeek V4.1 Engram graph input is null");
@@ -294,11 +322,12 @@ ggml_tensor * llama_dsv41_build_engram_add(
     const int64_t width = residual->ne[0];
     const int64_t streams = residual->ne[1];
     const int64_t tokens = residual->ne[2];
-    if (width <= 0 || streams != 4 || tokens <= 0 ||
+    if (width <= 0 || streams != 4 || tokens <= 0 || tokens > INT32_MAX/2 ||
             projected->ne[0] != 5*width || projected->ne[1] != tokens ||
             q_norm->ne[0] != width || q_norm->ne[1] != streams ||
             k_norm->ne[0] != width || k_norm->ne[1] != streams ||
-            (text_mask != nullptr && (text_mask->ne[0] != 1 || text_mask->ne[1] != tokens))) {
+            (text_select != nullptr &&
+             (text_select->type != GGML_TYPE_I32 || ggml_nelements(text_select) != tokens))) {
         throw std::invalid_argument("DeepSeek V4.1 Engram graph shape mismatch");
     }
 
@@ -321,14 +350,11 @@ ggml_tensor * llama_dsv41_build_engram_add(
         dot = ggml_mul(ctx, dot, key_norm);
         dot = ggml_scale(ctx, ggml_sum_rows(ctx, dot), 1.0f/std::sqrt((float) width));
 
-        ggml_tensor * magnitude = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, dot), 1.0e-6f, INFINITY));
-        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, dot), magnitude));
-        if (text_mask != nullptr) {
-            gate = ggml_mul(ctx, gate, text_mask);
+        ggml_tensor * gate = llama_dsv41_build_engram_gate(ctx, dot);
+        ggml_tensor * updated = dsv41_bf16_f32(ctx, ggml_add(ctx, hidden, ggml_mul(ctx, value, gate)));
+        if (text_select != nullptr) {
+            updated = ggml_get_rows(ctx, ggml_concat(ctx, hidden, updated, 1), text_select);
         }
-
-        ggml_tensor * updated = ggml_add(ctx, hidden, ggml_mul(ctx, value, gate));
-        updated = dsv41_bf16_f32(ctx, updated);
         updated = ggml_reshape_3d(ctx, updated, width, 1, tokens);
         result = result == nullptr ? updated : ggml_concat(ctx, result, updated, 1);
     }
@@ -342,7 +368,7 @@ ggml_tensor * llama_dsv41_build_engram(
         ggml_tensor * engram_kv,
         ggml_tensor * q_norm,
         ggml_tensor * k_norm,
-        ggml_tensor * text_mask,
+        ggml_tensor * text_select,
         float rms_eps) {
     if (ctx == nullptr || residual == nullptr || rows == nullptr || engram_kv == nullptr ||
             rows->ne[0] != LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM ||
@@ -352,5 +378,5 @@ ggml_tensor * llama_dsv41_build_engram(
     }
     ggml_tensor * projected = ggml_mul_mat(ctx, engram_kv, rows);
     return llama_dsv41_build_engram_add(
-            ctx, residual, projected, q_norm, k_norm, text_mask, rms_eps);
+            ctx, residual, projected, q_norm, k_norm, text_select, rms_eps);
 }

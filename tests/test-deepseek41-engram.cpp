@@ -222,7 +222,7 @@ static void test_scheduler_upload() {
     check(ctx != nullptr, "failed to create DeepSeek V4.1 Engram upload context");
     ggml_tensor * rows = ggml_new_tensor_2d(
             ctx, GGML_TYPE_F32, LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM, transaction.token_count());
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, transaction.token_count());
+    ggml_tensor * select = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, transaction.token_count());
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     check(backend != nullptr, "failed to create DeepSeek V4.1 Engram upload backend");
@@ -230,23 +230,23 @@ static void test_scheduler_upload() {
     check(buffer != nullptr, "failed to allocate DeepSeek V4.1 Engram upload tensors");
 
     std::vector<float> actual_rows(ggml_nelements(rows));
-    std::vector<float> actual_mask(ggml_nelements(mask));
+    std::vector<int32_t> actual_select(ggml_nelements(select));
     for (uint32_t layer = 0; layer < LLAMA_ENGRAM_LAYERS; ++layer) {
-        transaction.upload_layer(layer, 0, transaction.token_count(), rows, mask);
+        transaction.upload_layer(layer, 0, transaction.token_count(), rows, select);
         ggml_backend_tensor_get(rows, actual_rows.data(), 0, ggml_nbytes(rows));
-        ggml_backend_tensor_get(mask, actual_mask.data(), 0, ggml_nbytes(mask));
+        ggml_backend_tensor_get(select, actual_select.data(), 0, ggml_nbytes(select));
         check(std::memcmp(
                 actual_rows.data(),
                 transaction.rows(layer),
                 ggml_nbytes(rows)) == 0,
               "scheduler-backed Engram row upload changed the bounded pack");
-        check(actual_mask == std::vector<float>({ 1.0f, 0.0f, 1.0f }),
-              "scheduler-backed Engram text mask upload changed");
+        check(actual_select == std::vector<int32_t>({ 3, 1, 5 }),
+              "scheduler-backed Engram text selection upload changed");
     }
 
     runtime.commit(transaction);
     expect_invalid(
-            [&] { transaction.upload_layer(0, 0, 3, rows, mask); },
+            [&] { transaction.upload_layer(0, 0, 3, rows, select); },
             "committed Engram transaction uploaded stale input");
 
     ggml_backend_buffer_free(buffer);
@@ -335,7 +335,7 @@ static void test_graph_gate() {
             ctx, GGML_TYPE_F32, LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM, 5*width);
     ggml_tensor * q_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, streams);
     ggml_tensor * k_norm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, streams);
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, tokens);
+    ggml_tensor * select = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
 
     float * residual_data = static_cast<float *>(residual->data);
     float * rows_data = static_cast<float *>(rows->data);
@@ -343,8 +343,12 @@ static void test_graph_gate() {
     float * q_data = static_cast<float *>(q_norm->data);
     float * k_data = static_cast<float *>(k_norm->data);
     for (int64_t i = 0; i < width*streams*tokens; ++i) {
-        residual_data[i] = bf16(0.125f + (float) (i%13)/16.0f);
+        residual_data[i] = i < width*streams ?
+                bf16(0.125f + (float) (i%13)/16.0f) :
+                0.1234567f + (float) (i%13)/17.0f;
     }
+    residual_data[width*streams] = -0.0f;
+    residual_data[width*streams + 1] = 0.0f;
     std::fill(rows_data, rows_data + ggml_nelements(rows), 0.0f);
     std::fill(engram_kv_data, engram_kv_data + ggml_nelements(engram_kv), 0.0f);
     std::vector<float> projected_data(5*width*tokens);
@@ -359,12 +363,12 @@ static void test_graph_gate() {
         q_data[i] = 0.5f + (float) (i%5)/8.0f;
         k_data[i] = 0.75f - (float) (i%3)/16.0f;
     }
-    static_cast<float *>(mask->data)[0] = 1.0f;
-    static_cast<float *>(mask->data)[1] = 0.0f;
+    static_cast<int32_t *>(select->data)[0] = tokens;
+    static_cast<int32_t *>(select->data)[1] = 1;
 
     const std::vector<float> original(residual_data, residual_data + width*streams*tokens);
     ggml_tensor * output = llama_dsv41_build_engram(
-            ctx, residual, rows, engram_kv, q_norm, k_norm, mask, 1.0e-20f);
+            ctx, residual, rows, engram_kv, q_norm, k_norm, select, 1.0e-20f);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, output);
     check(ggml_graph_compute_with_ctx(ctx, graph, 1) == GGML_STATUS_SUCCESS,
@@ -400,6 +404,47 @@ static void test_graph_gate() {
     ggml_free(ctx);
 }
 
+static void test_signed_zero_gate() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    check(ctx != nullptr, "failed to create DeepSeek V4.1 signed-zero graph context");
+
+    ggml_tensor * dot = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+    ggml_set_input(dot);
+    ggml_tensor * gate = llama_dsv41_build_engram_gate(ctx, dot);
+    ggml_set_output(gate);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, gate);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    check(backend != nullptr, "failed to create DeepSeek V4.1 signed-zero backend");
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, &buft, 1, 16, false, true);
+    check(sched != nullptr, "failed to create DeepSeek V4.1 signed-zero scheduler");
+    check(ggml_backend_sched_alloc_graph(sched, graph), "failed to allocate DeepSeek V4.1 signed-zero graph");
+
+    const float input[] = { 0.0f, -0.0f };
+    ggml_backend_tensor_set(dot, input, 0, sizeof(input));
+    check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
+          "DeepSeek V4.1 signed-zero scheduler execution failed");
+    const float positive = 1.0f/(1.0f + std::exp(-0.001f));
+    const float negative = 1.0f/(1.0f + std::exp(0.001f));
+    float actual[2];
+    ggml_backend_tensor_get(gate, actual, 0, sizeof(actual));
+    check(std::abs(actual[0] - positive) < 1.0e-7f && actual[0] > 0.5f,
+          "DeepSeek V4.1 positive-zero gate lost copysign semantics");
+    check(std::abs(actual[1] - negative) < 1.0e-7f && actual[1] < 0.5f,
+          "DeepSeek V4.1 negative-zero gate lost copysign semantics");
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
 int main() {
 #if !defined(_WIN32)
     test_extent_validation();
@@ -409,6 +454,7 @@ int main() {
     test_transactional_read_failure();
 #endif
     test_graph_gate();
+    test_signed_zero_gate();
     std::puts("DeepSeek V4.1 Engram runtime and graph: PASS");
     return 0;
 }
