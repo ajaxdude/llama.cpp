@@ -267,7 +267,7 @@ void test_diagnostics_and_guards() {
                 "category=", "current=", "fixed=", "dense=", "state=", "workspace=",
                 "host_total=", "host_available=", "batch=", "outputs=", "outputs_per_seq=",
                 "expert_slots=", "required_expert_slots=", "expert_ubatch_capacity=",
-                "expert_cache=", "expert_staging=",
+                "expert_cache=", "expert_staging=", "expert_replacement=", "direct_io_bounce=",
                 "output_bytes=", "soft=", "watchdog=", "hard=" }) {
         REQUIRE(diagnostic.find(field) != std::string::npos);
     }
@@ -319,6 +319,33 @@ void test_expert_union_and_outputs() {
     REQUIRE(llama_dsv41_output_bytes(100, 16, 10) == expected);
 }
 
+void test_expert_replacement_peak() {
+    auto params = base_params();
+    params.n_ubatch = 32;
+    params.configured_cache_slots = 192;
+    auto result = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);
+    REQUIRE(result.expert_replacement_bytes == 1911029760);
+    REQUIRE(result.direct_io_bounce_bytes == 3874816);
+    REQUIRE(result.expert_replacement_bytes + result.direct_io_bounce_bytes == 1914904576);
+
+    params.n_ubatch = 36;
+    params.configured_cache_slots = 216;
+    result = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);
+    REQUIRE(result.expert_replacement_bytes + result.direct_io_bounce_bytes == 2153783296);
+
+    params.n_ubatch = 37;
+    params.configured_cache_slots = 222;
+    const auto baseline = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);
+    REQUIRE(baseline.expert_replacement_bytes + baseline.direct_io_bounce_bytes == 2213502976);
+
+    const uint64_t boundary_used = params.soft_bytes - baseline.projected_bytes;
+    const auto exact = llama_dsv41_admit(host_with_used(boundary_used), 0, published_tensors(), params);
+    REQUIRE(exact.projected_bytes == params.soft_bytes);
+    REQUIRE(!thrown([&]() {
+        llama_dsv41_admit(host_with_used(boundary_used + 1), 0, published_tensors(), params);
+    }).empty());
+}
+
 void test_runtime_memory_validation() {
     auto params = base_params();
     params.n_ubatch = 1;
@@ -365,6 +392,7 @@ int main() {
     test_context_progression();
     test_diagnostics_and_guards();
     test_expert_union_and_outputs();
+    test_expert_replacement_peak();
     test_runtime_memory_validation();
     test_unified_topology();
     return 0;

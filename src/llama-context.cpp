@@ -33,6 +33,17 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+struct llama_runtime_context_guard {
+    const llama_model & model;
+    bool active = true;
+
+    ~llama_runtime_context_guard() {
+        if (active) {
+            model.release_runtime_context();
+        }
+    }
+};
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -257,6 +268,8 @@ llama_context::llama_context(
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
 
     model.validate_context_params(cparams);
+    model.acquire_runtime_context();
+    llama_runtime_context_guard runtime_context_guard { model };
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -485,14 +498,17 @@ llama_context::llama_context(
         }
     }
 
-    model.acquire_runtime_context();
+    runtime_context_acquired = true;
+    runtime_context_guard.active = false;
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     model.release_runtime_work();
-    model.release_runtime_context();
+    if (runtime_context_acquired) {
+        model.release_runtime_context();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {

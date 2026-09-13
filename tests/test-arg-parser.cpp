@@ -170,6 +170,29 @@ static void test(void) {
         return res;
     };
 
+    {
+        common_params default_params;
+        const auto model_params = common_model_params_to_llama(default_params);
+        auto context_params = common_context_params_to_llama(default_params);
+        assert(model_params.dsv41_admission_ubatch == 32);
+        common_context_params_apply_arch_defaults("deepseek41", default_params, context_params);
+        assert(context_params.n_ubatch == 32);
+
+        common_params explicit_params;
+        std::vector<std::string> explicit_argv = { "binary_name", "-m", "model_file.gguf", "-ub", "37" };
+        assert(common_params_parse(
+                explicit_argv.size(),
+                list_str_to_char(explicit_argv).data(),
+                explicit_params,
+                LLAMA_EXAMPLE_COMMON));
+        const auto explicit_model_params = common_model_params_to_llama(explicit_params);
+        auto explicit_context_params = common_context_params_to_llama(explicit_params);
+        assert(explicit_params.n_ubatch_explicit);
+        assert(explicit_model_params.dsv41_admission_ubatch == 37);
+        common_context_params_apply_arch_defaults("deepseek41", explicit_params, explicit_context_params);
+        assert(explicit_context_params.n_ubatch == 37);
+    }
+
     std::vector<std::string> argv;
 
     printf("test-arg-parser: test invalid usage\n\n");

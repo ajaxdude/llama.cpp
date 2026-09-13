@@ -26,6 +26,16 @@ uint64_t checked_mul(uint64_t a, uint64_t b, const char * category) {
     return a*b;
 }
 
+uint64_t checked_align_up(uint64_t value, uint64_t alignment, const char * category) {
+    if (alignment == 0) {
+        throw std::runtime_error(std::string("DeepSeek V4.1 memory admission invalid alignment: ") + category);
+    }
+    return checked_mul(
+            checked_add(value, alignment - 1, category)/alignment,
+            alignment,
+            category);
+}
+
 uint64_t parse_u64(const std::string & value, const char * field) {
     uint64_t result = 0;
     const char * begin = value.data();
@@ -300,6 +310,15 @@ llama_dsv41_admission_result llama_dsv41_admit(
                 layer_slot_bytes[tensor.layer], tensor.nb[2], "expert slot");
         result.expert_slot_bytes = checked_add(
                 result.expert_slot_bytes, tensor.nb[2], "expert slot");
+        result.direct_io_bounce_bytes = std::max(
+                result.direct_io_bounce_bytes,
+                checked_align_up(
+                    checked_add(
+                        tensor.nb[2],
+                        LLAMA_EXPERT_STORE_DEFAULT_IO_ALIGNMENT - 1,
+                        "direct I/O bounce"),
+                    LLAMA_EXPERT_STORE_DEFAULT_IO_ALIGNMENT,
+                    "direct I/O bounce"));
     }
     if (expert_tensors.size() != LLAMA_DSV41_N_LAYER*3) {
         reject("cache", result, "expected 40 gate/up/down expert tensor sets");
@@ -320,6 +339,10 @@ llama_dsv41_admission_result llama_dsv41_admit(
     result.required_expert_slots = static_cast<uint32_t>(std::min<uint64_t>(
             LLAMA_DSV41_N_EXPERT,
             checked_mul(params.n_expert_used, params.n_ubatch, "required expert slots")));
+    result.expert_replacement_bytes = checked_mul(
+            result.required_expert_slots,
+            result.expert_staging_slot_bytes,
+            "expert replacement staging");
     const uint64_t bytes_slots = params.configured_cache_bytes == 0 ?
             LLAMA_DSV41_N_EXPERT : params.configured_cache_bytes/result.expert_slot_bytes;
     if (params.configured_cache_slots != 0 && params.configured_cache_bytes != 0 &&
@@ -349,6 +372,8 @@ llama_dsv41_admission_result llama_dsv41_admit(
     result.fixed_bytes = checked_add(result.fixed_bytes, result.state_bytes, "fixed bytes");
     result.fixed_bytes = checked_add(result.fixed_bytes, result.graph_workspace_bytes, "fixed bytes");
     result.fixed_bytes = checked_add(result.fixed_bytes, result.engram_staging_bytes, "fixed bytes");
+    result.fixed_bytes = checked_add(result.fixed_bytes, result.expert_replacement_bytes, "fixed bytes");
+    result.fixed_bytes = checked_add(result.fixed_bytes, result.direct_io_bounce_bytes, "fixed bytes");
     result.fixed_bytes = checked_add(result.fixed_bytes, result.output_bytes, "fixed bytes");
     result.fixed_bytes = checked_add(result.fixed_bytes, result.safety_margin_bytes, "fixed bytes");
 
@@ -435,7 +460,8 @@ std::string llama_dsv41_admission_result::describe() const {
             "outputs=%u, outputs_per_seq=%u, "
             "host_total=%llu, host_available=%llu, current=%llu, fixed=%llu, "
             "dense=%llu, state=%llu, workspace=%llu, engram_staging=%llu, expert_slots=%u, "
-            "required_expert_slots=%u, expert_ubatch_capacity=%u, expert_cache=%llu, expert_staging=%llu, output_bytes=%llu, "
+            "required_expert_slots=%u, expert_ubatch_capacity=%u, expert_cache=%llu, expert_staging=%llu, "
+            "expert_replacement=%llu, direct_io_bounce=%llu, output_bytes=%llu, "
             "safety_margin=%llu, projected=%llu, "
             "soft=%llu, watchdog=%llu, hard=%llu, device_reported_ignored=%llu",
             category.c_str(),
@@ -458,6 +484,8 @@ std::string llama_dsv41_admission_result::describe() const {
             expert_ubatch_capacity,
             (unsigned long long) expert_cache_bytes,
             (unsigned long long) expert_staging_bytes,
+            (unsigned long long) expert_replacement_bytes,
+            (unsigned long long) direct_io_bounce_bytes,
             (unsigned long long) output_bytes,
             (unsigned long long) safety_margin_bytes,
             (unsigned long long) projected_bytes,
