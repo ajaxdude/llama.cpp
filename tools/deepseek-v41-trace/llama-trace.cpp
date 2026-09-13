@@ -7,12 +7,14 @@ extern "C" {
 #include "hash/sha256/sha256.h"
 }
 #include "llama.h"
+#include "llama-ext.h"
 #include "trace-components.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <clocale>
 #include <cstdint>
@@ -26,12 +28,25 @@ extern "C" {
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 
 static constexpr int TRACE_VERSION = 1;
+#if defined(__linux__)
+static constexpr const char * WATCHDOG_SCRIPT_SHA256 =
+    "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f";
+#endif
 
 static std::string sha256_hex(const unsigned char digest[SHA256_DIGEST_SIZE]) {
     std::ostringstream stream;
@@ -107,7 +122,9 @@ static std::string required_environment(const char * name) {
 }
 
 #if defined(__linux__)
-static uint64_t proc_start_time_ticks(int64_t pid) {
+static constexpr uint64_t DSV41_GIB = UINT64_C(1024)*1024*1024;
+
+static std::pair<int64_t, uint64_t> proc_identity(int64_t pid) {
     const std::vector<uint8_t> bytes = read_file("/proc/" + std::to_string(pid) + "/stat");
     const std::string stat(bytes.begin(), bytes.end());
     const size_t command_end = stat.rfind(')');
@@ -116,44 +133,215 @@ static uint64_t proc_start_time_ticks(int64_t pid) {
     }
     std::istringstream fields(stat.substr(command_end + 2));
     std::string value;
+    int64_t parent = 0;
     for (int field = 3; field <= 22; ++field) {
         if (!(fields >> value)) {
             throw std::runtime_error("watchdog process stat is truncated");
         }
+        if (field == 4) {
+            parent = std::stoll(value);
+        }
     }
-    return std::stoull(value);
+    return { parent, std::stoull(value) };
+}
+
+static bool process_is_descendant(int64_t pid, int64_t ancestor) {
+    std::vector<int64_t> seen;
+    while (pid > 1 && std::find(seen.begin(), seen.end(), pid) == seen.end()) {
+        if (pid == ancestor) {
+            return true;
+        }
+        seen.push_back(pid);
+        pid = proc_identity(pid).first;
+    }
+    return false;
 }
 
 static void validate_watchdog(const json & data) {
-    const int64_t pid = data.value("pid", INT64_C(0));
+    const int64_t pid = data.value("watchdog_pid", INT64_C(0));
+    const int64_t guardian_pid = data.value("guardian_pid", INT64_C(0));
+    const int64_t child_pid = data.value("child_pid", INT64_C(0));
+    const int64_t child_pgid = data.value("child_process_group_id", INT64_C(0));
     if (pid <= 1 || !fs::exists("/proc/" + std::to_string(pid))) {
         throw std::runtime_error("watchdog process is not running");
     }
-    if (proc_start_time_ticks(pid) != data.value("start_time_ticks", UINT64_C(0))) {
+    if (data.value("format", "") != "strix-memory-watchdog-lease" || data.value("version", 0) != 2) {
+        throw std::runtime_error("watchdog lease format is invalid");
+    }
+    if (data.value("soft_bytes", UINT64_C(0)) != 116*DSV41_GIB ||
+            data.value("emergency_bytes", UINT64_C(0)) != 118*DSV41_GIB ||
+            data.value("strict_ceiling_bytes", UINT64_C(0)) != 120*DSV41_GIB ||
+            data.value("grace_seconds", 0.0) != 30.0 ||
+            data.value("sample_interval_seconds", 0.0) != 1.0 ||
+            data.value("procfs_root", "") != "/proc") {
+        throw std::runtime_error("watchdog execution policy is invalid");
+    }
+    if (guardian_pid <= 1 || child_pid <= 1 || child_pgid <= 1 || getpgrp() != child_pgid ||
+            !process_is_descendant(getpid(), child_pid)) {
+        throw std::runtime_error("trace exporter is outside the watchdog-monitored process group");
+    }
+    if (proc_identity(guardian_pid).first != pid ||
+            proc_identity(child_pid).first != guardian_pid ||
+            getpgid(guardian_pid) != child_pgid ||
+            getpgid(child_pid) != child_pgid ||
+            child_pgid != guardian_pid) {
+        throw std::runtime_error("watchdog guardian or child process identity is invalid");
+    }
+    if (proc_identity(pid).second != data.value("watchdog_start_time_ticks", UINT64_C(0))) {
         throw std::runtime_error("watchdog process start time changed");
     }
     const std::vector<uint8_t> command = read_file("/proc/" + std::to_string(pid) + "/cmdline");
-    if (sha256_data(command.data(), command.size()) != data.value("command_sha256", "")) {
+    if (sha256_data(command.data(), command.size()) != data.value("watchdog_command_sha256", "")) {
         throw std::runtime_error("watchdog process command changed");
     }
+    const fs::path executable_path = data.value("watchdog_executable_path", "");
+    if (executable_path.empty() ||
+            fs::canonical("/proc/" + std::to_string(pid) + "/exe") != fs::canonical(executable_path)) {
+        throw std::runtime_error("watchdog executable identity changed");
+    }
+    const fs::path script_path = data.value("watchdog_script_path", "");
+    if (script_path.empty() || data.value("watchdog_revision", "") !=
+    "778db6f50eae04e6c232c69b9575bdbd0747962b" ||
+            data.value("watchdog_script_sha256", "") != WATCHDOG_SCRIPT_SHA256 ||
+            sha256_file(script_path) != WATCHDOG_SCRIPT_SHA256) {
+        throw std::runtime_error("watchdog script identity changed");
+    }
+    std::vector<std::string> watchdog_arguments;
+    size_t argument_start = 0;
+    while (argument_start < command.size()) {
+        const auto * begin = reinterpret_cast<const char *>(command.data() + argument_start);
+        const size_t argument_size = std::char_traits<char>::length(begin);
+        watchdog_arguments.emplace_back(begin, argument_size);
+        argument_start += argument_size + 1;
+    }
+    fs::path command_script;
+    if (watchdog_arguments.size() >= 2) {
+        command_script = watchdog_arguments[1];
+        if (!command_script.is_absolute()) {
+            command_script = fs::canonical("/proc/" + std::to_string(pid) + "/cwd") / command_script;
+        }
+    }
+    if (watchdog_arguments.size() < 2 || fs::canonical(command_script) != fs::canonical(script_path)) {
+        throw std::runtime_error("watchdog script is not in executable argv position");
+    }
     const fs::path heartbeat_path = data.value("heartbeat_path", "");
-    const int64_t max_age = data.value("max_heartbeat_age_seconds", INT64_C(0));
+    const double max_age = data.value("max_heartbeat_age_seconds", 0.0);
     if (heartbeat_path.empty() || max_age <= 0 || max_age > 30) {
         throw std::runtime_error("watchdog heartbeat configuration is invalid");
     }
+    if (fs::canonical(required_environment("STRIX_MEMORY_WATCHDOG_LEASE_PATH")) !=
+            fs::canonical(fs::path(data.value("lease_path", ""))) ||
+            fs::canonical(required_environment("STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH")) !=
+                fs::canonical(heartbeat_path) ||
+            fs::canonical(required_environment("STRIX_MEMORY_WATCHDOG_AUDIT_PATH")) !=
+                fs::canonical(fs::path(data.value("audit_live_path", ""))) ||
+            std::stod(required_environment("STRIX_MEMORY_WATCHDOG_HEARTBEAT_MAX_AGE_SECONDS")) != max_age) {
+        throw std::runtime_error("watchdog lease does not match the inherited environment");
+    }
+    const json child_command = data.value("command", json::array());
+    if (!child_command.is_array() || child_command.empty()) {
+        throw std::runtime_error("watchdog child command is invalid");
+    }
+    for (const json & argument : child_command) {
+        if (!argument.is_string()) {
+            throw std::runtime_error("watchdog child command is invalid");
+        }
+    }
+    const std::string child_command_json = child_command.dump(-1, ' ', true);
+    if (sha256_data(
+                reinterpret_cast<const uint8_t *>(child_command_json.data()),
+                child_command_json.size()) != data.value("child_command_sha256", "")) {
+        throw std::runtime_error("watchdog child command SHA-256 is invalid");
+    }
     const std::vector<uint8_t> heartbeat_bytes = read_file(heartbeat_path);
-    const std::string heartbeat_text(heartbeat_bytes.begin(), heartbeat_bytes.end());
-    size_t parsed = 0;
-    const int64_t heartbeat = std::stoll(heartbeat_text, &parsed);
-    while (parsed < heartbeat_text.size() && std::isspace(static_cast<unsigned char>(heartbeat_text[parsed]))) {
-        ++parsed;
+    json heartbeat;
+    try {
+        heartbeat = json::parse(heartbeat_bytes.begin(), heartbeat_bytes.end());
+    } catch (const json::exception & error) {
+        throw std::runtime_error(std::string("watchdog heartbeat is invalid: ") + error.what());
     }
-    if (parsed != heartbeat_text.size()) {
-        throw std::runtime_error("watchdog heartbeat is invalid");
+    if (heartbeat.value("format", "") != "strix-memory-watchdog-heartbeat" ||
+            heartbeat.value("version", 0) != 2 ||
+            heartbeat.value("lease_id", "") != data.value("lease_id", "") ||
+            heartbeat.value("sequence", INT64_C(-1)) < 0 ||
+            heartbeat.value("state", "") != "active" ||
+            heartbeat.value("updated_at", "").empty() ||
+            heartbeat.value("watchdog_pid", INT64_C(0)) != pid ||
+            heartbeat.value("watchdog_start_time_ticks", UINT64_C(0)) !=
+                data.value("watchdog_start_time_ticks", UINT64_C(0)) ||
+            heartbeat.value("child_pid", INT64_C(0)) != child_pid ||
+            heartbeat.value("child_process_group_id", INT64_C(0)) != child_pgid) {
+        throw std::runtime_error("watchdog heartbeat identity is invalid");
     }
-    const int64_t now = static_cast<int64_t>(std::time(nullptr));
-    if (heartbeat <= 0 || heartbeat > now || now - heartbeat > max_age) {
+    const json heartbeat_sample = heartbeat.value("sample", json::object());
+    const std::string audit_record_sha256 = heartbeat_sample.value("audit_record_sha256", "");
+    if (audit_record_sha256.size() != 64) {
+        throw std::runtime_error("watchdog heartbeat audit identity is invalid");
+    }
+    const uint64_t updated_monotonic_ns = heartbeat.value("updated_monotonic_ns", UINT64_C(0));
+    struct timespec now;
+    if (updated_monotonic_ns == 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        throw std::runtime_error("watchdog heartbeat monotonic timestamp is invalid");
+    }
+    const uint64_t now_monotonic_ns =
+        static_cast<uint64_t>(now.tv_sec)*UINT64_C(1000000000) + static_cast<uint64_t>(now.tv_nsec);
+    const uint64_t max_age_ns = static_cast<uint64_t>(max_age*1000000000.0);
+    if (updated_monotonic_ns > now_monotonic_ns ||
+            now_monotonic_ns - updated_monotonic_ns > max_age_ns) {
         throw std::runtime_error("watchdog heartbeat is stale");
+    }
+    const fs::path audit_path = data.value("audit_live_path", "");
+    if (audit_path.empty()) {
+        throw std::runtime_error("watchdog audit path is invalid");
+    }
+    struct stat audit_stat;
+    struct stat descriptor_stat;
+    const int audit_fd = data.value("audit_fd", -1);
+    const fs::path descriptor_path =
+        "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(audit_fd);
+    if (audit_fd < 0 || lstat(audit_path.c_str(), &audit_stat) != 0 ||
+            stat(descriptor_path.c_str(), &descriptor_stat) != 0 ||
+            !S_ISREG(audit_stat.st_mode) ||
+            static_cast<uint64_t>(audit_stat.st_dev) != data.value("audit_device", UINT64_C(0)) ||
+            static_cast<uint64_t>(audit_stat.st_ino) != data.value("audit_inode", UINT64_C(0)) ||
+            static_cast<uint64_t>(descriptor_stat.st_dev) != data.value("audit_device", UINT64_C(0)) ||
+            static_cast<uint64_t>(descriptor_stat.st_ino) != data.value("audit_inode", UINT64_C(0)) ||
+            audit_stat.st_uid != getuid() ||
+            static_cast<uint64_t>(audit_stat.st_uid) != data.value("audit_uid", UINT64_C(0)) ||
+            (audit_stat.st_mode & 0777) != 0600 ||
+            data.value("audit_mode", UINT64_C(0)) != 0600) {
+        throw std::runtime_error("watchdog persistent audit identity changed");
+    }
+    const int local_audit_fd = open(audit_path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (local_audit_fd < 0) {
+        throw std::runtime_error("cannot open watchdog persistent audit");
+    }
+    const int lock_result = flock(local_audit_fd, LOCK_EX | LOCK_NB);
+    if (lock_result == 0) {
+        flock(local_audit_fd, LOCK_UN);
+        close(local_audit_fd);
+        throw std::runtime_error("watchdog does not hold the persistent audit lock");
+    }
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        close(local_audit_fd);
+        throw std::runtime_error("cannot inspect watchdog persistent audit lock");
+    }
+    close(local_audit_fd);
+    std::ifstream audit_stream(audit_path);
+    if (!audit_stream) {
+        throw std::runtime_error("cannot read watchdog persistent audit");
+    }
+    std::string audit_line;
+    bool found_audit_record = false;
+    while (std::getline(audit_stream, audit_line)) {
+        audit_line.push_back('\n');
+        if (sha256_data(audit_line.data(), audit_line.size()) == audit_record_sha256) {
+            found_audit_record = true;
+            break;
+        }
+    }
+    if (!found_audit_record) {
+        throw std::runtime_error("watchdog heartbeat audit record is missing");
     }
 }
 #endif
@@ -170,6 +358,9 @@ static json audit_reference(const char * environment_name, const char * expected
     }
     if (audit.value("kind", "") != expected_kind) {
         throw std::runtime_error(std::string("audit kind mismatch for ") + expected_kind);
+    }
+    if (audit.value("environment", json::object()).value("HIP_LAUNCH_BLOCKING", "") != "1") {
+        throw std::runtime_error(std::string("audit environment mismatch for ") + expected_kind);
     }
     const int64_t created = audit.value("created_unix", INT64_C(0));
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
@@ -458,6 +649,9 @@ int main(int argc, char ** argv) {
         require_nvme_path(params.model.path, "model");
         require_nvme_path(params.prompt_file, "prompt");
         require_nvme_path(params.out_file, "trace output");
+        if (required_environment("HIP_LAUNCH_BLOCKING") != "1") {
+            throw std::runtime_error("HIP_LAUNCH_BLOCKING=1 is required for gfx1151 correctness runs");
+        }
         const json memory_audit = audit_reference("DSV41_TRACE_MEMORY_AUDIT", "memory");
         const json swap_audit = audit_reference("DSV41_TRACE_SWAP_AUDIT", "swap");
         const json watchdog_audit = audit_reference("DSV41_TRACE_WATCHDOG_AUDIT", "watchdog");
@@ -481,6 +675,13 @@ int main(int argc, char ** argv) {
         }
         if (model_architecture(model) != "deepseek41") {
             throw std::runtime_error("trace tool requires general.architecture=deepseek41");
+        }
+        std::vector<std::string> model_devices;
+        for (int32_t index = 0; index < llama_model_n_devices(model); ++index) {
+            model_devices.emplace_back(ggml_backend_dev_name(llama_model_get_device(model, index)));
+        }
+        if (model_devices != std::vector<std::string>{"ROCm0"}) {
+            throw std::runtime_error("trace tool requires the loaded model to use only ROCm0");
         }
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const bool add_bos = llama_vocab_get_add_bos(vocab);
@@ -527,6 +728,7 @@ int main(int argc, char ** argv) {
                 {"context", llama_n_ctx(ctx)},
                 {"batch", params.n_batch},
                 {"ubatch", params.n_ubatch},
+                {"device", model_devices[0]},
                 {"decode_steps", params.n_predict},
                 {"kv_type_k", ggml_type_name(params.cache_type_k)},
                 {"kv_type_v", ggml_type_name(params.cache_type_v)},
@@ -548,6 +750,8 @@ int main(int argc, char ** argv) {
                     {"candidate_topk_blocks", 2048},
                     {"candidate_block_size", 8},
                     {"index_top_k", 512},
+                    {"raw_attention_layers", {0, 1}},
+                    {"raw_attention_width", 128},
                     {"candidate_propagation_layers", {24, 28, 32, 36}},
                 }},
             }},

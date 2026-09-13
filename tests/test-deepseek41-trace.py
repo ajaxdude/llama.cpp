@@ -19,36 +19,98 @@ SPEC.loader.exec_module(trace)
 import run_llama
 import run_ds4
 import preflight
+import verify_ds4_anchors
 
+trace.APPROVED_WATCHDOGS[trace.WATCHDOG_SCRIPT_SHA256] = trace.WATCHDOG_REVISION
+
+WATCHDOG_EVENTS = [
+    {
+        "timestamp": "1970-01-01T00:00:01.000Z",
+        "event": "preflight",
+        "soft_bytes": trace.SOFT_MEMORY_LIMIT,
+        "emergency_bytes": trace.WATCHDOG_EMERGENCY_LIMIT,
+        "strict_ceiling_bytes": trace.STRICT_MEMORY_LIMIT,
+        "swap_entries": 0,
+    },
+    {
+        "timestamp": "1970-01-01T00:00:01.000Z",
+        "event": "child_started",
+        "child_pid": 456,
+        "process_group_id": 455,
+        "command": ["python3", "run_matrix.py"],
+    },
+]
+WATCHDOG_JSONL = "".join(
+    json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    for event in WATCHDOG_EVENTS
+).encode("ascii")
+WATCHDOG_JSONL_SHA256 = trace.sha256_bytes(WATCHDOG_JSONL)
 
 AUDIT_RECORDS = {
     "memory": {
         "created_unix": 1,
         "kind": "memory",
+        "environment": {"HIP_LAUNCH_BLOCKING": "1"},
         "data": {"mem_total_bytes": 128, "mem_available_bytes": 64, "mem_used_bytes": 64},
     },
     "swap": {
         "created_unix": 1,
         "kind": "swap",
+        "environment": {"HIP_LAUNCH_BLOCKING": "1"},
         "data": {"enabled": False, "entries": []},
     },
     "watchdog": {
         "created_unix": 1,
         "kind": "watchdog",
+        "environment": {"HIP_LAUNCH_BLOCKING": "1"},
         "data": {
-            "pid": 123,
-            "start_time_ticks": 456,
-            "command_sha256": "7" * 64,
+            "format": trace.WATCHDOG_LEASE_FORMAT,
+            "version": trace.WATCHDOG_VERSION,
+            "lease_id": "1" * 32,
+            "lease_path": "/run/user/123/watchdog.lease",
+            "watchdog_pid": 123,
+            "watchdog_start_time_ticks": 456,
+            "watchdog_command": "python3 /repo/scripts/strix_memory_watchdog.py",
+            "watchdog_command_sha256": "7" * 64,
+            "watchdog_executable_path": "/usr/bin/python3",
+            "watchdog_script_path": "/repo/scripts/strix_memory_watchdog.py",
+            "watchdog_script_sha256": trace.WATCHDOG_SCRIPT_SHA256,
+            "watchdog_revision": trace.WATCHDOG_REVISION,
+            "soft_bytes": trace.SOFT_MEMORY_LIMIT,
+            "emergency_bytes": trace.WATCHDOG_EMERGENCY_LIMIT,
+            "strict_ceiling_bytes": trace.STRICT_MEMORY_LIMIT,
+            "grace_seconds": 30.0,
+            "sample_interval_seconds": 1.0,
+            "procfs_root": "/proc",
+            "guardian_pid": 455,
+            "child_pid": 456,
+            "child_process_group_id": 455,
+            "command": ["python3", "run_matrix.py"],
+            "child_command_sha256": trace.sha256_bytes(b'["python3","run_matrix.py"]'),
             "heartbeat_path": "/run/user/123/watchdog.heartbeat",
             "heartbeat_unix": 1,
-            "max_heartbeat_age_seconds": 30,
+            "max_heartbeat_age_seconds": 5.0,
+            "audit_live_path": "/run/user/123/watchdog.jsonl",
+            "audit_device": 1,
+            "audit_inode": 2,
+            "audit_uid": 1000,
+            "audit_mode": 0o600,
+            "audit_fd": 3,
+            "audit": {
+                "path": "",
+                "sha256": WATCHDOG_JSONL_SHA256,
+                "event_count": len(WATCHDOG_EVENTS),
+            },
         },
     },
 }
 
 
-def audit_bytes(kind: str) -> bytes:
-    return (json.dumps(AUDIT_RECORDS[kind], sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+def audit_bytes(kind: str, phase: str) -> bytes:
+    record = json.loads(json.dumps(AUDIT_RECORDS[kind]))
+    if kind == "watchdog":
+        record["data"]["audit"]["path"] = f"audits/{phase}/{WATCHDOG_JSONL_SHA256}.jsonl"
+    return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
 
 def provenance_bytes(prompt: bytes = b"abc") -> bytes:
@@ -88,13 +150,16 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
         "config": {
             "context": 3,
             "decode_steps": 1,
-            "batch": 512,
-            "ubatch": 128,
+            "batch": trace.ADMITTED_BATCH,
+            "ubatch": trace.ADMITTED_UBATCH,
             "kv_type_k": "f16",
             "kv_type_v": "f16",
             "flash_attention": True,
-            "expert_cache_slots": 8,
-            "expert_cache_bytes": 4096,
+            "expert_cache_slots": trace.REQUIRED_EXPERT_SLOTS,
+            "expert_cache_bytes": trace.REQUIRED_EXPERT_CACHE_BYTES,
+            "device": "ROCm0",
+            "gpu_layers": 99,
+            "load_mode": 0,
             "deepseek41": {
                 "layer_count": 40,
                 "vocab_size": 129280,
@@ -106,6 +171,8 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "candidate_topk_blocks": 2048,
                 "candidate_block_size": 8,
                 "index_top_k": 512,
+                "raw_attention_layers": list(trace.RAW_ATTENTION_LAYERS),
+                "raw_attention_width": trace.RAW_ATTENTION_WIDTH,
                 "candidate_propagation_layers": [24, 28, 32, 36],
             },
         },
@@ -131,8 +198,8 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
         "audits": {
             phase: {
                 kind: {
-                    "path": f"audits/{phase}/{trace.sha256_bytes(audit_bytes(kind))}.json",
-                    "sha256": trace.sha256_bytes(audit_bytes(kind)),
+                    "path": f"audits/{phase}/{trace.sha256_bytes(audit_bytes(kind, phase))}.json",
+                    "sha256": trace.sha256_bytes(audit_bytes(kind, phase)),
                     "created_unix": 1,
                 }
                 for kind in ("memory", "swap", "watchdog")
@@ -148,6 +215,8 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "diff_sha256": "c" * 64,
             "executable_sha256": "3" * 64,
         }
+    else:
+        result["config"]["prefill_chunk"] = trace.ADMITTED_UBATCH
     return result
 
 
@@ -156,8 +225,9 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
         audit_root = writer.root / "audits" / phase
         audit_root.mkdir(parents=True, exist_ok=True)
         for kind in ("memory", "swap", "watchdog"):
-            data = audit_bytes(kind)
+            data = audit_bytes(kind, phase)
             (audit_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
+        (audit_root / f"{WATCHDOG_JSONL_SHA256}.jsonl").write_bytes(WATCHDOG_JSONL)
     provenance_root = writer.root / "provenance"
     provenance_root.mkdir(exist_ok=True)
     data = provenance_bytes(prompt)
@@ -218,6 +288,21 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
         shape=[6, 2],
         data=struct.pack("<ffffffffffff", 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6),
     )
+    for layer in trace.RAW_ATTENTION_LAYERS:
+        writer.add_event(
+            component="attn.source",
+            phase="prefill",
+            step=0,
+            token_start=0,
+            token_count=2,
+            layer=layer,
+            dtype="i32",
+            shape=[trace.RAW_ATTENTION_WIDTH, 2],
+            data=struct.pack(
+                "<" + "i" * (trace.RAW_ATTENTION_WIDTH * 2),
+                *([trace.RAW_ATTENTION_WIDTH + 2] * (trace.RAW_ATTENTION_WIDTH * 2)),
+            ),
+        )
     writer.add_event(
         component="attn.source",
         phase="prefill",
@@ -283,6 +368,21 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
     writer.add_event(
         component="expert.weights", phase="decode", step=0, token_start=2, token_count=1,
         layer=0, dtype="f32", shape=[6, 1], data=struct.pack("<ffffff", 1, 2, 3, 4, 5, 6))
+    for layer in trace.RAW_ATTENTION_LAYERS:
+        writer.add_event(
+            component="attn.source",
+            phase="decode",
+            step=0,
+            token_start=2,
+            token_count=1,
+            layer=layer,
+            dtype="i32",
+            shape=[trace.RAW_ATTENTION_WIDTH, 1],
+            data=struct.pack(
+                "<" + "i" * trace.RAW_ATTENTION_WIDTH,
+                *([trace.RAW_ATTENTION_WIDTH + 1] * trace.RAW_ATTENTION_WIDTH),
+            ),
+        )
     writer.add_event(
         component="attn.source", phase="decode", step=0, token_start=2, token_count=1,
         layer=20, dtype="i32", shape=[1, 1], data=struct.pack("<i", 20))
@@ -327,7 +427,7 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
         writer.add_event(
             component="expert.weights", phase="decode", step=0, token_start=2, token_count=1,
             layer=layer, dtype="f32", shape=[6, 1], data=struct.pack("<ffffff", 1, 2, 3, 4, 5, 6))
-    for layer in list(range(20)) + list(range(21, 40)):
+    for layer in list(range(2, 20)) + list(range(21, 40)):
         writer.add_event(
             component="attn.source", phase="prefill", step=0, token_start=0, token_count=2,
             layer=layer, dtype="i32", shape=[1, 2], data=struct.pack("<ii", 20, 20))
@@ -343,6 +443,35 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
             component="attn.candidates", phase="decode", step=0, token_start=2, token_count=1,
             layer=layer, dtype="i32", shape=[512, 1],
             data=struct.pack("<" + "i" * 512, *([4, 7] * 256)))
+
+
+def replace_event_blob(
+        root: Path,
+        *,
+        component: str,
+        phase: str,
+        layer: int,
+        shape: list[int],
+        data: bytes) -> None:
+    events_path = root / trace.EVENTS_NAME
+    events = [json.loads(line) for line in events_path.read_text(encoding="ascii").splitlines()]
+    event = next(
+        item for item in events
+        if item["component"] == component and item["phase"] == phase and item["layer"] == layer
+    )
+    digest = trace.sha256_bytes(data)
+    blob = root / trace.BLOBS_DIR / f"{digest}.bin"
+    blob.write_bytes(data)
+    event.update({
+        "shape": shape,
+        "byte_count": len(data),
+        "sha256": digest,
+        "blob": f"{trace.BLOBS_DIR}/{digest}.bin",
+    })
+    events_path.write_text(
+        "".join(json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n" for item in events),
+        encoding="ascii",
+    )
 
 
 class TraceFormatTests(unittest.TestCase):
@@ -437,14 +566,287 @@ class TraceFormatTests(unittest.TestCase):
                 context=32768,
                 decode_steps=8,
                 batch=2048,
-                ubatch=512,
+                ubatch=trace.ADMITTED_UBATCH,
+                device="ROCm0",
                 gpu_layers=99,
-                expert_cache_slots=8,
-                expert_cache_mib=4096,
+                expert_cache_slots=trace.REQUIRED_EXPERT_SLOTS,
+                expert_cache_mib=trace.REQUIRED_EXPERT_CACHE_MIB,
             )
             command = run_llama.build_command(args, exporter, output)
             self.assertEqual(command[command.index("-bf") + 1], str(prompt.resolve()))
+            self.assertEqual(command[command.index("--device") + 1], "ROCm0")
+            self.assertEqual(command[command.index("--load-mode") + 1], "none")
             self.assertNotIn("-f", command)
+
+    def test_rejects_unadmitted_expert_cache_configuration(self) -> None:
+        invalid = Namespace(
+            batch=trace.ADMITTED_BATCH,
+            ubatch=512,
+            device="ROCm0",
+            gpu_layers=99,
+            expert_cache_slots=8,
+            expert_cache_mib=4096,
+        )
+        with self.assertRaisesRegex(preflight.PreflightError, "admitted ubatch 32"):
+            run_llama.validate_runtime_config(invalid)
+
+        invalid.ubatch = trace.ADMITTED_UBATCH
+        with self.assertRaisesRegex(preflight.PreflightError, "192 expert cache slots"):
+            run_llama.validate_runtime_config(invalid)
+
+        invalid.expert_cache_slots = trace.REQUIRED_EXPERT_SLOTS
+        with self.assertRaisesRegex(preflight.PreflightError, "76441190400 expert cache bytes"):
+            run_llama.validate_runtime_config(invalid)
+
+        valid = Namespace(
+            batch=trace.ADMITTED_BATCH,
+            ubatch=trace.ADMITTED_UBATCH,
+            device="ROCm0",
+            gpu_layers=99,
+            expert_cache_slots=trace.REQUIRED_EXPERT_SLOTS,
+            expert_cache_mib=trace.REQUIRED_EXPERT_CACHE_MIB,
+        )
+        run_llama.validate_runtime_config(valid)
+        self.assertEqual(trace.REQUIRED_EXPERT_CACHE_BYTES, 76_441_190_400)
+        self.assertEqual(trace.REQUIRED_EXPERT_CACHE_MIB, 72_900)
+
+    def test_watchdog_lease_rejects_arbitrary_heartbeat_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            script = repo / "scripts" / "strix_memory_watchdog.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/usr/bin/env python3\n", encoding="ascii")
+
+            procfs = root / "proc"
+            watchdog_pid = 123
+            child_pid = 456
+            current_pid = 789
+            for pid in (watchdog_pid, child_pid, current_pid):
+                (procfs / str(pid)).mkdir(parents=True)
+
+            def stat(pid: int, parent: int, start: int) -> str:
+                fields = ["S", str(parent), *(["0"] * 17), str(start)]
+                return f"{pid} (test) " + " ".join(fields) + "\n"
+
+            (procfs / str(watchdog_pid) / "stat").write_text(
+                stat(watchdog_pid, 1, 1000), encoding="ascii")
+            (procfs / str(child_pid) / "stat").write_text(
+                stat(child_pid, watchdog_pid, 2000), encoding="ascii")
+            (procfs / str(current_pid) / "stat").write_text(
+                stat(current_pid, child_pid, 3000), encoding="ascii")
+
+            watchdog_command = (
+                b"python3\0" + str(script.resolve()).encode("ascii") +
+                b"\0--soft-gib\0" + b"116\0--emergency-gib\0" + b"118\0"
+            )
+            child_command = b"python3\0run_matrix.py\0"
+            (procfs / str(watchdog_pid) / "cmdline").write_bytes(watchdog_command)
+            (procfs / str(child_pid) / "cmdline").write_bytes(child_command)
+            (procfs / str(watchdog_pid) / "cwd").symlink_to(repo)
+
+            heartbeat = root / "heartbeat.json"
+            audit = root / "watchdog.jsonl"
+            lease = root / "lease.json"
+            lease_id = "1" * 32
+            heartbeat.write_text(json.dumps({
+                "format": preflight.WATCHDOG_HEARTBEAT_FORMAT,
+                "version": preflight.WATCHDOG_VERSION,
+                "lease_id": lease_id,
+                "sequence": 1,
+                "state": "active",
+                "updated_at": "1970-01-01T00:01:40.000Z",
+                "updated_monotonic_ns": 1,
+                "watchdog_pid": watchdog_pid,
+                "watchdog_start_time_ticks": 1000,
+                "child_pid": child_pid,
+                "child_process_group_id": child_pid,
+                "sample": {},
+            }), encoding="ascii")
+            child_argv = ["python3", "run_matrix.py"]
+            audit.write_text(
+                json.dumps({
+                    "event": "preflight",
+                    "soft_bytes": preflight.SOFT_MEMORY_LIMIT,
+                    "emergency_bytes": preflight.WATCHDOG_EMERGENCY_LIMIT,
+                    "strict_ceiling_bytes": preflight.STRICT_MEMORY_LIMIT,
+                    "swap_entries": 0,
+                }) + "\n" +
+                json.dumps({
+                    "event": "child_started",
+                    "child_pid": child_pid,
+                    "process_group_id": child_pid,
+                    "command": child_argv,
+                }) + "\n",
+                encoding="ascii",
+            )
+            lease_record = {
+                "format": preflight.WATCHDOG_LEASE_FORMAT,
+                "version": preflight.WATCHDOG_VERSION,
+                "lease_id": lease_id,
+                "state": "active",
+                "watchdog_pid": watchdog_pid,
+                "watchdog_start_time_ticks": 1000,
+                "watchdog_command_sha256": preflight.sha256_bytes(watchdog_command),
+                "watchdog_script_path": str(script.resolve()),
+                "watchdog_script_sha256": preflight.sha256_bytes(script.read_bytes()),
+                "soft_bytes": preflight.SOFT_MEMORY_LIMIT,
+                "emergency_bytes": preflight.WATCHDOG_EMERGENCY_LIMIT,
+                "strict_ceiling_bytes": preflight.STRICT_MEMORY_LIMIT,
+                "procfs_root": "/proc",
+                "child_pid": child_pid,
+                "child_process_group_id": child_pid,
+                "command": child_argv,
+                "child_command_sha256": preflight.sha256_bytes(child_command),
+                "heartbeat_path": str(heartbeat),
+                "max_heartbeat_age_seconds": 5.0,
+                "audit_path": str(audit),
+            }
+            lease_record["child_command_sha256"] = preflight.sha256_bytes(
+                json.dumps(child_argv, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+            lease.write_text(json.dumps(lease_record), encoding="ascii")
+            environment = {
+                preflight.WATCHDOG_LEASE_ENV: str(lease),
+                preflight.WATCHDOG_HEARTBEAT_ENV: str(heartbeat),
+                preflight.WATCHDOG_AUDIT_ENV: str(audit),
+                preflight.WATCHDOG_MAX_AGE_ENV: "5.0",
+            }
+            result = preflight.watchdog_audit(
+                repo,
+                environment=environment,
+                procfs_root=procfs,
+                current_pid=current_pid,
+                current_pgid=child_pid,
+                getpgid=lambda pid: child_pid,
+                now=100,
+                monotonic_ns=lambda: 1_000_000_001,
+                timeout_seconds=0,
+            )
+            self.assertEqual(result["child_process_group_id"], child_pid)
+
+            arbitrary = root / "arbitrary-heartbeat.py"
+            arbitrary.write_text("#!/usr/bin/env python3\n", encoding="ascii")
+            arbitrary_command = b"python3\0" + str(arbitrary.resolve()).encode("ascii") + b"\0"
+            (procfs / str(watchdog_pid) / "cmdline").write_bytes(arbitrary_command)
+            lease_record["watchdog_command_sha256"] = preflight.sha256_bytes(arbitrary_command)
+            lease.write_text(json.dumps(lease_record), encoding="ascii")
+            with self.assertRaisesRegex(preflight.PreflightError, "candidate repository script"):
+                preflight.watchdog_audit(
+                    repo,
+                    environment=environment,
+                    procfs_root=procfs,
+                    current_pid=current_pid,
+                    current_pgid=child_pid,
+                    getpgid=lambda pid: child_pid,
+                    now=100,
+                    monotonic_ns=lambda: 1_000_000_001,
+                    timeout_seconds=0,
+                )
+
+    def test_canonical_watchdog_validation_is_pinned_and_delegated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            script = repo / "scripts" / "strix_memory_watchdog.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# fixture\n", encoding="ascii")
+            lease = root / "lease.json"
+            heartbeat = root / "heartbeat.json"
+            audit = root / "audit.jsonl"
+            lease.write_text("{}\n", encoding="ascii")
+            heartbeat.write_text(
+                json.dumps({"updated_at": "1970-01-01T00:00:01.000Z"}) + "\n",
+                encoding="ascii",
+            )
+            audit.write_bytes(WATCHDOG_JSONL)
+            environment = {
+                preflight.WATCHDOG_LEASE_ENV: str(lease),
+                preflight.WATCHDOG_HEARTBEAT_ENV: str(heartbeat),
+                preflight.WATCHDOG_AUDIT_ENV: str(audit),
+                preflight.WATCHDOG_MAX_AGE_ENV: "5",
+            }
+
+            class FakeLeaseError(RuntimeError):
+                pass
+
+            class FakeWatchdog:
+                LeaseValidationError = FakeLeaseError
+                calls = []
+
+                @classmethod
+                def validate_active_lease(cls, lease_path: Path, **kwargs: object) -> dict[str, object]:
+                    cls.calls.append((lease_path, kwargs))
+                    return {
+                        **AUDIT_RECORDS["watchdog"]["data"],
+                        "audit_path": str(audit),
+                        "heartbeat_path": str(heartbeat),
+                        "child_pid": 456,
+                    }
+
+                @staticmethod
+                def start_process_group_lease_guard(*args: object, **kwargs: object) -> None:
+                    raise AssertionError("descendant validation must not start the direct-child guard")
+
+            original_sha256 = preflight.WATCHDOG_SCRIPT_SHA256
+            original_approved = dict(preflight.APPROVED_WATCHDOGS)
+            try:
+                preflight.WATCHDOG_SCRIPT_SHA256 = preflight.sha256_bytes(script.read_bytes())
+                preflight.APPROVED_WATCHDOGS[preflight.WATCHDOG_SCRIPT_SHA256] = (
+                    preflight.WATCHDOG_REVISION)
+                result = preflight.watchdog_audit(
+                    repo,
+                    environment=environment,
+                    procfs_root=Path("/proc"),
+                    current_pid=789,
+                    watchdog_module=FakeWatchdog,
+                    monotonic=lambda: 2.0,
+                    sleeper=lambda _: None,
+                )
+            finally:
+                preflight.APPROVED_WATCHDOGS.clear()
+                preflight.APPROVED_WATCHDOGS.update(original_approved)
+                preflight.WATCHDOG_SCRIPT_SHA256 = original_sha256
+            self.assertEqual(result["watchdog_revision"], preflight.WATCHDOG_REVISION)
+            self.assertEqual(len(FakeWatchdog.calls), 1)
+            kwargs = FakeWatchdog.calls[0][1]
+            self.assertEqual(kwargs["expected_soft_bytes"], trace.SOFT_MEMORY_LIMIT)
+            self.assertEqual(kwargs["expected_emergency_bytes"], trace.WATCHDOG_EMERGENCY_LIMIT)
+            self.assertEqual(kwargs["expected_procfs_root"], Path("/proc"))
+
+    def test_approved_watchdog_is_exact(self) -> None:
+        expected = {
+            "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f":
+                "778db6f50eae04e6c232c69b9575bdbd0747962b",
+        }
+        self.assertEqual(preflight.APPROVED_WATCHDOGS, expected)
+        self.assertEqual(trace.APPROVED_WATCHDOGS, expected)
+        self.assertEqual(preflight.WATCHDOG_VERSION, 2)
+        self.assertEqual(trace.WATCHDOG_VERSION, 2)
+
+    def test_workload_scan_ignores_guarded_process_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            procfs = Path(temp)
+
+            def add_process(pid: int, parent: int, command: bytes) -> None:
+                process = procfs / str(pid)
+                process.mkdir()
+                process.joinpath("stat").write_text(
+                    f"{pid} (test) S {parent} " + " ".join(["0"] * 18) + "\n",
+                    encoding="ascii",
+                )
+                process.joinpath("cmdline").write_bytes(command)
+
+            add_process(90, 1, b"python3\0scripts/strix_memory_watchdog.py\0DeepSeek-V4.1\0")
+            add_process(100, 90, b"python3\0run_matrix.py\0--ds4-checkout\0/home/papa/src/ds4-v41\0")
+            add_process(200, 1, b"/tmp/ds4-v41-worker\0")
+            self.assertEqual(
+                preflight.matching_workloads(
+                    ["ds4-v41", "DeepSeek-V4.1"],
+                    procfs_root=procfs,
+                    current_pid=100,
+                ),
+                [{"pid": 200, "command": "/tmp/ds4-v41-worker"}],
+            )
 
     def test_rejects_cache_slot_id_space(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -559,6 +961,93 @@ class TraceFormatTests(unittest.TestCase):
                     )
                 writer.events.close()
 
+    def test_rejects_malformed_raw_attention_sources(self) -> None:
+        cases = (
+            (
+                "width",
+                0,
+                [trace.RAW_ATTENTION_WIDTH - 1, 2],
+                [trace.RAW_ATTENTION_WIDTH + 2] * ((trace.RAW_ATTENTION_WIDTH - 1) * 2),
+                "raw attn.source shape",
+            ),
+            (
+                "future ubatch row",
+                0,
+                [trace.RAW_ATTENTION_WIDTH, 2],
+                [trace.RAW_ATTENTION_WIDTH + 1] +
+                [trace.RAW_ATTENTION_WIDTH + 2] * (trace.RAW_ATTENTION_WIDTH * 2 - 1),
+                "invalid row",
+            ),
+            (
+                "layer mismatch",
+                1,
+                [trace.RAW_ATTENTION_WIDTH, 2],
+                [0] + [trace.RAW_ATTENTION_WIDTH + 2] * (trace.RAW_ATTENTION_WIDTH * 2 - 1),
+                "differs between layers 0 and 1",
+            ),
+        )
+        for name, layer, shape, values, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest()) as writer:
+                    add_required_events(writer)
+                replace_event_blob(
+                    root,
+                    component="attn.source",
+                    phase="prefill",
+                    layer=layer,
+                    shape=shape,
+                    data=struct.pack("<" + "i" * len(values), *values),
+                )
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
+    def test_compares_raw_attention_sources_in_every_prefill_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            events = [
+                json.loads(line)
+                for line in (root / trace.EVENTS_NAME).read_text(encoding="ascii").splitlines()
+            ]
+            split_events = []
+            for event in events:
+                if event["component"] != "attn.source" or event["phase"] != "prefill" or (
+                        event["layer"] not in trace.RAW_ATTENTION_LAYERS):
+                    split_events.append(event)
+                    continue
+                for token_start in (0, 1):
+                    values = [0] * trace.RAW_ATTENTION_WIDTH
+                    if event["layer"] == 0 and token_start == 0:
+                        values[0] = 1
+                    data = struct.pack("<" + "i" * len(values), *values)
+                    digest = trace.sha256_bytes(data)
+                    (root / trace.BLOBS_DIR / f"{digest}.bin").write_bytes(data)
+                    split = dict(event)
+                    split.update({
+                        "token_start": token_start,
+                        "token_count": 1,
+                        "shape": [trace.RAW_ATTENTION_WIDTH, 1],
+                        "byte_count": len(data),
+                        "sha256": digest,
+                        "blob": f"{trace.BLOBS_DIR}/{digest}.bin",
+                    })
+                    split_events.append(split)
+            (root / trace.EVENTS_NAME).write_text(
+                "".join(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+                        for event in split_events),
+                encoding="ascii",
+            )
+            manifest_record = json.loads((root / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+            manifest_record["event_count"] = len(split_events)
+            (root / trace.MANIFEST_NAME).write_text(
+                json.dumps(manifest_record, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(trace.TraceError, "differs between layers 0 and 1"):
+                trace.TraceBundle(root)
+
     def test_rejects_zero_dimensions_globally(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             writer = trace.TraceBundleWriter(Path(temp) / "trace", manifest())
@@ -585,6 +1074,106 @@ class TraceFormatTests(unittest.TestCase):
                 run_ds4.verify_checkout(Path("/tmp/ds4"))
         finally:
             run_ds4.git_output = original
+
+    def test_verifies_pinned_ds4_anchor_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp)
+            anchor = checkout / "tests" / "fixture.vec"
+            anchor.parent.mkdir(parents=True)
+            anchor.write_bytes(b"fixture")
+            expected = trace.sha256_bytes(b"fixture")
+            original = verify_ds4_anchors.git_output
+            try:
+                verify_ds4_anchors.git_output = lambda checkout, *args: (
+                    trace.DS4_REVISION if args == ("rev-parse", "HEAD") else "")
+                result = verify_ds4_anchors.verify(
+                    checkout,
+                    anchors={"tests/fixture.vec": expected},
+                )
+                self.assertEqual(result["status"], "ANCHORS VERIFIED")
+                anchor.write_bytes(b"changed")
+                with self.assertRaisesRegex(verify_ds4_anchors.AnchorError, "SHA-256 mismatch"):
+                    verify_ds4_anchors.verify(
+                        checkout,
+                        anchors={"tests/fixture.vec": expected},
+                    )
+            finally:
+                verify_ds4_anchors.git_output = original
+
+    def test_embeds_rewritten_watchdog_audit_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            audits = {}
+            for kind in ("memory", "swap", "watchdog"):
+                record = json.loads(json.dumps(AUDIT_RECORDS[kind]))
+                if kind == "watchdog":
+                    jsonl = source / "watchdog-events.jsonl"
+                    jsonl.write_bytes(WATCHDOG_JSONL)
+                    record["data"].pop("audit")
+                    record["data"]["audit_path"] = str(jsonl)
+                    record["data"]["audit_sha256"] = WATCHDOG_JSONL_SHA256
+                    record["data"]["audit_event_count"] = len(WATCHDOG_EVENTS)
+                path = source / f"{kind}.json"
+                path.write_text(
+                    json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                audits[kind] = str(path)
+            references = preflight.embed_audits(root / "trace", "pre", audits)
+            embedded = json.loads(
+                (root / "trace" / references["watchdog"]["path"]).read_text(encoding="ascii"))
+            self.assertIn("audit", embedded["data"])
+            self.assertNotIn("audit_path", embedded["data"])
+            self.assertEqual(
+                trace.sha256_bytes(
+                    (root / "trace" / references["watchdog"]["path"]).read_bytes()),
+                references["watchdog"]["sha256"],
+            )
+
+    def test_rejects_unapproved_ds4_exporter(self) -> None:
+        with self.assertRaisesRegex(preflight.PreflightError, "not approved"):
+            run_ds4.verify_exporter_approval("a" * 64)
+
+    def test_rejects_preflight_audit_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audits = {}
+            for kind in ("memory", "swap", "watchdog"):
+                record = json.loads(json.dumps(AUDIT_RECORDS[kind]))
+                if kind == "watchdog":
+                    jsonl = root / "watchdog-events.jsonl"
+                    jsonl.write_bytes(WATCHDOG_JSONL)
+                    record["data"]["audit_path"] = str(jsonl)
+                    record["data"]["audit_sha256"] = WATCHDOG_JSONL_SHA256
+                    record["data"]["audit_event_count"] = len(WATCHDOG_EVENTS)
+                path = root / f"{kind}.json"
+                path.write_text(
+                    json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                audits[kind] = str(path)
+            digests = preflight.seal_audits(audits)
+            memory = Path(audits["memory"])
+            memory.chmod(0o644)
+            memory.write_text("{}\n", encoding="ascii")
+            with self.assertRaisesRegex(preflight.PreflightError, "changed during runtime"):
+                preflight.verify_sealed_audits(audits, digests)
+
+    def test_rejects_symlinked_bundle_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bundle = root / "bundle"
+            with trace.TraceBundleWriter(bundle, manifest()) as writer:
+                add_required_events(writer)
+            provenance = next((bundle / "provenance").iterdir())
+            outside = root / "outside.json"
+            outside.write_bytes(provenance.read_bytes())
+            provenance.unlink()
+            provenance.symlink_to(outside)
+            with self.assertRaisesRegex(trace.TraceError, "must not use symlinks"):
+                trace.TraceBundle(bundle)
 
     def test_rejects_weakened_coverage_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -622,6 +1211,42 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(result["status"], "TARGET PASS")
             self.assertEqual(result["events_compared"], 259)
             self.assertIsNone(result["first_divergence"])
+
+    def test_local_bringup_reports_do_not_claim_cross_runtime_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            first = Path(temp) / "first"
+            second = Path(temp) / "second"
+            with trace.TraceBundleWriter(first, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            with trace.TraceBundleWriter(second, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            result = trace.local_report(
+                trace.TraceBundle(first),
+                trace.TraceBundle(second),
+                "self-consistency",
+            )
+            self.assertEqual(result["status"], "BRINGUP PASS")
+            self.assertNotEqual(result["status"], "TARGET PASS")
+            self.assertEqual(result["cross_runtime_status"], "INCOMPLETE")
+
+    def test_local_base_regression_requires_attested_oracle_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp) / "base"
+            integrated = Path(temp) / "integrated"
+            base_manifest = manifest("llama.cpp")
+            base_manifest["revision"] = "b" * 40
+            base_manifest["candidate"]["revision"] = "b" * 40
+            with trace.TraceBundleWriter(base, base_manifest) as writer:
+                add_required_events(writer)
+            with trace.TraceBundleWriter(integrated, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            result = trace.local_report(
+                trace.TraceBundle(base),
+                trace.TraceBundle(integrated),
+                "base-regression",
+            )
+            self.assertEqual(result["status"], "BRINGUP PASS")
+            self.assertEqual(result["cross_runtime_status"], "INCOMPLETE")
 
     def test_manifest_mismatch_is_classified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

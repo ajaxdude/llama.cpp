@@ -15,10 +15,25 @@ from preflight import (
     bind_prompt_provenance,
     resolved,
     run_preflight,
+    safe_trace_path,
+    seal_audits,
     validate_prompt_provenance,
+    verify_sealed_audits,
     write_audits,
 )
-from trace_format import CORPUS_SHA256, MODEL_SHA256, REPOSITORY, TraceBundle, TraceError, sha256_file
+from trace_format import (
+    ADMITTED_BATCH,
+    ADMITTED_UBATCH,
+    CORPUS_SHA256,
+    MODEL_SHA256,
+    REPOSITORY,
+    REQUIRED_EXPERT_CACHE_BYTES,
+    REQUIRED_EXPERT_CACHE_MIB,
+    REQUIRED_EXPERT_SLOTS,
+    TraceBundle,
+    TraceError,
+    sha256_file,
+)
 
 
 def git_output(repo: Path, *args: str) -> bytes:
@@ -76,8 +91,10 @@ def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dic
     }
 
 
-def bind_candidate_attestation(output: Path, attestation: dict[str, str]) -> None:
-    manifest_path = output / "manifest.json"
+def bind_candidate_attestation(
+        output: Path,
+        attestation: dict[str, str]) -> None:
+    manifest_path = safe_trace_path(output, "manifest.json")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -98,13 +115,36 @@ def build_command(args: argparse.Namespace, exporter: Path, output: Path) -> lis
         "-n", str(args.decode_steps),
         "-b", str(args.batch),
         "-ub", str(args.ubatch),
+        "--device", args.device,
         "-ngl", str(args.gpu_layers),
         "-fa", "on",
         "-ctk", "f16",
         "-ctv", "f16",
+        "--load-mode", "none",
         "--expert-cache-slots", str(args.expert_cache_slots),
         "--expert-cache-mib", str(args.expert_cache_mib),
     ]
+
+
+def validate_runtime_config(args: argparse.Namespace) -> None:
+    if args.batch != ADMITTED_BATCH:
+        raise PreflightError(
+            f"DeepSeek V4.1 correctness runs require batch {ADMITTED_BATCH}, found {args.batch}")
+    if args.ubatch != ADMITTED_UBATCH:
+        raise PreflightError(
+            f"DeepSeek V4.1 correctness runs require admitted ubatch {ADMITTED_UBATCH}, found {args.ubatch}")
+    if args.expert_cache_slots != REQUIRED_EXPERT_SLOTS:
+        raise PreflightError(
+            f"DeepSeek V4.1 correctness runs require {REQUIRED_EXPERT_SLOTS} expert cache slots, "
+            f"found {args.expert_cache_slots}")
+    if args.expert_cache_mib != REQUIRED_EXPERT_CACHE_MIB:
+        raise PreflightError(
+            f"DeepSeek V4.1 correctness runs require {REQUIRED_EXPERT_CACHE_BYTES} expert cache bytes "
+            f"({REQUIRED_EXPERT_CACHE_MIB} MiB), found {args.expert_cache_mib} MiB")
+    if args.device != "ROCm0":
+        raise PreflightError(f"DeepSeek V4.1 correctness runs require device ROCm0, found {args.device}")
+    if args.gpu_layers != 99:
+        raise PreflightError(f"DeepSeek V4.1 correctness runs require 99 GPU layers, found {args.gpu_layers}")
 
 
 def main() -> int:
@@ -120,19 +160,20 @@ def main() -> int:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--watchdog-pid-file", type=Path, required=True)
     parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--decode-steps", type=int, default=8)
-    parser.add_argument("--batch", type=int, default=2048)
-    parser.add_argument("--ubatch", type=int, default=512)
-    parser.add_argument("--expert-cache-slots", type=int, required=True)
-    parser.add_argument("--expert-cache-mib", type=int, required=True)
+    parser.add_argument("--batch", type=int, default=ADMITTED_BATCH)
+    parser.add_argument("--ubatch", type=int, default=ADMITTED_UBATCH)
+    parser.add_argument("--device", default="ROCm0")
+    parser.add_argument("--expert-cache-slots", type=int, default=REQUIRED_EXPERT_SLOTS)
+    parser.add_argument("--expert-cache-mib", type=int, default=REQUIRED_EXPERT_CACHE_MIB)
     parser.add_argument("--gpu-layers", type=int, default=99)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
     try:
+        validate_runtime_config(args)
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         if args.preflight_only:
@@ -140,7 +181,7 @@ def main() -> int:
                 model=args.model,
                 prompt=args.prompt,
                 output=args.output,
-                watchdog_pid_file=args.watchdog_pid_file,
+                repo=args.repo,
                 busy_patterns=args.busy_pattern,
             )
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
@@ -169,7 +210,7 @@ def main() -> int:
             model=args.model,
             prompt=args.prompt,
             output=args.output,
-            watchdog_pid_file=args.watchdog_pid_file,
+            repo=args.repo,
             busy_patterns=args.busy_pattern,
         )
         preflight_audit["runtime"] = "llama.cpp"
@@ -178,11 +219,13 @@ def main() -> int:
             "decode_steps": args.decode_steps,
             "batch": args.batch,
             "ubatch": args.ubatch,
+            "device": args.device,
             "expert_cache_slots": args.expert_cache_slots,
             "expert_cache_mib": args.expert_cache_mib,
             "gpu_layers": args.gpu_layers,
         }
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
+        pre_audit_digests = seal_audits(pre_audits)
         environment = os.environ.copy()
         environment["DSV41_TRACE_MEMORY_AUDIT"] = pre_audits["memory"]
         environment["DSV41_TRACE_SWAP_AUDIT"] = pre_audits["swap"]
@@ -192,11 +235,12 @@ def main() -> int:
         result = subprocess.run(command, env=environment, check=False)
         if result.returncode != 0:
             return result.returncode
+        verify_sealed_audits(pre_audits, pre_audit_digests)
         postflight_audit = run_preflight(
             model=args.model,
             prompt=args.prompt,
             output=args.output,
-            watchdog_pid_file=args.watchdog_pid_file,
+            repo=args.repo,
             busy_patterns=args.busy_pattern,
         )
         postflight_audit["runtime"] = "llama.cpp"

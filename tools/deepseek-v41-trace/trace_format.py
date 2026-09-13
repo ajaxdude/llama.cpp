@@ -17,6 +17,23 @@ DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 MODEL_SHA256 = "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
 REPOSITORY = "halo-box/strix-llama.cpp"
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
+WATCHDOG_EMERGENCY_LIMIT = 118 * 1024 * 1024 * 1024
+STRICT_MEMORY_LIMIT = 120 * 1024 * 1024 * 1024
+WATCHDOG_LEASE_FORMAT = "strix-memory-watchdog-lease"
+WATCHDOG_VERSION = 2
+WATCHDOG_REVISION = "778db6f50eae04e6c232c69b9575bdbd0747962b"
+WATCHDOG_SCRIPT_SHA256 = "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f"
+APPROVED_WATCHDOGS = {WATCHDOG_SCRIPT_SHA256: WATCHDOG_REVISION}
+ADMITTED_UBATCH = 32
+ADMITTED_BATCH = 2048
+EXPERT_COUNT = 384
+EXPERTS_USED = 6
+EXPERT_SLOT_BYTES = 398_131_200
+REQUIRED_EXPERT_SLOTS = min(EXPERT_COUNT, EXPERTS_USED * ADMITTED_UBATCH)
+REQUIRED_EXPERT_CACHE_BYTES = REQUIRED_EXPERT_SLOTS * EXPERT_SLOT_BYTES
+REQUIRED_EXPERT_CACHE_MIB = REQUIRED_EXPERT_CACHE_BYTES // (1024 * 1024)
+RAW_ATTENTION_LAYERS = (0, 1)
+RAW_ATTENTION_WIDTH = 128
 CORPUS_SHA256 = {
     "correctness-prose.txt": "2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2",
     "correctness-code.txt": "41b4246ef4e6b4e3f9f23a3d02aa8cdab48f495b3af0ebeaccea255679c771f0",
@@ -329,9 +346,11 @@ class TraceBundleWriter:
 
 class TraceBundle:
     def __init__(self, root: Path, verify_blobs: bool = True):
-        self.root = root
+        if root.is_symlink():
+            raise TraceError("trace root must not be a symlink")
+        self.root = root.resolve()
         try:
-            self.manifest = json.loads((root / MANIFEST_NAME).read_text(encoding="ascii"))
+            self.manifest = json.loads(self._path(MANIFEST_NAME).read_text(encoding="ascii"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise TraceError(f"cannot read manifest: {error}") from error
         if self.manifest.get("trace_format") != TRACE_FORMAT:
@@ -348,7 +367,7 @@ class TraceBundle:
         result = []
         try:
             stream: BinaryIO
-            with (self.root / EVENTS_NAME).open("rb") as stream:
+            with self._path(EVENTS_NAME).open("rb") as stream:
                 for line_number, raw in enumerate(stream, 1):
                     if not raw.endswith(b"\n"):
                         raise TraceError(f"events.jsonl is truncated at line {line_number}")
@@ -420,7 +439,7 @@ class TraceBundle:
         if provenance.get("path") != f"provenance/{provenance_sha256}.json":
             raise TraceError("prompt provenance path is not content addressed")
         try:
-            provenance_bytes = (self.root / provenance["path"]).read_bytes()
+            provenance_bytes = self._path(provenance["path"]).read_bytes()
             provenance_record = json.loads(provenance_bytes.decode("ascii"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise TraceError(f"cannot read prompt provenance: {error}") from error
@@ -471,12 +490,28 @@ class TraceBundle:
             "candidate_topk_blocks": 2048,
             "candidate_block_size": 8,
             "index_top_k": 512,
+            "raw_attention_layers": list(RAW_ATTENTION_LAYERS),
+            "raw_attention_width": RAW_ATTENTION_WIDTH,
             "candidate_propagation_layers": [24, 28, 32, 36],
         }
         if self.manifest["config"].get("deepseek41") != expected_config:
             raise TraceError("DeepSeek V4.1 configuration is invalid")
         if self.manifest["comparison"].get("logits") != "byte-identical-f32":
             raise TraceError("logit comparison policy must be byte-identical-f32")
+        config = self.manifest["config"]
+        if self.manifest["runtime"] == "llama.cpp":
+            if config.get("batch") != ADMITTED_BATCH or config.get("ubatch") != ADMITTED_UBATCH:
+                raise TraceError("llama.cpp trace does not use the admitted batch and ubatch")
+            if config.get("expert_cache_slots") != REQUIRED_EXPERT_SLOTS or (
+                    config.get("expert_cache_bytes") != REQUIRED_EXPERT_CACHE_BYTES):
+                raise TraceError("llama.cpp trace does not use the admitted expert cache")
+            if config.get("device") != "ROCm0" or config.get("gpu_layers") != 99:
+                raise TraceError("llama.cpp trace does not use the required ROCm0 offload")
+            if config.get("kv_type_k") != "f16" or config.get("kv_type_v") != "f16" or (
+                    config.get("flash_attention") not in (True, 1)) or config.get("load_mode") != 0:
+                raise TraceError("llama.cpp trace inference configuration is invalid")
+        if self.manifest["runtime"] == "ds4" and config.get("prefill_chunk") != ADMITTED_UBATCH:
+            raise TraceError("ds4 trace does not use the admitted prefill chunk")
         for audit_phase in ("pre", "post"):
             phase_audits = self.manifest["audits"].get(audit_phase)
             if not isinstance(phase_audits, dict):
@@ -498,7 +533,7 @@ class TraceBundle:
         expected_path = f"audits/{phase}/{digest}.json"
         if audit_path != expected_path:
             raise TraceError(f"manifest {phase} {kind} audit path is not content addressed")
-        evidence_path = self.root / audit_path
+        evidence_path = self._path(audit_path)
         try:
             evidence = evidence_path.read_bytes()
         except OSError as error:
@@ -511,6 +546,8 @@ class TraceBundle:
             raise TraceError(f"{phase} {kind} audit evidence is invalid: {error}") from error
         if record.get("kind") != kind or record.get("created_unix") != audit["created_unix"]:
             raise TraceError(f"{phase} {kind} audit evidence metadata mismatch")
+        if record.get("environment") != {"HIP_LAUNCH_BLOCKING": "1"}:
+            raise TraceError(f"{phase} {kind} audit environment is invalid")
         if not isinstance(record.get("data"), dict):
             raise TraceError(f"{phase} {kind} audit evidence data is invalid")
         if kind == "memory":
@@ -521,33 +558,146 @@ class TraceBundle:
             if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
                 raise TraceError(f"{phase} swap audit evidence does not report zero configured swap")
         if kind == "watchdog":
-            required = ("pid", "start_time_ticks", "command_sha256", "heartbeat_path", "heartbeat_unix")
+            required = (
+                "format",
+                "version",
+                "lease_id",
+                "lease_path",
+                "watchdog_pid",
+                "watchdog_start_time_ticks",
+                "watchdog_command",
+                "watchdog_command_sha256",
+                "watchdog_executable_path",
+                "watchdog_script_path",
+                "watchdog_script_sha256",
+                "watchdog_revision",
+                "soft_bytes",
+                "emergency_bytes",
+                "strict_ceiling_bytes",
+                "grace_seconds",
+                "sample_interval_seconds",
+                "procfs_root",
+                "guardian_pid",
+                "child_pid",
+                "child_process_group_id",
+                "command",
+                "child_command_sha256",
+                "heartbeat_path",
+                "heartbeat_unix",
+                "max_heartbeat_age_seconds",
+                "audit_live_path",
+                "audit_device",
+                "audit_inode",
+                "audit_uid",
+                "audit_mode",
+                "audit_fd",
+                "audit",
+            )
             if any(key not in record["data"] for key in required):
                 raise TraceError(f"{phase} watchdog audit evidence is incomplete")
             data = record["data"]
-            if not isinstance(data["pid"], int) or data["pid"] <= 1:
+            if data["format"] != WATCHDOG_LEASE_FORMAT or data["version"] != WATCHDOG_VERSION:
+                raise TraceError(f"{phase} watchdog audit format is invalid")
+            if not isinstance(data["lease_id"], str) or re.fullmatch(r"[0-9a-f]{32,64}", data["lease_id"]) is None:
+                raise TraceError(f"{phase} watchdog audit lease ID is invalid")
+            if not isinstance(data["watchdog_pid"], int) or data["watchdog_pid"] <= 1:
                 raise TraceError(f"{phase} watchdog audit PID is invalid")
-            if not isinstance(data["start_time_ticks"], int) or data["start_time_ticks"] <= 0:
+            if not isinstance(data["watchdog_start_time_ticks"], int) or data["watchdog_start_time_ticks"] <= 0:
                 raise TraceError(f"{phase} watchdog audit start time is invalid")
-            if not isinstance(data["command_sha256"], str) or re.fullmatch(
-                    r"[0-9a-f]{64}", data["command_sha256"]) is None:
+            for key in ("watchdog_command_sha256", "watchdog_script_sha256"):
+                if not isinstance(data[key], str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None:
+                    raise TraceError(f"{phase} watchdog audit {key} is invalid")
+            for key in ("lease_path", "watchdog_command", "watchdog_script_path", "heartbeat_path", "audit_live_path"):
+                if not isinstance(data[key], str) or not data[key]:
+                    raise TraceError(f"{phase} watchdog audit {key} is invalid")
+            if APPROVED_WATCHDOGS.get(data["watchdog_script_sha256"]) != data["watchdog_revision"]:
+                raise TraceError(f"{phase} watchdog audit revision is invalid")
+            if not isinstance(data["watchdog_executable_path"], str) or not data["watchdog_executable_path"]:
+                raise TraceError(f"{phase} watchdog executable path is invalid")
+            if data["soft_bytes"] != SOFT_MEMORY_LIMIT or (
+                    data["emergency_bytes"] != WATCHDOG_EMERGENCY_LIMIT) or (
+                    data["strict_ceiling_bytes"] != STRICT_MEMORY_LIMIT):
+                raise TraceError(f"{phase} watchdog audit thresholds are invalid")
+            if data["grace_seconds"] != 30.0 or data["sample_interval_seconds"] != 1.0:
+                raise TraceError(f"{phase} watchdog timing policy is invalid")
+            if data["procfs_root"] != "/proc":
+                raise TraceError(f"{phase} watchdog procfs root is invalid")
+            if not isinstance(data["guardian_pid"], int) or data["guardian_pid"] <= 1 or (
+                    not isinstance(data["child_pid"], int) or data["child_pid"] <= 1) or (
+                    not isinstance(data["child_process_group_id"], int) or data["child_process_group_id"] <= 1):
+                raise TraceError(f"{phase} watchdog child identity is invalid")
+            for key in ("audit_device", "audit_inode", "audit_uid", "audit_fd"):
+                if not isinstance(data[key], int) or data[key] < 0:
+                    raise TraceError(f"{phase} watchdog audit {key} is invalid")
+            if data["audit_mode"] != 0o600:
+                raise TraceError(f"{phase} watchdog audit mode is invalid")
+            if not isinstance(data["command"], list) or not data["command"] or (
+                    not all(isinstance(argument, str) for argument in data["command"])):
+                raise TraceError(f"{phase} watchdog child command is invalid")
+            canonical_command = json.dumps(
+                data["command"], ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+            if data["child_command_sha256"] != sha256_bytes(canonical_command):
+                raise TraceError(f"{phase} watchdog child command SHA-256 is invalid")
+            if not isinstance(data["watchdog_command_sha256"], str) or re.fullmatch(
+                    r"[0-9a-f]{64}", data["watchdog_command_sha256"]) is None:
                 raise TraceError(f"{phase} watchdog audit command SHA-256 is invalid")
-            if not isinstance(data["heartbeat_path"], str) or not data["heartbeat_path"]:
-                raise TraceError(f"{phase} watchdog audit heartbeat path is invalid")
             if not isinstance(data["heartbeat_unix"], int) or data["heartbeat_unix"] <= 0:
                 raise TraceError(f"{phase} watchdog audit heartbeat timestamp is invalid")
             max_age = data.get("max_heartbeat_age_seconds")
-            if not isinstance(max_age, int) or max_age <= 0 or max_age > 30:
+            if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) or (
+                    max_age <= 0 or max_age > 30):
                 raise TraceError(f"{phase} watchdog audit heartbeat age is invalid")
             if data["heartbeat_unix"] > record["created_unix"] or (
                     record["created_unix"] - data["heartbeat_unix"] > max_age):
                 raise TraceError(f"{phase} watchdog audit heartbeat was stale when captured")
+            audit_jsonl = data["audit"]
+            if not isinstance(audit_jsonl, dict):
+                raise TraceError(f"{phase} watchdog JSONL reference is invalid")
+            jsonl_digest = audit_jsonl.get("sha256", "")
+            if not isinstance(jsonl_digest, str) or re.fullmatch(r"[0-9a-f]{64}", jsonl_digest) is None:
+                raise TraceError(f"{phase} watchdog JSONL SHA-256 is invalid")
+            if audit_jsonl.get("path") != f"audits/{phase}/{jsonl_digest}.jsonl":
+                raise TraceError(f"{phase} watchdog JSONL path is invalid")
+            if not isinstance(audit_jsonl.get("event_count"), int) or audit_jsonl["event_count"] < 2:
+                raise TraceError(f"{phase} watchdog JSONL event count is invalid")
+            jsonl_path = self._path(audit_jsonl["path"])
+            try:
+                jsonl_bytes = jsonl_path.read_bytes()
+            except OSError as error:
+                raise TraceError(f"cannot read {phase} watchdog JSONL audit: {error}") from error
+            if sha256_bytes(jsonl_bytes) != jsonl_digest:
+                raise TraceError(f"{phase} watchdog JSONL SHA-256 mismatch")
+            lines = jsonl_bytes.decode("ascii").splitlines()
+            if len(lines) != audit_jsonl["event_count"]:
+                raise TraceError(f"{phase} watchdog JSONL event count mismatch")
+            try:
+                events = [json.loads(line) for line in lines]
+            except json.JSONDecodeError as error:
+                raise TraceError(f"{phase} watchdog JSONL is invalid: {error}") from error
+            if not any(event.get("event") == "preflight" for event in events) or (
+                    not any(event.get("event") == "child_started" for event in events)):
+                raise TraceError(f"{phase} watchdog JSONL lacks startup evidence")
 
     def read_blob(self, event: dict[str, Any]) -> bytes:
         try:
-            return (self.root / event["blob"]).read_bytes()
+            return self._path(event["blob"]).read_bytes()
         except OSError as error:
             raise TraceError(f"cannot read blob {event['blob']}: {error}") from error
+
+    def _path(self, relative: str) -> Path:
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise TraceError(f"trace path is outside the bundle: {relative}")
+        candidate = self.root
+        for part in relative_path.parts:
+            candidate = candidate / part
+            if candidate.is_symlink():
+                raise TraceError(f"trace path must not use symlinks: {relative}")
+        try:
+            candidate.resolve().relative_to(self.root)
+        except ValueError as error:
+            raise TraceError(f"trace path is outside the bundle: {relative}") from error
+        return candidate
 
     def _validate_coverage(self) -> None:
         expected = self.manifest.get("expected")
@@ -566,6 +716,24 @@ class TraceBundle:
             raise TraceError("expected prompt_tokens does not match prompt provenance")
         for event in self.events:
             self._validate_component_schema(event)
+        raw_attention = {
+            (event["phase"], event["step"], event["token_start"], event["layer"]): event
+            for event in self.events
+            if event["component"] == "attn.source" and event["layer"] in RAW_ATTENTION_LAYERS
+        }
+        raw_coordinates = {
+            (phase, step, token_start)
+            for phase, step, token_start, _layer in raw_attention
+        }
+        for phase, step, token_start in raw_coordinates:
+            layer0 = raw_attention.get((phase, step, token_start, 0))
+            layer1 = raw_attention.get((phase, step, token_start, 1))
+            if layer0 is None or layer1 is None:
+                continue
+            if layer0["shape"] != layer1["shape"] or self.read_blob(layer0) != self.read_blob(layer1):
+                raise TraceError(
+                    f"raw attn.source differs between layers 0 and 1 at "
+                    f"{phase} step {step} token {token_start}")
         if not isinstance(components, dict):
             raise TraceError("expected components are invalid")
         if self.manifest.get("model", {}).get("architecture") == "deepseek41":
@@ -678,9 +846,26 @@ class TraceBundle:
             raise TraceError(f"{component} dtype must be {expected_dtype}")
         if width is not None and shape[0] != width:
             raise TraceError(f"{component} shape must be [{width},token_count]")
+        if component == "attn.source" and layer in RAW_ATTENTION_LAYERS:
+            if shape[0] != RAW_ATTENTION_WIDTH:
+                raise TraceError(f"raw attn.source shape must be [{RAW_ATTENTION_WIDTH},token_count]")
+            values = list(struct.iter_unpack("<i", self.read_blob(event)))
+            sentinel = RAW_ATTENTION_WIDTH + token_count
+            for token in range(token_count):
+                for row in range(RAW_ATTENTION_WIDTH):
+                    value = values[token*RAW_ATTENTION_WIDTH + row][0]
+                    if 0 <= value < RAW_ATTENTION_WIDTH or (
+                            RAW_ATTENTION_WIDTH <= value <= RAW_ATTENTION_WIDTH + token) or value == sentinel:
+                        continue
+                    raise TraceError(
+                        f"raw attn.source contains invalid row {value} for token {token}; "
+                        f"expected physical row, visible ubatch row, or sentinel {sentinel}")
         if component == "attn.candidate_blocks" and shape[0] > config.get("candidate_topk_blocks", 0):
             raise TraceError("attn.candidate_blocks width exceeds candidate_topk_blocks")
-        if component in ("attn.source", "attn.candidates") and shape[0] > config.get("index_top_k", 0):
+        if component == "attn.source" and layer not in RAW_ATTENTION_LAYERS and (
+                shape[0] > config.get("index_top_k", 0)):
+            raise TraceError(f"{component} width exceeds index_top_k")
+        if component == "attn.candidates" and shape[0] > config.get("index_top_k", 0):
             raise TraceError(f"{component} width exceeds index_top_k")
         if component == "expert.ids":
             values = struct.iter_unpack("<i", self.read_blob(event))
@@ -728,7 +913,11 @@ def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
     return None
 
 
-def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
+def compare_bundles(
+        left: TraceBundle,
+        right: TraceBundle,
+        *,
+        runtime_roles: tuple[str, str] = ("ds4", "llama.cpp")) -> Mismatch | None:
     if left.root.resolve() == right.root.resolve():
         return Mismatch(
             "artifact_identity",
@@ -739,7 +928,7 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             None,
             "cannot compare a trace bundle with itself",
         )
-    if left.manifest["runtime"] != "ds4" or right.manifest["runtime"] != "llama.cpp":
+    if left.manifest["runtime"] != runtime_roles[0] or right.manifest["runtime"] != runtime_roles[1]:
         return Mismatch(
             "runtime_role",
             "manifest",
@@ -747,7 +936,7 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             -1,
             -1,
             None,
-            "left trace must be pinned ds4 and right trace must be llama.cpp candidate",
+            f"left trace must be {runtime_roles[0]} and right trace must be {runtime_roles[1]}",
         )
     mismatch = compare_manifests(left, right)
     if mismatch is not None:
@@ -864,11 +1053,16 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
     ))
 
 
-def report(left: TraceBundle, right: TraceBundle) -> dict[str, Any]:
-    mismatch = compare_bundles(left, right)
+def report(
+        left: TraceBundle,
+        right: TraceBundle,
+        *,
+        runtime_roles: tuple[str, str] = ("ds4", "llama.cpp"),
+        success_status: str = "TARGET PASS") -> dict[str, Any]:
+    mismatch = compare_bundles(left, right, runtime_roles=runtime_roles)
     if mismatch is None:
         return {
-            "status": "TARGET PASS",
+            "status": success_status,
             "trace_version": TRACE_VERSION,
             "left_runtime": left.manifest.get("runtime"),
             "right_runtime": right.manifest.get("runtime"),
@@ -904,6 +1098,61 @@ def command_compare(args: argparse.Namespace) -> int:
     return 0 if result["status"] == "TARGET PASS" else 1
 
 
+def local_report(left: TraceBundle, right: TraceBundle, mode: str) -> dict[str, Any]:
+    result = report(
+        left,
+        right,
+        runtime_roles=("llama.cpp", "llama.cpp"),
+        success_status="BRINGUP PASS",
+    )
+    result["mode"] = mode
+    result["cross_runtime_status"] = "INCOMPLETE"
+    result["cross_runtime_requirement"] = (
+        "Run the pinned ds4 exporter and trace_format.py compare before reporting TARGET PASS.")
+    if mode == "self-consistency":
+        if left.manifest.get("candidate") != right.manifest.get("candidate"):
+            result = {
+                **result,
+                "status": "FAIL",
+                "first_divergence": Mismatch(
+                    "candidate_identity",
+                    "manifest",
+                    "metadata",
+                    -1,
+                    -1,
+                    None,
+                    "self-consistency traces use different candidate attestations",
+                ).as_dict(),
+            }
+    else:
+        base_revision = left.manifest.get("candidate", {}).get("revision")
+        integrated_base = right.manifest.get("candidate", {}).get("base_revision")
+        if base_revision != integrated_base:
+            result = {
+                **result,
+                "status": "FAIL",
+                "first_divergence": Mismatch(
+                    "candidate_identity",
+                    "manifest",
+                    "metadata",
+                    -1,
+                    -1,
+                    None,
+                    f"base trace revision {base_revision!r} != integrated oracle {integrated_base!r}",
+                ).as_dict(),
+            }
+    return result
+
+
+def command_compare_local(args: argparse.Namespace) -> int:
+    result = local_report(TraceBundle(args.left), TraceBundle(args.right), args.mode)
+    text = canonical_json(result) + "\n"
+    if args.report:
+        args.report.write_text(text, encoding="ascii")
+    sys.stdout.write(text)
+    return 0 if result["status"] == "BRINGUP PASS" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate and compare DeepSeek V4.1 correctness traces")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -915,6 +1164,12 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("right", type=Path)
     compare_parser.add_argument("--report", type=Path)
     compare_parser.set_defaults(func=command_compare)
+    local_parser = subparsers.add_parser("compare-local")
+    local_parser.add_argument("mode", choices=("self-consistency", "base-regression"))
+    local_parser.add_argument("left", type=Path)
+    local_parser.add_argument("right", type=Path)
+    local_parser.add_argument("--report", type=Path)
+    local_parser.set_defaults(func=command_compare_local)
     return parser
 
 

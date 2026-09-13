@@ -14,12 +14,15 @@ from preflight import (
     bind_prompt_provenance,
     resolved,
     run_preflight,
+    seal_audits,
     validate_prompt_provenance,
+    verify_sealed_audits,
     write_audits,
 )
-from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, sha256_file
+from trace_format import ADMITTED_UBATCH, CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, sha256_file
 
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
+APPROVED_EXPORTERS: dict[str, str] = {}
 
 
 def git_output(checkout: Path, *args: str) -> str:
@@ -41,6 +44,13 @@ def verify_checkout(checkout: Path) -> str:
     return revision
 
 
+def verify_exporter_approval(exporter_sha256: str) -> None:
+    if APPROVED_EXPORTERS.get(exporter_sha256) != DS4_REVISION:
+        raise PreflightError(
+            "ds4 trace exporter is not approved for the pinned ds4 revision; "
+            "publish and review the exporter before cross-runtime execution")
+
+
 def preflight(args: argparse.Namespace) -> dict[str, object]:
     checkout = resolved(args.checkout)
     revision = verify_checkout(checkout)
@@ -50,7 +60,7 @@ def preflight(args: argparse.Namespace) -> dict[str, object]:
         model=args.model,
         prompt=args.prompt,
         output=args.output,
-        watchdog_pid_file=args.watchdog_pid_file,
+        repo=args.repo,
         busy_patterns=args.busy_pattern,
     )
     result.update({
@@ -69,10 +79,10 @@ def preflight(args: argparse.Namespace) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fail-closed launcher for the pinned ds4 trace exporter")
     parser.add_argument("--checkout", type=Path, default=Path("/home/papa/src/ds4-v41"))
+    parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--watchdog-pid-file", type=Path, required=True)
     parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
     parser.add_argument("--exporter", type=Path, required=True)
     parser.add_argument("--exporter-sha256", required=True)
@@ -81,11 +91,15 @@ def main() -> int:
     parser.add_argument("--prompt-provenance", type=Path, required=True)
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--decode-steps", type=int, default=8)
-    parser.add_argument("--prefill-chunk", type=int, default=512)
+    parser.add_argument("--prefill-chunk", type=int, default=ADMITTED_UBATCH)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
     try:
+        if args.prefill_chunk != ADMITTED_UBATCH:
+            raise PreflightError(
+                f"DeepSeek V4.1 correctness runs require admitted prefill chunk {ADMITTED_UBATCH}, "
+                f"found {args.prefill_chunk}")
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         if args.preflight_only:
@@ -100,6 +114,7 @@ def main() -> int:
         if exporter_sha256 != args.exporter_sha256:
             raise PreflightError(
                 f"trace exporter SHA-256 mismatch: expected {args.exporter_sha256}, found {exporter_sha256}")
+        verify_exporter_approval(exporter_sha256)
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
@@ -117,6 +132,7 @@ def main() -> int:
         preflight_audit = preflight(args)
         preflight_audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
+        pre_audit_digests = seal_audits(pre_audits)
         command = [
             str(exporter),
             "--model", str(resolved(args.model)),
@@ -133,6 +149,7 @@ def main() -> int:
         result = subprocess.run(command, cwd=resolved(args.checkout), check=False)
         if result.returncode != 0:
             return result.returncode
+        verify_sealed_audits(pre_audits, pre_audit_digests)
         postflight_audit = preflight(args)
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})

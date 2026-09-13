@@ -9,7 +9,17 @@ import sys
 from pathlib import Path
 
 from preflight import PreflightError, require_nvme_path, resolved, run_preflight
-from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, report, sha256_file
+from trace_format import (
+    ADMITTED_BATCH,
+    ADMITTED_UBATCH,
+    CORPUS_SHA256,
+    MODEL_SHA256,
+    REQUIRED_EXPERT_CACHE_MIB,
+    REQUIRED_EXPERT_SLOTS,
+    TraceBundle,
+    report,
+    sha256_file,
+)
 
 CORPORA = (
     "correctness-prose.txt",
@@ -81,27 +91,46 @@ def main() -> int:
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--watchdog-pid-file", type=Path, required=True)
     parser.add_argument("--llama-runner", type=Path, required=True)
     parser.add_argument("--llama-exporter", type=Path, required=True)
     parser.add_argument("--llama-prompt-builder", type=Path, required=True)
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--base-revision", required=True)
     parser.add_argument("--candidate-diff-sha256", required=True)
-    parser.add_argument("--ds4-runner", type=Path, required=True)
-    parser.add_argument("--ds4-exporter", type=Path, required=True)
-    parser.add_argument("--ds4-exporter-sha256", required=True)
+    parser.add_argument("--ds4-runner", type=Path)
+    parser.add_argument("--ds4-exporter", type=Path)
+    parser.add_argument("--ds4-exporter-sha256")
     parser.add_argument("--ds4-checkout", type=Path, default=Path("/home/papa/src/ds4-v41"))
+    parser.add_argument("--llama-only", action="store_true")
     parser.add_argument("--contexts", type=int, nargs="+", default=[32768])
-    parser.add_argument("--ubatches", type=int, nargs="+", default=[512])
+    parser.add_argument("--ubatches", type=int, nargs="+", default=[ADMITTED_UBATCH])
     parser.add_argument("--decode-steps", type=int, default=8)
-    parser.add_argument("--batch", type=int, default=2048)
-    parser.add_argument("--expert-cache-slots", type=int, required=True)
-    parser.add_argument("--expert-cache-mib", type=int, required=True)
+    parser.add_argument("--batch", type=int, default=ADMITTED_BATCH)
+    parser.add_argument("--device", default="ROCm0")
+    parser.add_argument("--expert-cache-slots", type=int, default=REQUIRED_EXPERT_SLOTS)
+    parser.add_argument("--expert-cache-mib", type=int, default=REQUIRED_EXPERT_CACHE_MIB)
     parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
     args = parser.parse_args()
 
     try:
+        if args.ubatches != [ADMITTED_UBATCH]:
+            raise PreflightError(
+                f"DeepSeek V4.1 correctness matrix requires admitted ubatch [{ADMITTED_UBATCH}]")
+        if args.batch != ADMITTED_BATCH:
+            raise PreflightError(f"DeepSeek V4.1 correctness matrix requires batch {ADMITTED_BATCH}")
+        if args.device != "ROCm0":
+            raise PreflightError("DeepSeek V4.1 correctness matrix requires device ROCm0")
+        if args.expert_cache_slots != REQUIRED_EXPERT_SLOTS:
+            raise PreflightError(
+                f"DeepSeek V4.1 correctness matrix requires {REQUIRED_EXPERT_SLOTS} expert cache slots")
+        if args.expert_cache_mib != REQUIRED_EXPERT_CACHE_MIB:
+            raise PreflightError(
+                f"DeepSeek V4.1 correctness matrix requires {REQUIRED_EXPERT_CACHE_MIB} MiB expert cache")
+        if not args.llama_only and (
+                args.ds4_runner is None or args.ds4_exporter is None or args.ds4_exporter_sha256 is None):
+            raise PreflightError(
+                "--ds4-runner, --ds4-exporter, and --ds4-exporter-sha256 are required "
+                "unless --llama-only is selected")
         repo = resolved(args.repo)
         output = require_nvme_path(args.output, "matrix output")
         model = require_nvme_path(args.model, "model")
@@ -110,6 +139,17 @@ def main() -> int:
         model_sha256 = sha256_file(model)
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        initial_corpus = require_nvme_path(
+            repo / "tests" / "corpus" / CORPORA[0],
+            "repository corpus",
+        )
+        run_preflight(
+            model=model,
+            prompt=initial_corpus,
+            output=output,
+            repo=repo,
+            busy_patterns=args.busy_pattern,
+        )
         prompt_builder = resolved(args.llama_prompt_builder)
         if not prompt_builder.is_file() or not os.access(prompt_builder, os.X_OK):
             raise PreflightError(f"prompt builder is not executable: {prompt_builder}")
@@ -155,7 +195,7 @@ def main() -> int:
                     model=model,
                     prompt=Path(corpus["path"]),
                     output=prompt,
-                    watchdog_pid_file=args.watchdog_pid_file,
+                    repo=repo,
                     busy_patterns=args.busy_pattern,
                 )
                 prepared = prepare_prompt(
@@ -184,22 +224,26 @@ def main() -> int:
                         "--prompt-provenance", provenance,
                         "--corpus-name", corpus["name"],
                         "--corpus-sha256", corpus["sha256"],
-                        "--watchdog-pid-file", str(resolved(args.watchdog_pid_file)),
                         "--context", str(context),
                         "--decode-steps", str(args.decode_steps),
                     ]
                     for pattern in args.busy_pattern:
                         common.extend(["--busy-pattern", pattern])
-                    run([
-                        sys.executable,
-                        str(resolved(args.ds4_runner)),
-                        "--checkout", str(resolved(args.ds4_checkout)),
-                        "--exporter", str(resolved(args.ds4_exporter)),
-                        "--exporter-sha256", args.ds4_exporter_sha256,
-                        "--output", str(ds4_output),
-                        "--prefill-chunk", str(ubatch),
-                        *common,
-                    ])
+                    if not args.llama_only:
+                        assert args.ds4_runner is not None
+                        assert args.ds4_exporter is not None
+                        assert args.ds4_exporter_sha256 is not None
+                        run([
+                            sys.executable,
+                            str(resolved(args.ds4_runner)),
+                            "--repo", str(repo),
+                            "--checkout", str(resolved(args.ds4_checkout)),
+                            "--exporter", str(resolved(args.ds4_exporter)),
+                            "--exporter-sha256", args.ds4_exporter_sha256,
+                            "--output", str(ds4_output),
+                            "--prefill-chunk", str(ubatch),
+                            *common,
+                        ])
                     run([
                         sys.executable,
                         str(resolved(args.llama_runner)),
@@ -211,23 +255,35 @@ def main() -> int:
                         "--output", str(llama_output),
                         "--batch", str(args.batch),
                         "--ubatch", str(ubatch),
+                        "--device", args.device,
                         "--expert-cache-slots", str(args.expert_cache_slots),
                         "--expert-cache-mib", str(args.expert_cache_mib),
                         *common,
                     ])
-                    comparison = report(TraceBundle(ds4_output), TraceBundle(llama_output))
-                    result_path = output / "reports" / f"{case}.json"
-                    result_path.parent.mkdir(parents=True, exist_ok=True)
-                    result_path.write_text(
-                        json.dumps(comparison, sort_keys=True, separators=(",", ":")) + "\n",
-                        encoding="ascii",
-                    )
-                    results.append({"case": case, **comparison})
-                    if comparison["status"] != "TARGET PASS":
-                        raise RuntimeError(f"correctness mismatch in {case}: {comparison['first_divergence']}")
+                    if args.llama_only:
+                        results.append({
+                            "case": case,
+                            "status": "BRINGUP TRACE CAPTURED",
+                            "cross_runtime_status": "INCOMPLETE",
+                            "trace": str(llama_output),
+                        })
+                    else:
+                        comparison = report(TraceBundle(ds4_output), TraceBundle(llama_output))
+                        result_path = output / "reports" / f"{case}.json"
+                        result_path.parent.mkdir(parents=True, exist_ok=True)
+                        result_path.write_text(
+                            json.dumps(comparison, sort_keys=True, separators=(",", ":")) + "\n",
+                            encoding="ascii",
+                        )
+                        results.append({"case": case, **comparison})
+                        if comparison["status"] != "TARGET PASS":
+                            raise RuntimeError(
+                                f"correctness mismatch in {case}: {comparison['first_divergence']}")
 
         summary = {
-            "status": "TARGET PASS",
+            "status": "BRINGUP TRACE CAPTURED" if args.llama_only else "TARGET PASS",
+            "mode": "llama-only" if args.llama_only else "cross-runtime",
+            "cross_runtime_status": "INCOMPLETE" if args.llama_only else "TARGET PASS",
             "model": str(model),
             "model_sha256": model_sha256,
             "candidate_revision": args.candidate_revision,
