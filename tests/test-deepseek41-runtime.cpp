@@ -2,6 +2,8 @@
 #include "../src/llama-arch.h"
 #include "../tools/deepseek-v41-trace/trace-components.h"
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -17,6 +19,11 @@
 #include <vector>
 
 std::string llama_dsv41_graph_trace_name(const char * trace, uint32_t layer);
+ggml_tensor * llama_dsv41_graph_append_zero_row(ggml_context * ctx, ggml_tensor * tensor);
+ggml_tensor * llama_dsv41_graph_completion_zero(
+        ggml_context * ctx,
+        ggml_tensor * dependency,
+        ggml_type type);
 
 static void check(bool condition, const std::string & message) {
     if (!condition) {
@@ -413,6 +420,46 @@ static void test_graph_construction() {
     const float * ordered = static_cast<const float *>(ordered_probs->data);
     check(ordered[0] < ordered[1] && ordered[1] < ordered[2], "shared-softmax segment order mismatch");
 
+    ggml_tensor * f16_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 32, 1);
+    std::vector<float> cache_values(32, 1.0f);
+    ggml_fp32_to_fp16_row(
+            cache_values.data(),
+            static_cast<ggml_fp16_t *>(f16_cache->data),
+            cache_values.size());
+    ggml_tensor * cache_with_sentinel =
+        llama_dsv41_graph_append_zero_row(ctx, f16_cache);
+    ggml_tensor * sentinel_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    static_cast<int32_t *>(sentinel_ids->data)[0] = 1;
+    static_cast<int32_t *>(sentinel_ids->data)[1] = 0;
+    ggml_tensor * sentinel_rows = ggml_get_rows(ctx, cache_with_sentinel, sentinel_ids);
+    ggml_tensor * completion_zero =
+        llama_dsv41_graph_completion_zero(ctx, sentinel_rows, GGML_TYPE_F16);
+    ggml_cgraph * support_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(support_gf, sentinel_rows);
+    ggml_build_forward_expand(support_gf, completion_zero);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    check(backend != nullptr, "failed to create graph support backend");
+    for (int i = 0; i < ggml_graph_n_nodes(support_gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(support_gf, i);
+        if (node->op == GGML_OP_SCALE) {
+            check(node->src[0]->type == GGML_TYPE_F32,
+                  "DeepSeek V4.1 graph contains a non-F32 SCALE input");
+        }
+        check(ggml_backend_supports_op(backend, node),
+              "CPU backend does not support a DeepSeek V4.1 dependency node");
+    }
+    ggml_backend_free(backend);
+    check(cache_with_sentinel->ne[1] == 2,
+          "compressed cache sentinel row was not allocated");
+    check(ggml_graph_compute_with_ctx(ctx, support_gf, 1) == GGML_STATUS_SUCCESS,
+          "compressed sentinel graph execution failed");
+    for (uint32_t i = 0; i < 32; ++i) {
+        check(ggml_get_f32_1d(sentinel_rows, i) == 0.0f,
+              "compressed sentinel row is not zero");
+        check(ggml_get_f32_1d(sentinel_rows, 32 + i) == 1.0f,
+              "compressed real row changed");
+    }
+
     ggml_tensor * candidate_scores = ggml_new_tensor_2d(
             ctx, GGML_TYPE_F32, 24, 2);
     ggml_tensor * candidate_bias = ggml_new_tensor_2d(
@@ -502,8 +549,24 @@ static void test_graph_construction() {
             selected_order);
     selected_sorted = ggml_cont(
             ctx, ggml_reshape_2d(ctx, selected_sorted, 3, 2));
+    ggml_tensor * routing_probs = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, 6, 2);
+    const float routing_values[] = {
+        10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+        20.0f, 21.0f, 22.0f, 23.0f, 24.0f, 25.0f,
+    };
+    std::memcpy(
+            routing_probs->data, routing_values,
+            sizeof(routing_values));
+    ggml_tensor * selected_weights = ggml_get_rows(
+            ctx,
+            ggml_reshape_3d(ctx, routing_probs, 1, 6, 2),
+            selected_sorted);
+    selected_weights = ggml_cont(
+            ctx, ggml_reshape_2d(ctx, selected_weights, 3, 2));
     ggml_cgraph * selected_gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(selected_gf, selected_sorted);
+    ggml_build_forward_expand(selected_gf, selected_weights);
     check(
             ggml_graph_compute_with_ctx(ctx, selected_gf, 1) ==
                 GGML_STATUS_SUCCESS,
@@ -514,6 +577,14 @@ static void test_graph_construction() {
                 selected_sorted->data, selected_expected,
                 sizeof(selected_expected)) == 0,
             "selected IDs are not accumulated in original ID order");
+    const float selected_weight_expected[] = {
+        11.0f, 13.0f, 15.0f, 20.0f, 22.0f, 24.0f,
+    };
+    check(
+            std::memcmp(
+                selected_weights->data, selected_weight_expected,
+                sizeof(selected_weight_expected)) == 0,
+            "routing weights are not paired with sorted original IDs");
 
     ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 4, 2);
     ggml_tensor * pre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);

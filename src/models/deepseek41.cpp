@@ -19,6 +19,11 @@ static float dsv41_rope_attn_factor(float freq_scale) {
 }
 
 std::string llama_dsv41_graph_trace_name(const char * trace, uint32_t layer);
+ggml_tensor * llama_dsv41_graph_append_zero_row(ggml_context * ctx, ggml_tensor * tensor);
+ggml_tensor * llama_dsv41_graph_completion_zero(
+        ggml_context * ctx,
+        ggml_tensor * dependency,
+        ggml_type type);
 
 std::string llama_dsv41_graph_trace_name(
         const char * trace,
@@ -397,9 +402,16 @@ static ggml_tensor * dsv41_flatten_memory(
 static ggml_tensor * dsv41_append_zero_row(
         ggml_context * ctx,
         ggml_tensor * tensor) {
+    const ggml_type type = tensor->type;
     ggml_tensor * row = ggml_view_2d(
             ctx, tensor, tensor->ne[0], 1, tensor->nb[1], 0);
+    if (row->type != GGML_TYPE_F32) {
+        row = ggml_cast(ctx, row, GGML_TYPE_F32);
+    }
     row = ggml_scale(ctx, row, 0.0f);
+    if (type != GGML_TYPE_F32) {
+        row = ggml_cast(ctx, row, type);
+    }
     return ggml_concat(ctx, tensor, row, 1);
 }
 
@@ -445,7 +457,9 @@ static ggml_tensor * dsv41_sort_row_ids(
             ctx,
             ggml_reshape_3d(ctx, ids, 1, ids->ne[0], ids->ne[1]),
             order);
-    return ggml_reshape_2d(ctx, sorted, ids->ne[0], ids->ne[1]);
+    return ggml_cont(
+            ctx,
+            ggml_reshape_2d(ctx, sorted, ids->ne[0], ids->ne[1]));
 }
 
 }
@@ -807,8 +821,9 @@ static ggml_tensor * dsv41_completion_zero(
         ggml_type type) {
     ggml_tensor * marker = ggml_view_1d(ctx, dependency, 1, 0);
     marker = ggml_argsort_top_k(ctx, marker, 1);
-    marker = ggml_cast(ctx, marker, type);
-    return ggml_scale(ctx, marker, 0.0f);
+    marker = ggml_cast(ctx, marker, GGML_TYPE_F32);
+    marker = ggml_scale(ctx, marker, 0.0f);
+    return type == GGML_TYPE_F32 ? marker : ggml_cast(ctx, marker, type);
 }
 
 static ggml_tensor * dsv41_build_candidate_mask(
@@ -1214,6 +1229,8 @@ static ggml_tensor * dsv41_build_attention(
     if (selected != nullptr) {
         ggml_tensor * comp_store = dsv41_flatten_memory(
                 graph.ctx0, memory->compressed_kv(kv_source));
+        comp_store = dsv41_append_zero_row(
+                graph.ctx0, comp_store);
         ggml_tensor * compressed = ggml_get_rows(
                 graph.ctx0, comp_store, selected);
         compressed = ggml_reshape_4d(
@@ -1328,6 +1345,19 @@ static std::pair<ggml_tensor *, ggml_tensor *> dsv41_build_router(
     return { logits, ids };
 }
 
+}
+
+ggml_tensor * llama_dsv41_graph_append_zero_row(
+        ggml_context * ctx,
+        ggml_tensor * tensor) {
+    return dsv41_append_zero_row(ctx, tensor);
+}
+
+ggml_tensor * llama_dsv41_graph_completion_zero(
+        ggml_context * ctx,
+        ggml_tensor * dependency,
+        ggml_type type) {
+    return dsv41_completion_zero(ctx, dependency, type);
 }
 
 llama_model_deepseek41::graph::graph(
