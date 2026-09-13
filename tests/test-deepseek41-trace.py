@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from argparse import Namespace
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -33,8 +34,6 @@ import verify_ds4_anchors
 
 trace.APPROVED_WATCHDOGS[trace.WATCHDOG_SCRIPT_SHA256] = trace.WATCHDOG_REVISION
 FIXTURE_DS4_EXPORTER_SHA256 = "3" * 64
-trace.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
-run_ds4.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
 TEST_AUTH_ISSUED = int(time.time()) - 60
 TEST_AUTH_EXPIRES = TEST_AUTH_ISSUED + 3600
 TEST_CHALLENGE = "d" * 64
@@ -43,6 +42,7 @@ TEST_RUN_IDS = {
     "ds4": "apple-ds4-test-run",
 }
 TEST_CANDIDATE_EXPORTER_POLICY_ID = "test-candidate-exporter"
+TEST_DS4_EXPORTER_POLICY_ID = "test-ds4-exporter"
 TEST_PROMPT_BUILDER_POLICY_ID = "test-prompt-builder"
 
 WATCHDOG_EVENTS = [
@@ -118,6 +118,128 @@ METAL_ACCELERATOR_ATTESTATION = {
     "source": "metal-device-query",
 }
 
+DS4_RUNTIME_PROFILE = {
+    "name": "sibling-lib",
+    "components": ["ds4-runtime", "metal-backend"],
+    "selected_backend_component": "metal-backend",
+}
+DS4_RUNTIME_RECEIPT = {
+    "format": "dsv41-runtime-receipt",
+    "version": 1,
+    "revision": trace.DS4_REVISION,
+    "profile": "sibling-lib",
+    "components": [
+        {
+            "component": "ds4-runtime",
+            "filename": "libds4-runtime.dylib",
+            "sha256": "a" * 64,
+            "revision": trace.DS4_REVISION,
+        },
+        {
+            "component": "metal-backend",
+            "filename": "libds4-metal.dylib",
+            "sha256": "b" * 64,
+            "revision": None,
+        },
+    ],
+}
+DS4_RUNTIME_LIBRARIES = [
+    {
+        "component": component["component"],
+        "filename": component["filename"],
+        "path": f"/Users/oracle/ds4-install/lib/{component['filename']}",
+        "sha256": component["sha256"],
+        "role": f"runtime:{component['component']}",
+        "revision": component["revision"],
+    }
+    for component in DS4_RUNTIME_RECEIPT["components"]
+]
+DS4_RUNTIME_LIBRARIES.sort(key=lambda item: item["path"])
+DS4_RUNTIME_BUILD = {
+    "revision": trace.DS4_REVISION,
+    "path": "/Users/oracle/ds4-install/bin/ds4-trace",
+    "sha256": FIXTURE_DS4_EXPORTER_SHA256,
+    "runtime_profile": DS4_RUNTIME_PROFILE,
+    "runtime_receipt_sha256": trace.sha256_bytes(
+        trace.canonical_json(DS4_RUNTIME_RECEIPT).encode("ascii")),
+    "runtime_libraries": DS4_RUNTIME_LIBRARIES,
+    "runtime_libraries_post": copy.deepcopy(DS4_RUNTIME_LIBRARIES),
+}
+DS4_INSTALL_TRUST = {
+    "format": "dsv41-install-trust",
+    "version": 1,
+    "install_root": "/Users/oracle/ds4-install",
+    "owner_uid": 0,
+    "execution_uid": 501,
+    "directories": [
+        {
+            "path": path,
+            "device": 1,
+            "inode": index,
+            "owner_uid": 0,
+            "mode": 0o555,
+            "effective_write_access": False,
+            "acl_entries": False,
+        }
+        for index, path in enumerate(
+            (
+                "/",
+                "/Users",
+                "/Users/oracle",
+                "/Users/oracle/ds4-install",
+                "/Users/oracle/ds4-install/bin",
+                "/Users/oracle/ds4-install/lib",
+            ),
+            1,
+        )
+    ],
+    "files": [
+        {
+            "path": path,
+            "device": 1,
+            "inode": index,
+            "owner_uid": 0,
+            "mode": 0o555,
+            "link_count": 1,
+            "byte_count": index,
+            "modified_ns": index,
+            "changed_ns": index,
+            "sha256": digest,
+            "effective_write_access": False,
+            "acl_entries": False,
+        }
+        for index, (path, digest) in enumerate(
+            sorted((
+                ("/Users/oracle/ds4-install/bin/ds4-trace", FIXTURE_DS4_EXPORTER_SHA256),
+                ("/Users/oracle/ds4-install/lib/libds4-runtime.dylib", "a" * 64),
+                ("/Users/oracle/ds4-install/lib/libds4-metal.dylib", "b" * 64),
+            )),
+            100,
+        )
+    ],
+}
+DS4_EXPORTER_POLICY = {
+    "runtime": "ds4",
+    "repository": trace.DS4_REPOSITORY,
+    "revision": trace.DS4_REVISION,
+    "install_root": "/Users/oracle/ds4-install",
+    "install_owner_uid": 0,
+    "executable_path": "/Users/oracle/ds4-install/bin/ds4-trace",
+    "executable_sha256": FIXTURE_DS4_EXPORTER_SHA256,
+    "runtime_profile": DS4_RUNTIME_PROFILE,
+    "runtime_receipt": DS4_RUNTIME_RECEIPT,
+}
+_DS4_POLICY, DS4_EXPORTER_POLICY_SHA256 = trace.ds4_exporter_approval(
+    TEST_DS4_EXPORTER_POLICY_ID,
+    policies={TEST_DS4_EXPORTER_POLICY_ID: DS4_EXPORTER_POLICY},
+)
+DS4_INSTALL_TRUST_SHA256 = trace.install_trust_sha256(DS4_INSTALL_TRUST)
+DS4_RUNTIME_BUILD_SHA256 = trace.runtime_build_evidence_sha256(
+    DS4_RUNTIME_BUILD,
+    DS4_EXPORTER_POLICY,
+    label="ds4 exporter",
+)
+
 
 def storage_record(path: str) -> dict[str, object]:
     model_storage = path.startswith("/mnt/models")
@@ -182,7 +304,7 @@ DS4_STORAGE_ATTESTATION = {
     "temporary_directory": metal_storage_record("/Users/oracle/tmp"),
     "runner_executable": metal_storage_record("/usr/bin/python3", "/"),
     "runner_script": metal_storage_record("/Users/oracle/repo/tools/deepseek-v41-trace/run_ds4.py"),
-    "exporter": metal_storage_record("/Users/oracle/bin/ds4-trace"),
+    "exporter": metal_storage_record("/Users/oracle/ds4-install/bin/ds4-trace"),
 }
 
 DS4_HOST_ATTESTATION = {
@@ -209,8 +331,16 @@ DS4_RUNNER_ATTESTATION = {
     "runner_executable_sha256": "1" * 64,
     "runner_script": "/Users/oracle/repo/tools/deepseek-v41-trace/run_ds4.py",
     "runner_script_sha256": "2" * 64,
-    "exporter_path": "/Users/oracle/bin/ds4-trace",
+    "exporter_path": "/Users/oracle/ds4-install/bin/ds4-trace",
     "exporter_sha256": FIXTURE_DS4_EXPORTER_SHA256,
+    "exporter_approval_id": TEST_DS4_EXPORTER_POLICY_ID,
+    "exporter_approval_sha256": DS4_EXPORTER_POLICY_SHA256,
+    "exporter_install_trust_sha256": DS4_INSTALL_TRUST_SHA256,
+    "exporter_runtime_build_sha256": DS4_RUNTIME_BUILD_SHA256,
+    "exporter_runtime_profile": DS4_RUNTIME_PROFILE,
+    "exporter_runtime_receipt_sha256": DS4_RUNTIME_BUILD["runtime_receipt_sha256"],
+    "producer_revision": trace.DS4_REVISION,
+    "verifier_revision": "a" * 40,
     "checkout_path": "/Users/oracle/ds4",
     "checkout_revision": trace.DS4_REVISION,
     "command_sha256": "4" * 64,
@@ -448,6 +578,21 @@ def materialize_policy_runtime(policy: dict[str, object]) -> None:
     Path(policy["install_root"]).chmod(0o555)
 
 
+def materialize_ds4_exporter_policy(root: Path) -> tuple[dict[str, object], Path]:
+    install = root / "ds4-install"
+    exporter = install / "bin" / "ds4-trace"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("#!/bin/sh\nprintf 'approved\\n'\n", encoding="ascii")
+    exporter.chmod(0o555)
+    policy = copy.deepcopy(DS4_EXPORTER_POLICY)
+    policy["install_root"] = str(install)
+    policy["install_owner_uid"] = os.geteuid() if hasattr(os, "geteuid") else 0
+    policy["executable_path"] = str(exporter)
+    policy["executable_sha256"] = trace.sha256_file(exporter)
+    materialize_policy_runtime(policy)
+    return policy, exporter
+
+
 def fixture_install_trust(policy: dict[str, object]) -> dict[str, object]:
     install_root = Path(policy["install_root"])
     paths = {
@@ -643,8 +788,17 @@ def manifest(
             {
                 "compiler": "clang",
                 "target": "arm64-apple-darwin",
-                "path": "/Users/oracle/bin/ds4-trace",
+                "path": DS4_RUNTIME_BUILD["path"],
                 "sha256": FIXTURE_DS4_EXPORTER_SHA256,
+                "runtime_profile": copy.deepcopy(DS4_RUNTIME_PROFILE),
+                "runtime_receipt_sha256": DS4_RUNTIME_BUILD["runtime_receipt_sha256"],
+                "runtime_libraries": copy.deepcopy(DS4_RUNTIME_LIBRARIES),
+                "runtime_libraries_post": copy.deepcopy(DS4_RUNTIME_LIBRARIES),
+                "runtime_module_monitor": {
+                    "mechanism": "dyld-add-image",
+                    "checked_after_trace": True,
+                    "project_additions": [],
+                },
             }
             if is_ds4
             else {
@@ -793,6 +947,25 @@ def manifest(
         }
     else:
         result["host"] = dict(DS4_HOST_ATTESTATION)
+        result["oracle"] = {
+            "repository": trace.DS4_REPOSITORY,
+            "revision": trace.DS4_REVISION,
+            "verifier_revision": "a" * 40,
+            "executable_path": DS4_RUNTIME_BUILD["path"],
+            "executable_sha256": FIXTURE_DS4_EXPORTER_SHA256,
+            "runtime_profile": copy.deepcopy(DS4_RUNTIME_PROFILE),
+            "runtime_build_sha256": DS4_RUNTIME_BUILD_SHA256,
+            "runtime_libraries_sha256": trace.sha256_bytes(
+                trace.canonical_json({
+                    "pre": DS4_RUNTIME_LIBRARIES,
+                    "post": DS4_RUNTIME_LIBRARIES,
+                }).encode("ascii")),
+            "runtime_receipt_sha256": DS4_RUNTIME_BUILD["runtime_receipt_sha256"],
+            "exporter_approval_id": TEST_DS4_EXPORTER_POLICY_ID,
+            "exporter_approval_sha256": DS4_EXPORTER_POLICY_SHA256,
+            "install_trust": copy.deepcopy(DS4_INSTALL_TRUST),
+            "install_trust_sha256": DS4_INSTALL_TRUST_SHA256,
+        }
         result["config"]["prefill_chunk"] = trace.ADMITTED_UBATCH
         result["config"]["device_backend"] = "Metal"
         result["config"]["device_registry_id"] = METAL_ACCELERATOR_ATTESTATION["metal_registry_id"]
@@ -811,7 +984,14 @@ def manifest(
             trace.install_trust_sha256(prompt_trust),
         ),
     }
-    if not is_ds4:
+    if is_ds4:
+        approvals["ds4_exporter"] = trace.approval_binding(
+            "ds4_exporter",
+            TEST_DS4_EXPORTER_POLICY_ID,
+            DS4_EXPORTER_POLICY_SHA256,
+            DS4_INSTALL_TRUST_SHA256,
+        )
+    else:
         candidate_policy = {
             "runtime": "llama.cpp",
             "repository": trace.REPOSITORY,
@@ -1183,7 +1363,9 @@ class TraceFormatTests(unittest.TestCase):
         })
         prompt_policies = {TEST_PROMPT_BUILDER_POLICY_ID: prompt_policy}
         candidate_policies = {}
+        ds4_policies = {}
         candidate_policy_id = None
+        ds4_policy_id = None
         if runtime == "llama.cpp":
             receipt = {
                 "format": "dsv41-runtime-receipt",
@@ -1218,6 +1400,10 @@ class TraceFormatTests(unittest.TestCase):
             }
             candidate_policies[TEST_CANDIDATE_EXPORTER_POLICY_ID] = candidate_policy
             candidate_policy_id = TEST_CANDIDATE_EXPORTER_POLICY_ID
+        else:
+            ds4_policy = copy.deepcopy(DS4_EXPORTER_POLICY)
+            ds4_policies[TEST_DS4_EXPORTER_POLICY_ID] = ds4_policy
+            ds4_policy_id = TEST_DS4_EXPORTER_POLICY_ID
         return trace.TraceVerifier.for_tests(
             principal,
             policy["public_key"],
@@ -1227,8 +1413,10 @@ class TraceFormatTests(unittest.TestCase):
             expected_challenge=expected_challenge,
             expected_run_id=expected_run_id or TEST_RUN_IDS[runtime],
             candidate_exporter_policies=candidate_policies,
+            ds4_exporter_policies=ds4_policies,
             prompt_builder_policies=prompt_policies,
             expected_candidate_exporter_policy_id=candidate_policy_id,
+            expected_ds4_exporter_policy_id=ds4_policy_id,
             expected_prompt_builder_policy_id=TEST_PROMPT_BUILDER_POLICY_ID,
             verification_unix=verification_unix or int(time.time()),
             ssh_keygen=cls.ssh_keygen,
@@ -1268,8 +1456,10 @@ class TraceFormatTests(unittest.TestCase):
                 expected_challenge=authorization["challenge"],
                 expected_run_id=authorization["run_id"],
                 candidate_exporter_policies=verifier.candidate_exporter_policies,
+                ds4_exporter_policies=verifier.ds4_exporter_policies,
                 prompt_builder_policies=verifier.prompt_builder_policies,
                 expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=verifier.expected_ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
                 expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
                 expected_verifier_revision=verifier.expected_verifier_revision,
@@ -1311,8 +1501,10 @@ class TraceFormatTests(unittest.TestCase):
             expected_challenge=authorization["challenge"],
             expected_run_id=authorization["run_id"],
             candidate_exporter_policies=verifier.candidate_exporter_policies,
+            ds4_exporter_policies=verifier.ds4_exporter_policies,
             prompt_builder_policies=verifier.prompt_builder_policies,
             expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+            expected_ds4_exporter_policy_id=verifier.expected_ds4_exporter_policy_id,
             expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
             expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
             expected_verifier_revision=verifier.expected_verifier_revision,
@@ -1461,10 +1653,13 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_production_executable_approval_maps_fail_closed(self) -> None:
         self.assertEqual(trace.APPROVED_CANDIDATE_EXPORTERS, {})
+        self.assertEqual(trace.APPROVED_DS4_EXPORTERS, {})
         self.assertEqual(trace.APPROVED_PROMPT_BUILDERS, {})
         self.assertEqual(trace.APPROVED_EXECUTABLE_APPROVERS, {})
         with self.assertRaisesRegex(trace.TraceError, "candidate exporter approval is not trusted"):
             trace.candidate_exporter_approval(TEST_CANDIDATE_EXPORTER_POLICY_ID)
+        with self.assertRaisesRegex(trace.TraceError, "ds4 exporter approval is not trusted"):
+            trace.ds4_exporter_approval(TEST_DS4_EXPORTER_POLICY_ID)
         with self.assertRaisesRegex(trace.TraceError, "prompt builder approval is not trusted"):
             trace.prompt_builder_approval(TEST_PROMPT_BUILDER_POLICY_ID)
 
@@ -1479,6 +1674,7 @@ class TraceFormatTests(unittest.TestCase):
             "verifier_repository": trace.REPOSITORY,
             "verifier_revision": "a" * 40,
             "candidate_exporters": verifier.candidate_exporter_policies,
+            "ds4_exporters": verifier.ds4_exporter_policies,
             "prompt_builders": verifier.prompt_builder_policies,
         }
         with tempfile.TemporaryDirectory() as temp:
@@ -1519,6 +1715,7 @@ class TraceFormatTests(unittest.TestCase):
                 loaded.candidate_exporters,
                 verifier.candidate_exporter_policies,
             )
+            self.assertEqual(loaded.ds4_exporters, verifier.ds4_exporter_policies)
             with self.assertRaisesRegex(trace.TraceError, "outside protected output roots"):
                 trace.load_executable_approval_policy(
                     policy_path,
@@ -1561,6 +1758,7 @@ class TraceFormatTests(unittest.TestCase):
             "verifier_repository": trace.REPOSITORY,
             "verifier_revision": "a" * 40,
             "candidate_exporters": verifier.candidate_exporter_policies,
+            "ds4_exporters": verifier.ds4_exporter_policies,
             "prompt_builders": verifier.prompt_builder_policies,
         }
         for mutation, message in (
@@ -1614,6 +1812,90 @@ class TraceFormatTests(unittest.TestCase):
                     root.chmod(0o755)
                     for alias in Path(temp).parent.glob(f"{root.name}-*-alias"):
                         alias.unlink()
+
+    def test_external_ds4_approval_requires_distinct_producer_and_verifier(self) -> None:
+        principal = "dsv41-test-executable-approver"
+        policy = {
+            "format": trace.EXECUTABLE_APPROVAL_FORMAT,
+            "version": trace.EXECUTABLE_APPROVAL_VERSION,
+            "principal": principal,
+            "verifier_repository": trace.REPOSITORY,
+            "verifier_revision": trace.DS4_REVISION,
+            "candidate_exporters": {},
+            "ds4_exporters": {
+                TEST_DS4_EXPORTER_POLICY_ID: copy.deepcopy(DS4_EXPORTER_POLICY),
+            },
+            "prompt_builders": {},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy_path = root / "approval.json"
+            policy_path.write_text(trace.canonical_json(policy) + "\n", encoding="ascii")
+            subprocess.run(
+                [
+                    str(self.ssh_keygen),
+                    "-Y", "sign",
+                    "-f", str(self.signing_key),
+                    "-n", trace.EXECUTABLE_APPROVAL_NAMESPACE,
+                    str(policy_path),
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+            )
+            with self.assertRaisesRegex(trace.TraceError, "producer revision must differ"):
+                trace.load_executable_approval_policy(
+                    policy_path,
+                    policy_path.with_suffix(".json.sig"),
+                    expected_principal=principal,
+                    trusted_approvers={
+                        principal: {
+                            "public_key": self.test_signers[self.signer_principal]["public_key"],
+                            "policy_root": str(root),
+                            "owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                        },
+                    },
+                    ssh_keygen=self.ssh_keygen,
+                    test_only_trust=True,
+                )
+
+    def test_ds4_approval_rejects_runtime_identity_mismatches(self) -> None:
+        for mutation, message in (
+                (lambda value: value.update({"runtime": "llama.cpp"}), "runtime identity"),
+                (lambda value: value.update({"repository": trace.REPOSITORY}), "runtime identity"),
+                (lambda value: value.update({"revision": "a" * 40}), "runtime identity"),
+                (
+                    lambda value: value.update({
+                        "executable_path": "/Users/oracle/other/bin/ds4-trace",
+                    }),
+                    "outside its install policy",
+                ),
+                (
+                    lambda value: value["runtime_profile"].update({
+                        "selected_backend_component": "missing",
+                    }),
+                    "runtime profile",
+                ),
+                (
+                    lambda value: value["runtime_receipt"].update({"profile": "co-located"}),
+                    "runtime receipt identity",
+                ),
+                (
+                    lambda value: [
+                        component.update({"revision": None})
+                        for component in value["runtime_receipt"]["components"]
+                    ],
+                    "receipt differs|pinned ds4 revision",
+                ),
+        ):
+            with self.subTest(message=message):
+                policy = copy.deepcopy(DS4_EXPORTER_POLICY)
+                mutation(policy)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.ds4_exporter_approval(
+                        TEST_DS4_EXPORTER_POLICY_ID,
+                        policies={TEST_DS4_EXPORTER_POLICY_ID: policy},
+                    )
 
     def test_candidate_runner_rejects_unapproved_exporter_before_execution(self) -> None:
         argv = [
@@ -1817,6 +2099,252 @@ class TraceFormatTests(unittest.TestCase):
                     label="approved executable",
                 )
             execute.assert_not_called()
+
+    def test_ds4_exporter_revalidates_each_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                first = run_ds4.run_exporter_command(
+                    [str(exporter)],
+                    exporter=exporter,
+                    exporter_identity=identity,
+                    exporter_policy=policy,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(first.stdout, "approved\n")
+                exporter.parent.chmod(0o755)
+                exporter.chmod(0o755)
+                exporter.write_text("#!/bin/sh\nprintf 'replacement\\n'\n", encoding="ascii")
+                exporter.chmod(0o555)
+                exporter.parent.chmod(0o555)
+                with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                        run_ds4.TraceError, "SHA-256 differs|identity changed"):
+                    run_ds4.run_exporter_command(
+                        [str(exporter)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                execute.assert_not_called()
+
+    def test_ds4_exporter_detects_swap_after_precheck(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            backup = root / "approved-backup"
+            replacement = root / "replacement"
+            replacement.write_text("#!/bin/sh\nprintf 'replacement\\n'\n", encoding="ascii")
+            replacement.chmod(0o555)
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+
+                def swap_after_precheck(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                    exporter.parent.chmod(0o755)
+                    exporter.rename(backup)
+                    replacement.rename(exporter)
+                    exporter.parent.chmod(0o555)
+                    return subprocess.CompletedProcess([str(exporter)], 0, "replacement\n", "")
+
+                with mock.patch.object(
+                        trace.subprocess, "run", side_effect=swap_after_precheck), self.assertRaisesRegex(
+                        run_ds4.TraceError, "descriptor identity changed|SHA-256 differs|identity changed"):
+                    run_ds4.run_exporter_command(
+                        [str(exporter)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+
+    def test_ds4_exporter_postchecks_failed_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            backup = root / "approved-backup"
+            replacement = root / "replacement"
+            replacement.write_text("#!/bin/sh\nexit 7\n", encoding="ascii")
+            replacement.chmod(0o555)
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+
+                def fail_after_swap(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                    exporter.parent.chmod(0o755)
+                    exporter.rename(backup)
+                    replacement.rename(exporter)
+                    exporter.parent.chmod(0o555)
+                    raise subprocess.CalledProcessError(7, [str(exporter)])
+
+                with mock.patch.object(
+                        trace.subprocess, "run", side_effect=fail_after_swap), self.assertRaisesRegex(
+                        run_ds4.TraceError, "descriptor identity changed|SHA-256 differs|identity changed"):
+                    run_ds4.run_exporter_command(
+                        [str(exporter)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+
+    def test_ds4_writable_root_blocks_restore_before_postcheck(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+            Path(policy["install_root"]).chmod(0o777)
+            try:
+                with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                        run_ds4.TraceError, "path is mutable|distinct"):
+                    run_ds4.run_exporter_command(
+                        [str(exporter)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                    )
+                execute.assert_not_called()
+            finally:
+                Path(policy["install_root"]).chmod(0o755)
+
+    def test_ds4_exporter_rejects_hardlinks_and_dependency_substitution(self) -> None:
+        for mutation, message in (
+                ("hard-linked-exporter", "one-link"),
+                ("hard-linked-dependency", "one-link"),
+                ("dependency-substitution", "SHA-256 differs"),
+                ("symlinked-exporter", "differs|canonical|aliases"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                policy, exporter = materialize_ds4_exporter_policy(root)
+                library = Path(policy["install_root"]) / "lib" / policy["runtime_receipt"]["components"][0]["filename"]
+                if mutation == "hard-linked-exporter":
+                    os.link(exporter, root / "exporter-alias")
+                elif mutation == "hard-linked-dependency":
+                    os.link(library, root / "library-alias")
+                elif mutation == "dependency-substitution":
+                    library.chmod(0o755)
+                    library.write_bytes(b"substituted")
+                    library.chmod(0o555)
+                else:
+                    alias = root / "exporter-alias"
+                    alias.symlink_to(exporter)
+                    exporter = alias
+                with isolated_test_install_trust(), mock.patch.object(
+                        trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                        trace.TraceError, message):
+                    trace.run_approved_executable(
+                        [str(exporter)],
+                        path=exporter,
+                        runtime_policy=policy,
+                        expected_path=policy["executable_path"],
+                        expected_sha256=policy["executable_sha256"],
+                        label="ds4 exporter",
+                    )
+                execute.assert_not_called()
+
+    def test_ds4_exporter_rejects_command_path_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            replacement = Path(temp) / "replacement"
+            replacement.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            replacement.chmod(0o555)
+            with isolated_test_install_trust(), mock.patch.object(
+                    trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                    trace.TraceError, "command path differs"):
+                trace.run_approved_executable(
+                    [str(replacement)],
+                    path=exporter,
+                    runtime_policy=policy,
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+            execute.assert_not_called()
+
+    def test_ds4_exporter_rejects_execution_owned_install(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                    trace.TraceError, "owner must be distinct"):
+                trace.run_approved_executable(
+                    [str(exporter)],
+                    path=exporter,
+                    runtime_policy=policy,
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+            execute.assert_not_called()
+
+    def test_ds4_policy_and_receipt_mutation_change_approval_identity(self) -> None:
+        policy = copy.deepcopy(DS4_EXPORTER_POLICY)
+        _approved, original_sha256 = trace.ds4_exporter_approval(
+            TEST_DS4_EXPORTER_POLICY_ID,
+            policies={TEST_DS4_EXPORTER_POLICY_ID: policy},
+        )
+        policy["runtime_receipt"]["components"][0]["sha256"] = "c" * 64
+        _mutated, mutated_sha256 = trace.ds4_exporter_approval(
+            TEST_DS4_EXPORTER_POLICY_ID,
+            policies={TEST_DS4_EXPORTER_POLICY_ID: policy},
+        )
+        self.assertNotEqual(original_sha256, mutated_sha256)
+        record = manifest("ds4")
+        with self.assertRaisesRegex(trace.TraceError, "ds4 exporter approval"):
+            trace.validate_execution_authorization(
+                record,
+                policy=self.test_signers[self.signer_principals["ds4"]],
+                expected_lane=trace.ORACLE_LANE,
+                expected_challenge=TEST_CHALLENGE,
+                expected_run_id=TEST_RUN_IDS["ds4"],
+                candidate_exporter_policies={},
+                ds4_exporter_policies={TEST_DS4_EXPORTER_POLICY_ID: policy},
+                prompt_builder_policies={
+                    TEST_PROMPT_BUILDER_POLICY_ID: fixture_prompt_builder_policy(b"abc"),
+                },
+                expected_candidate_exporter_policy_id=None,
+                expected_ds4_exporter_policy_id=TEST_DS4_EXPORTER_POLICY_ID,
+                expected_prompt_builder_policy_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                expected_approval_policy_sha256="e" * 64,
+                expected_verifier_revision="a" * 40,
+                verification_unix=TEST_AUTH_ISSUED,
+                seen_run_ids=None,
+            )
 
     def test_install_trust_evidence_rejects_mutability_claims(self) -> None:
         policy = fixture_prompt_builder_policy(b"prompt")
@@ -2584,10 +3112,21 @@ class TraceFormatTests(unittest.TestCase):
             '"backend": "Metal"',
             '"backend": "Metal", "backend": "Metal"',
         )
-        result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, duplicate, "")
-        with mock.patch.object(run_ds4.subprocess, "run", return_value=result):
+        device_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, duplicate, "")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+        with mock.patch.object(
+                run_ds4, "run_exporter_command",
+                side_effect=[device_result, build_result]) as execute:
             with self.assertRaisesRegex(preflight.PreflightError, "duplicate JSON key"):
-                run_ds4.query_accelerator_attestation(Path("/exporter"), "Metal0")
+                run_ds4.query_accelerator_attestation(
+                    Path("/exporter"),
+                    "Metal0",
+                    exporter_identity=object(),
+                    exporter_policy=DS4_EXPORTER_POLICY,
+                    expected_runtime_build=DS4_RUNTIME_BUILD,
+                )
+        self.assertEqual(execute.call_count, 2)
 
     def test_nvme_attestation_uses_mount_and_block_ancestry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3561,7 +4100,7 @@ class TraceFormatTests(unittest.TestCase):
 
         ds4_manifest = manifest("ds4")
         ds4_manifest["build"]["path"] = "/Users/attacker/unrelated-exporter"
-        cases.append((ds4_manifest, "ds4 build path"))
+        cases.append((ds4_manifest, "ds4 exporter runtime build path"))
 
         short_revision_manifest = manifest()
         short_revision_manifest["revision"] = "a" * 9
@@ -4637,6 +5176,7 @@ class TraceFormatTests(unittest.TestCase):
                 "--corpus-name", "correctness-prose.txt",
                 "--corpus-sha256", trace.CORPUS_SHA256["correctness-prose.txt"],
                 "--prompt-provenance", str(root / "prompt.json"),
+                "--ds4-exporter-policy-id", TEST_DS4_EXPORTER_POLICY_ID,
                 "--prompt-builder-policy-id", TEST_PROMPT_BUILDER_POLICY_ID,
                 "--approval-policy", str(root / "approval.json"),
                 "--approval-signature", str(root / "approval.sig"),
@@ -4872,30 +5412,74 @@ class TraceFormatTests(unittest.TestCase):
             )
 
     def test_rejects_unapproved_ds4_exporter(self) -> None:
-        with self.assertRaisesRegex(preflight.PreflightError, "not approved"):
-            run_ds4.verify_exporter_approval("a" * 64)
+        with self.assertRaisesRegex(trace.TraceError, "not trusted"):
+            trace.ds4_exporter_approval("missing", policies={})
 
     def test_bundle_validation_and_comparison_reject_unapproved_ds4_exporter(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             ds4_root = root / "ds4"
-            llama_root = root / "llama"
             with trace.TraceBundleWriter(ds4_root, manifest("ds4")) as writer:
                 add_required_events(writer)
-            with trace.TraceBundleWriter(llama_root, manifest("llama.cpp")) as writer:
+            self._seal_test_bundle(ds4_root)
+            verifier = self._verifier_for_runtime("ds4")
+            verifier = replace(verifier, ds4_exporter_policies={})
+            with self.assertRaisesRegex(trace.TraceError, "not trusted"):
+                self._trace_bundle_class(ds4_root, verifier=verifier)
+
+    def test_ds4_oracle_trust_bindings_reject_mutation_before_signing(self) -> None:
+        mutations = (
+            (
+                lambda value: value["oracle"].update({"exporter_approval_id": "other"}),
+                "approval differs",
+            ),
+            (
+                lambda value: value["oracle"].update({"exporter_approval_sha256": "f" * 64}),
+                "approval differs",
+            ),
+            (
+                lambda value: value["oracle"].update({"install_trust_sha256": "f" * 64}),
+                "install trust",
+            ),
+            (
+                lambda value: value["oracle"].update({"runtime_build_sha256": "f" * 64}),
+                "runtime build",
+            ),
+            (
+                lambda value: value["oracle"].update({"runtime_receipt_sha256": "f" * 64}),
+                "runtime evidence",
+            ),
+            (
+                lambda value: value["authorization"]["approvals"]["ds4_exporter"].update({
+                    "install_trust_sha256": "f" * 64,
+                }),
+                "install trust",
+            ),
+        )
+        for mutate, message in mutations:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temp:
+                record = manifest("ds4")
+                mutate(record)
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, record) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    self._seal_test_bundle(root)
+
+    def test_ds4_runner_trust_binding_rejects_mutation_before_signing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
                 add_required_events(writer)
-            approved = dict(trace.APPROVED_EXPORTERS)
-            try:
-                trace.APPROVED_EXPORTERS.clear()
-                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
-                    trace.TraceBundle(ds4_root)
-                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
-                    trace.command_validate(Namespace(bundle=ds4_root))
-                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
-                    trace.command_compare(Namespace(left=ds4_root, right=llama_root, report=None))
-            finally:
-                trace.APPROVED_EXPORTERS.clear()
-                trace.APPROVED_EXPORTERS.update(approved)
+            manifest_record = trace.strict_json_loads(
+                (root / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+            original_path = root / manifest_record["audits"]["pre"]["runner"]["path"]
+            runner = json.loads(json.dumps(DS4_AUDIT_RECORDS["runner"]))
+            runner["data"]["exporter_install_trust_sha256"] = "f" * 64
+            replace_audit_record(root, "pre", "runner", runner)
+            original_path.unlink()
+            with self.assertRaisesRegex(trace.TraceError, "install.trust"):
+                self._seal_test_bundle(root)
 
     def test_rejects_preflight_audit_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

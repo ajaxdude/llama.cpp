@@ -170,11 +170,13 @@ Production installs no manifest-writing or runtime-path probe option. With `LLAM
 
 ## Apple Metal oracle execution gate
 
-The external ds4 exporter is not present in the pinned canonical checkout. It remains blocked until a separately built executable is reviewed and its exact SHA-256 is added to the otherwise empty `APPROVED_EXPORTERS` map. Approval is checked before the exporter can run, including device-only preflight, and is checked again whenever a ds4 bundle is validated or compared. `run_ds4.py` requires macOS arm64, at least 128 GiB of measured host memory, zero swap, no unrelated matching workload, an exact selected Metal device query, and an existing writable non-symlink `TMPDIR`. The model, prompt, output, harness repository, ds4 checkout, temporary directory, Python executable, runner script, and exporter must resolve through `df -P` to a volume that `diskutil info -plist` proves is internal solid-state storage backed by NVMe or Apple Fabric. SATA, network, virtual, disk-image, external/non-internal, non-solid-state, and incomplete device identities fail closed, as do lexical or resolved forbidden paths.
+The external ds4 exporter is not present in the pinned canonical checkout. Production remains blocked because the source-controlled `APPROVED_DS4_EXPORTERS` map is empty. A run requires a detached, externally signed executable-approval v2 policy with a selected `ds4_exporters` record. The record binds the `ds4` runtime role, `antirez/ds4` repository, pinned producer revision, distinct verifier revision, canonical install root and executable path, trusted owner, exact executable SHA-256, runtime profile, and exact dependency receipt. `run_ds4.py` verifies that policy before any exporter execution, requires a canonical non-symlink install hierarchy that is trusted-owned and not writable by the execution identity or an untrusted group, and requires the exporter and every dependency to be regular non-writable one-link trusted-owned files. Linux launches the retained exporter descriptor through `/proc/self/fd`. macOS launches the canonical path only after proving the immutable root and retains all measured descriptors through the launch; it does not claim descriptor-selected dyld loading. Test policies are explicit and cannot satisfy production defaults.
 
-The ds4 memory audit binds the exact Metal accelerator, host model/OS/memory identity, and every storage record. The runner audit binds the Python runner process, UID, executable/script paths and hashes, exporter path/hash, pinned checkout path/revision, and exact command hash. The runner script must be inside the attested harness repository. The preflight and postflight accelerator and host identities must remain unchanged. These Apple audits replace Linux KFD, `/proc`, HIP, and Strix watchdog claims; the oracle must never fabricate those fields.
+Every exporter invocation repeats the install-root, executable, and dependency identity checks immediately before and after execution. The exporter must answer `--dsv41-attest-build` without loading the model and report its exact path, SHA-256, runtime profile, dependency receipt digest, and pre/post loaded-library closure. The launcher measures that evidence before and after device attestation, trace generation, and postflight device attestation. The signed authorization, oracle evidence, runner audits, and Seal v1 manifest bind the DS4 approval ID and hash, install-trust hash, canonical executable identity, runtime profile and receipt, loaded-library closure, and producer/verifier revisions. Missing or mismatched policy, mutable or aliased paths, hard links, component substitution, and changed build evidence fail closed. `run_ds4.py` also requires macOS arm64, at least 128 GiB of measured host memory, zero swap, no unrelated matching workload, an exact selected Metal device query, and an existing writable non-symlink `TMPDIR`. The model, prompt, output, harness repository, ds4 checkout, temporary directory, Python executable, runner script, and exporter must resolve through `df -P` to a volume that `diskutil info -plist` proves is internal solid-state storage backed by NVMe or Apple Fabric. SATA, network, virtual, disk-image, external/non-internal, non-solid-state, and incomplete device identities fail closed, as do lexical or resolved forbidden paths.
 
-After the exporter is independently reviewed on an authorized 128 GiB or larger Apple oracle host, add its exact executable SHA-256 and pinned ds4 revision to the shared `APPROVED_EXPORTERS` map in `trace_format.py`; a caller-provided digest alone is not sufficient oracle provenance. The exporter must answer `--dsv41-attest-device Metal0` without loading the model and emit the strict `apple-metal` attestation. Its trace command interface is:
+The ds4 memory audit binds the exact Metal accelerator, host model/OS/memory identity, and every storage record. The runner audit binds the Python runner process, UID, executable/script paths and hashes, exporter path/hash, external approval and install-trust hashes, runtime build/profile/receipt identity, producer and verifier revisions, pinned checkout path/revision, and exact command hash. The runner script must be inside the attested harness repository. The preflight and postflight accelerator and host identities must remain unchanged. These Apple audits replace Linux KFD, `/proc`, HIP, and Strix watchdog claims; the oracle must never fabricate those fields.
+
+After the exporter and its complete runtime receipt are independently reviewed on an authorized 128 GiB or larger Apple oracle host, add the externally reviewed record to a signed executable-approval v2 policy and select it with `--ds4-exporter-policy-id`. Do not add test policy material to the production maps. A caller-provided digest or self-reported build record alone is not sufficient oracle provenance. The exporter must answer `--dsv41-attest-build` and `--dsv41-attest-device Metal0` without loading the model. The device query emits the strict `apple-metal` attestation. Its trace command interface is:
 
 The unpublished `ds4gguf` documentation revision `e13893ffcb33e90c8852929303e188102df7a8f5` is provenance only. It is not an executable dependency, exporter approval, or fixture source. Executable tests and fixtures stay in this `strix-llama.cpp` stack.
 
@@ -261,16 +263,17 @@ export TMPDIR=/Users/oracle/dsv41/tmp
 python3 tools/deepseek-v41-trace/run_ds4.py \
   --repo /Users/oracle/src/strix-llama.cpp \
   --checkout /Users/oracle/src/ds4-v41 \
-  --exporter /Users/oracle/bin/dsv41-trace-exporter \
+  --exporter /opt/dsv41/ds4/bin/dsv41-trace-exporter \
   --exporter-sha256 <approved-exact-sha256> \
   --model /Users/oracle/models/DeepSeek-V4.1-Flash-Q2.gguf \
   --prompt /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt \
   --prompt-provenance /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt.provenance.json \
   --output /Users/oracle/dsv41/traces/correctness-prose-c32768-ub32 \
   --approval-policy "$APPROVAL_POLICY" \
-  --approval-policy-signature "$APPROVAL_POLICY_SIGNATURE" \
-  --approval-approver-principal "$APPROVAL_APPROVER_PRINCIPAL" \
-  --prompt-builder-approval-id "$PROMPT_BUILDER_APPROVAL_ID" \
+  --approval-signature "$APPROVAL_POLICY_SIGNATURE" \
+  --approval-principal "$APPROVAL_APPROVER_PRINCIPAL" \
+  --ds4-exporter-policy-id "$DS4_EXPORTER_POLICY_ID" \
+  --prompt-builder-policy-id "$PROMPT_BUILDER_POLICY_ID" \
   --corpus-name correctness-prose.txt \
   --corpus-sha256 2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2 \
   --context 32768 \

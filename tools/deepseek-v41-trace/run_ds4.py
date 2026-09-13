@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from preflight import (
     PreflightError,
@@ -22,11 +23,12 @@ from preflight import (
 )
 from trace_format import (
     ADMITTED_UBATCH,
-    APPROVED_EXPORTERS,
     APPROVED_PROMPT_BUILDERS,
     APPROVED_TRACE_SIGNERS,
     CORPUS_SHA256,
+    DS4_REPOSITORY,
     DS4_REVISION,
+    ExecutableFileReceipt,
     MODEL_SHA256,
     NO_EXTERNAL_STATE_STORAGE,
     ORACLE_LANE,
@@ -34,18 +36,28 @@ from trace_format import (
     TraceError,
     TraceVerifier,
     approval_binding,
+    approved_executable_identity,
+    approved_runtime_file_identities,
     bind_execution_authorization,
     canonical_json,
+    ds4_exporter_approval,
     execution_authorization,
+    install_trust_evidence,
+    install_trust_sha256,
     load_executable_approval_policy,
     prompt_builder_approval,
     reject_loader_overrides,
+    run_approved_executable,
+    runtime_build_evidence_sha256,
     seal_bundle,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
     tokenizer_policy_sha256,
+    validate_runtime_build_evidence,
     validate_signing_identity,
+    verify_approved_executable_identity,
+    verify_approved_runtime_file_identities,
 )
 
 def git_output(checkout: Path, *args: str) -> str:
@@ -65,13 +77,6 @@ def verify_checkout(checkout: Path) -> str:
     if status:
         raise PreflightError("ds4 checkout has tracked or untracked changes")
     return revision
-
-
-def verify_exporter_approval(exporter_sha256: str) -> None:
-    if APPROVED_EXPORTERS.get(exporter_sha256) != DS4_REVISION:
-        raise PreflightError(
-            "ds4 trace exporter is not approved for the pinned ds4 revision; "
-            "publish and review the exporter before cross-runtime execution")
 
 
 def validate_accelerator_attestation(
@@ -122,30 +127,103 @@ def validate_accelerator_attestation(
     return dict(record)
 
 
-def query_accelerator_attestation(exporter: Path, device: str) -> dict[str, object]:
-    try:
-        result = subprocess.run(
-            [str(exporter), "--dsv41-attest-device", device],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError as error:
-        raise PreflightError(f"cannot query selected accelerator: {error}") from error
+def run_exporter_command(
+        command: list[str],
+        *,
+        exporter: Path,
+        exporter_identity: ExecutableFileReceipt,
+        exporter_policy: dict[str, Any],
+        **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    result, executed_identity = run_approved_executable(
+        command,
+        path=exporter,
+        runtime_policy=exporter_policy,
+        expected_path=exporter_policy["executable_path"],
+        expected_sha256=exporter_policy["executable_sha256"],
+        label="ds4 exporter",
+        **kwargs,
+    )
+    if executed_identity != exporter_identity:
+        raise PreflightError("ds4 exporter execution identity differs from external approval")
+    return result
+
+
+def query_runtime_build_attestation(
+        exporter: Path,
+        *,
+        exporter_identity: ExecutableFileReceipt,
+        exporter_policy: dict[str, Any]) -> dict[str, Any]:
+    result = run_exporter_command(
+        [str(exporter), "--dsv41-attest-build"],
+        exporter=exporter,
+        exporter_identity=exporter_identity,
+        exporter_policy=exporter_policy,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
-        detail = result.stderr.strip() or f"exit {result.returncode}"
-        raise PreflightError(f"selected accelerator query failed: {detail}")
+        raise PreflightError(f"ds4 exporter build attestation failed: {result.stderr.strip()}")
     try:
         record = strict_json_loads(result.stdout)
+        return validate_runtime_build_evidence(record, exporter_policy, label="ds4 exporter")
     except TraceError as error:
-        raise PreflightError(f"selected accelerator query returned invalid JSON: {error}") from error
-    return validate_accelerator_attestation(record, expected_device=device)
+        raise PreflightError(f"ds4 exporter build attestation is invalid: {error}") from error
+
+
+def query_accelerator_attestation(
+        exporter: Path,
+        device: str,
+        *,
+        exporter_identity: ExecutableFileReceipt,
+        exporter_policy: dict[str, Any],
+        expected_runtime_build: dict[str, Any]) -> dict[str, object]:
+    result = run_exporter_command(
+        [str(exporter), "--dsv41-attest-device", device],
+        exporter=exporter,
+        exporter_identity=exporter_identity,
+        exporter_policy=exporter_policy,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    validation_error = None
+    attestation = None
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        validation_error = PreflightError(f"selected accelerator query failed: {detail}")
+    else:
+        try:
+            record = strict_json_loads(result.stdout)
+            attestation = validate_accelerator_attestation(record, expected_device=device)
+        except (TraceError, PreflightError) as error:
+            validation_error = PreflightError(
+                f"selected accelerator query returned invalid attestation: {error}")
+    post_runtime_build = query_runtime_build_attestation(
+        exporter,
+        exporter_identity=exporter_identity,
+        exporter_policy=exporter_policy,
+    )
+    if post_runtime_build != expected_runtime_build:
+        raise PreflightError("ds4 exporter build identity changed during accelerator query")
+    if validation_error is not None:
+        raise validation_error
+    if attestation is None:
+        raise PreflightError("selected accelerator attestation is missing")
+    return attestation
 
 
 def runner_attestation(
         *,
         exporter: Path,
         exporter_sha256: str,
+        exporter_approval_id: str,
+        exporter_approval_sha256: str,
+        exporter_install_trust_sha256: str,
+        exporter_runtime_build_sha256: str,
+        exporter_runtime_profile: dict[str, object],
+        exporter_runtime_receipt_sha256: str,
+        verifier_revision: str,
         checkout: Path,
         command: list[str]) -> dict[str, object]:
     runner_executable = resolved(Path(sys.executable))
@@ -164,6 +242,14 @@ def runner_attestation(
         "runner_script_sha256": sha256_file(runner_script),
         "exporter_path": str(exporter),
         "exporter_sha256": exporter_sha256,
+        "exporter_approval_id": exporter_approval_id,
+        "exporter_approval_sha256": exporter_approval_sha256,
+        "exporter_install_trust_sha256": exporter_install_trust_sha256,
+        "exporter_runtime_build_sha256": exporter_runtime_build_sha256,
+        "exporter_runtime_profile": exporter_runtime_profile,
+        "exporter_runtime_receipt_sha256": exporter_runtime_receipt_sha256,
+        "producer_revision": DS4_REVISION,
+        "verifier_revision": verifier_revision,
         "checkout_path": str(checkout),
         "checkout_revision": DS4_REVISION,
         "command_sha256": sha256_bytes(canonical_json(command).encode("ascii")),
@@ -174,7 +260,14 @@ def bind_oracle_attestation(
         output: Path,
         audit: dict[str, object],
         accelerator: dict[str, object],
-        command: list[str]) -> None:
+        command: list[str],
+        *,
+        exporter_policy: dict[str, object],
+        exporter_approval_id: str,
+        exporter_approval_sha256: str,
+        exporter_install_trust: dict[str, object],
+        runtime_build: dict[str, object],
+        verifier_revision: str) -> None:
     manifest_path = output / "manifest.json"
     try:
         manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
@@ -203,6 +296,46 @@ def bind_oracle_attestation(
     runner = audit.get("runner")
     if not isinstance(runner, dict) or build.get("sha256") != runner.get("exporter_sha256"):
         raise PreflightError("ds4 trace build SHA-256 differs from the executed exporter")
+    build_evidence = {
+        "revision": manifest.get("revision"),
+        "path": build.get("path"),
+        "sha256": build.get("sha256"),
+        "runtime_profile": build.get("runtime_profile"),
+        "runtime_receipt_sha256": build.get("runtime_receipt_sha256"),
+        "runtime_libraries": build.get("runtime_libraries"),
+        "runtime_libraries_post": build.get("runtime_libraries_post"),
+    }
+    try:
+        validated_build = validate_runtime_build_evidence(
+            build_evidence, exporter_policy, label="ds4 exporter")
+    except TraceError as error:
+        raise PreflightError(f"ds4 trace runtime build differs from external approval: {error}") from error
+    if validated_build != runtime_build:
+        raise PreflightError("ds4 trace runtime build differs from measured exporter attestation")
+    runtime_build_sha256 = runtime_build_evidence_sha256(
+        validated_build, exporter_policy, label="ds4 exporter")
+    runtime_libraries_sha256 = sha256_bytes(canonical_json({
+        "pre": validated_build["runtime_libraries"],
+        "post": validated_build["runtime_libraries_post"],
+    }).encode("ascii"))
+    runtime_receipt_sha256 = sha256_bytes(
+        canonical_json(exporter_policy["runtime_receipt"]).encode("ascii"))
+    trust_sha256 = install_trust_sha256(exporter_install_trust)
+    manifest["oracle"] = {
+        "repository": DS4_REPOSITORY,
+        "revision": DS4_REVISION,
+        "verifier_revision": verifier_revision,
+        "executable_path": exporter_policy["executable_path"],
+        "executable_sha256": exporter_policy["executable_sha256"],
+        "runtime_profile": exporter_policy["runtime_profile"],
+        "runtime_build_sha256": runtime_build_sha256,
+        "runtime_libraries_sha256": runtime_libraries_sha256,
+        "runtime_receipt_sha256": runtime_receipt_sha256,
+        "exporter_approval_id": exporter_approval_id,
+        "exporter_approval_sha256": exporter_approval_sha256,
+        "install_trust": exporter_install_trust,
+        "install_trust_sha256": trust_sha256,
+    }
     storage_policy = audit.get("storage_policy")
     if storage_policy != NO_EXTERNAL_STATE_STORAGE:
         raise PreflightError("ds4 external cache/state storage policy is invalid")
@@ -290,6 +423,7 @@ def main() -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--authorization-issued-unix", type=int, required=True)
     parser.add_argument("--authorization-expires-unix", type=int, required=True)
+    parser.add_argument("--ds4-exporter-policy-id", required=True)
     parser.add_argument("--prompt-builder-policy-id", required=True)
     parser.add_argument("--approval-policy", type=Path, required=True)
     parser.add_argument("--approval-signature", type=Path, required=True)
@@ -314,6 +448,10 @@ def main() -> int:
             args.prompt_builder_policy_id,
             policies=approval_policy.prompt_builders,
         )
+        exporter_policy, exporter_policy_sha256 = ds4_exporter_approval(
+            args.ds4_exporter_policy_id,
+            policies=approval_policy.ds4_exporters,
+        )
         harness_repo = resolved(args.repo)
         harness_revision = subprocess.check_output(
             ["git", "-C", str(harness_repo), "rev-parse", "HEAD"],
@@ -321,6 +459,39 @@ def main() -> int:
         ).decode("ascii").strip()
         if harness_revision != approval_policy.verifier_revision:
             raise PreflightError("ds4 verifier checkout differs from the external approval policy")
+        checkout = resolved(args.checkout)
+        checkout_revision = verify_checkout(checkout)
+        if checkout_revision != DS4_REVISION:
+            raise PreflightError(
+                f"ds4 revision mismatch: expected {DS4_REVISION}, found {checkout_revision}")
+        if not args.exporter.is_absolute() or str(args.exporter) != exporter_policy["executable_path"]:
+            raise PreflightError("ds4 exporter path or caller digest differs from external approval")
+        exporter = resolved(args.exporter)
+        if str(exporter) != str(args.exporter) or (
+                args.exporter_sha256 != exporter_policy["executable_sha256"]):
+            raise PreflightError("ds4 exporter path or caller digest differs from external approval")
+        exporter_identity = approved_executable_identity(
+            exporter,
+            install_root=exporter_policy["install_root"],
+            expected_owner_uid=exporter_policy["install_owner_uid"],
+            expected_path=exporter_policy["executable_path"],
+            expected_sha256=exporter_policy["executable_sha256"],
+            label="ds4 exporter",
+        )
+        runtime_identities = approved_runtime_file_identities(
+            exporter_policy, label="ds4 exporter")
+        exporter_install_trust = install_trust_evidence(
+            exporter_identity, runtime_identities)
+        exporter_install_trust_sha256 = install_trust_sha256(exporter_install_trust)
+        pre_runtime_build = query_runtime_build_attestation(
+            exporter,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+        )
+        runtime_build_sha256 = runtime_build_evidence_sha256(
+            pre_runtime_build, exporter_policy, label="ds4 exporter")
+        runtime_receipt_sha256 = sha256_bytes(
+            canonical_json(exporter_policy["runtime_receipt"]).encode("ascii"))
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         model_sha256 = sha256_file(resolved(args.model))
@@ -351,6 +522,12 @@ def main() -> int:
             verifier_revision=approval_policy.verifier_revision,
             tokenizer_policy_sha256_value=tokenizer_policy_sha256(prompt_policy["tokenizer"]),
             approvals={
+                "ds4_exporter": approval_binding(
+                    "ds4_exporter",
+                    args.ds4_exporter_policy_id,
+                    exporter_policy_sha256,
+                    exporter_install_trust_sha256,
+                ),
                 "prompt_builder": approval_binding(
                     "prompt_builder",
                     args.prompt_builder_policy_id,
@@ -359,14 +536,7 @@ def main() -> int:
                 ),
             },
         )
-        exporter = resolved(args.exporter)
-        if not exporter.is_file() or not os.access(exporter, os.X_OK):
-            raise PreflightError(f"trace exporter is not executable: {exporter}")
-        exporter_sha256 = sha256_file(exporter)
-        if exporter_sha256 != args.exporter_sha256:
-            raise PreflightError(
-                f"trace exporter SHA-256 mismatch: expected {args.exporter_sha256}, found {exporter_sha256}")
-        verify_exporter_approval(exporter_sha256)
+        exporter_sha256 = exporter_identity.sha256
         validate_signing_identity(
             args.signing_key,
             args.signer_principal,
@@ -383,11 +553,24 @@ def main() -> int:
             "--prefill-chunk", str(args.prefill_chunk),
             "--device", args.device,
         ]
-        accelerator = query_accelerator_attestation(exporter, args.device)
+        accelerator = query_accelerator_attestation(
+            exporter,
+            args.device,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+            expected_runtime_build=pre_runtime_build,
+        )
         runner = runner_attestation(
             exporter=exporter,
             exporter_sha256=exporter_sha256,
-            checkout=resolved(args.checkout),
+            exporter_approval_id=args.ds4_exporter_policy_id,
+            exporter_approval_sha256=exporter_policy_sha256,
+            exporter_install_trust_sha256=exporter_install_trust_sha256,
+            exporter_runtime_build_sha256=runtime_build_sha256,
+            exporter_runtime_profile=exporter_policy["runtime_profile"],
+            exporter_runtime_receipt_sha256=runtime_receipt_sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            checkout=checkout,
             command=command,
         )
         if args.preflight_only:
@@ -398,15 +581,47 @@ def main() -> int:
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
         preflight_audit = preflight(args, accelerator=accelerator, runner=runner)
-        preflight_audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
+        preflight_audit["exporter"] = {
+            "path": str(exporter),
+            "sha256": exporter_sha256,
+            "approval_id": args.ds4_exporter_policy_id,
+            "approval_sha256": exporter_policy_sha256,
+            "install_trust_sha256": exporter_install_trust_sha256,
+            "runtime_build_sha256": runtime_build_sha256,
+            "runtime_receipt_sha256": runtime_receipt_sha256,
+        }
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
         pre_audit_digests = seal_audits(pre_audits)
         print("exec:", shlex.join(command), file=sys.stderr)
-        result = subprocess.run(command, cwd=resolved(args.checkout), check=False)
+        result = run_exporter_command(
+            command,
+            exporter=exporter,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+            cwd=checkout,
+            check=False,
+        )
+        verify_approved_executable_identity(
+            exporter, exporter_identity, label="ds4 exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="ds4 exporter")
+        post_trace_runtime_build = query_runtime_build_attestation(
+            exporter,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+        )
+        if post_trace_runtime_build != pre_runtime_build:
+            raise PreflightError("ds4 exporter build identity changed during trace execution")
         if result.returncode != 0:
             return result.returncode
         verify_sealed_audits(pre_audits, pre_audit_digests)
-        post_accelerator = query_accelerator_attestation(exporter, args.device)
+        post_accelerator = query_accelerator_attestation(
+            exporter,
+            args.device,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+            expected_runtime_build=pre_runtime_build,
+        )
         if post_accelerator != accelerator:
             raise PreflightError("selected accelerator identity changed during trace execution")
         postflight_audit = preflight(args, accelerator=post_accelerator, runner=runner)
@@ -415,7 +630,18 @@ def main() -> int:
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
-        bind_oracle_attestation(output, preflight_audit, accelerator, command)
+        bind_oracle_attestation(
+            output,
+            preflight_audit,
+            accelerator,
+            command,
+            exporter_policy=exporter_policy,
+            exporter_approval_id=args.ds4_exporter_policy_id,
+            exporter_approval_sha256=exporter_policy_sha256,
+            exporter_install_trust=exporter_install_trust,
+            runtime_build=pre_runtime_build,
+            verifier_revision=approval_policy.verifier_revision,
+        )
         bind_execution_authorization(output, authorization)
         seal_bundle(
             output,
@@ -425,8 +651,10 @@ def main() -> int:
             expected_challenge=args.execution_challenge,
             expected_run_id=args.run_id,
             candidate_exporter_policies={},
+            ds4_exporter_policies=approval_policy.ds4_exporters,
             prompt_builder_policies=approval_policy.prompt_builders,
             expected_candidate_exporter_policy_id=None,
+            expected_ds4_exporter_policy_id=args.ds4_exporter_policy_id,
             expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
             expected_approval_policy_sha256=approval_policy.sha256,
             expected_verifier_revision=approval_policy.verifier_revision,
@@ -440,6 +668,7 @@ def main() -> int:
                 expected_challenge=args.execution_challenge,
                 expected_run_id=args.run_id,
                 expected_candidate_exporter_policy_id=None,
+                expected_ds4_exporter_policy_id=args.ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,

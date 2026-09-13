@@ -19,10 +19,11 @@ from typing import Any, Iterable
 TRACE_FORMAT = "dsv41-trace"
 TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
-APPROVED_EXPORTERS: dict[str, str] = {}
+DS4_REPOSITORY = "antirez/ds4"
 APPROVED_TRACE_SIGNERS: dict[str, dict[str, str]] = {}
 APPROVED_EXECUTABLE_APPROVERS: dict[str, dict[str, Any]] = {}
 APPROVED_CANDIDATE_EXPORTERS: dict[str, dict[str, Any]] = {}
+APPROVED_DS4_EXPORTERS: dict[str, dict[str, Any]] = {}
 APPROVED_PROMPT_BUILDERS: dict[str, dict[str, Any]] = {}
 EXECUTABLE_APPROVAL_FORMAT = "dsv41-executable-approval"
 EXECUTABLE_APPROVAL_VERSION = 2
@@ -143,8 +144,10 @@ class TraceVerifier:
     expected_run_id: str
     verification_unix: int
     candidate_exporter_policies: dict[str, dict[str, Any]]
+    ds4_exporter_policies: dict[str, dict[str, Any]]
     prompt_builder_policies: dict[str, dict[str, Any]]
     expected_candidate_exporter_policy_id: str | None
+    expected_ds4_exporter_policy_id: str | None
     expected_prompt_builder_policy_id: str
     expected_approval_policy_sha256: str
     expected_verifier_revision: str
@@ -160,6 +163,7 @@ class TraceVerifier:
             expected_challenge: str,
             expected_run_id: str,
             expected_candidate_exporter_policy_id: str | None,
+            expected_ds4_exporter_policy_id: str | None,
             expected_prompt_builder_policy_id: str,
             approval_policy: "ExecutableApprovalPolicy | None" = None,
             verification_unix: int | None,
@@ -175,10 +179,14 @@ class TraceVerifier:
             candidate_exporter_policies=(
                 approval_policy.candidate_exporters
                 if approval_policy is not None else APPROVED_CANDIDATE_EXPORTERS),
+            ds4_exporter_policies=(
+                approval_policy.ds4_exporters
+                if approval_policy is not None else APPROVED_DS4_EXPORTERS),
             prompt_builder_policies=(
                 approval_policy.prompt_builders
                 if approval_policy is not None else APPROVED_PROMPT_BUILDERS),
             expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
             expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
             expected_approval_policy_sha256=(
                 approval_policy.sha256 if approval_policy is not None else ""),
@@ -199,8 +207,10 @@ class TraceVerifier:
             expected_challenge: str,
             expected_run_id: str,
             candidate_exporter_policies: dict[str, dict[str, Any]] | None = None,
+            ds4_exporter_policies: dict[str, dict[str, Any]] | None = None,
             prompt_builder_policies: dict[str, dict[str, Any]] | None = None,
             expected_candidate_exporter_policy_id: str | None = None,
+            expected_ds4_exporter_policy_id: str | None = None,
             expected_prompt_builder_policy_id: str = "",
             expected_approval_policy_sha256: str = "e" * 64,
             expected_verifier_revision: str = "a" * 40,
@@ -223,8 +233,10 @@ class TraceVerifier:
             expected_run_id=expected_run_id,
             verification_unix=verification_unix,
             candidate_exporter_policies=candidate_exporter_policies or {},
+            ds4_exporter_policies=ds4_exporter_policies or {},
             prompt_builder_policies=prompt_builder_policies or {},
             expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
             expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
             expected_approval_policy_sha256=expected_approval_policy_sha256,
             expected_verifier_revision=expected_verifier_revision,
@@ -264,6 +276,7 @@ class ExecutableApprovalPolicy:
     principal: str
     verifier_revision: str
     candidate_exporters: dict[str, dict[str, Any]]
+    ds4_exporters: dict[str, dict[str, Any]]
     prompt_builders: dict[str, dict[str, Any]]
     sha256: str
 
@@ -592,8 +605,12 @@ def run_approved_executable(
         label: str,
         **kwargs: Any,
 ) -> tuple[subprocess.CompletedProcess[Any], ExecutableFileReceipt]:
-    if sys.platform != "linux":
-        raise TraceError(f"{label} descriptor execution requires Linux")
+    if sys.platform not in {"linux", "darwin"}:
+        raise TraceError(f"{label} immutable execution is unsupported on this platform")
+    if not command or command[0] != str(path):
+        raise TraceError(f"{label} command path differs from external approval")
+    if "executable" in kwargs or "pass_fds" in kwargs:
+        raise TraceError(f"{label} execution parameters may not override immutable launch controls")
     identity, descriptor = _approved_file_identity(
         path,
         install_root=Path(runtime_policy["install_root"]),
@@ -624,12 +641,18 @@ def run_approved_executable(
                 label=f"{label} runtime component",
             )
         retained_descriptors = (descriptor, *(item[1] for item in runtime_files))
-        result = subprocess.run(
-            command,
-            executable=f"/proc/self/fd/{descriptor}",
-            pass_fds=retained_descriptors,
+        launch = {
+            "pass_fds": retained_descriptors,
             **kwargs,
-        )
+        }
+        if sys.platform == "linux":
+            launch["executable"] = f"/proc/self/fd/{descriptor}"
+        execution_error: OSError | subprocess.SubprocessError | None = None
+        result = None
+        try:
+            result = subprocess.run(command, **launch)
+        except (OSError, subprocess.SubprocessError) as error:
+            execution_error = error
         descriptor_after = os.fstat(descriptor)
         if (
                 descriptor_after.st_dev,
@@ -673,6 +696,10 @@ def run_approved_executable(
                 runtime_identity,
                 label=f"{label} runtime component",
             )
+        if execution_error is not None:
+            raise execution_error
+        if result is None:
+            raise TraceError(f"{label} execution did not return a result")
         return result, identity
     finally:
         for _runtime_identity, runtime_descriptor in runtime_files:
@@ -1135,6 +1162,101 @@ def candidate_exporter_approval(
     return policy, _approval_digest("candidate-exporter", approval_id, policy)
 
 
+def ds4_exporter_approval(
+        approval_id: str,
+        *,
+        policies: dict[str, dict[str, Any]] = APPROVED_DS4_EXPORTERS,
+) -> tuple[dict[str, Any], str]:
+    policy = policies.get(approval_id)
+    if not isinstance(policy, dict):
+        raise TraceError(f"ds4 exporter approval is not trusted: {approval_id}")
+    _require_exact_keys(
+        policy,
+        {
+            "runtime",
+            "repository",
+            "revision",
+            "install_root",
+            "install_owner_uid",
+            "executable_path",
+            "executable_sha256",
+            "runtime_profile",
+            "runtime_receipt",
+        },
+        "ds4 exporter approval",
+    )
+    if policy["runtime"] != "ds4" or policy["repository"] != DS4_REPOSITORY or (
+            policy["revision"] != DS4_REVISION):
+        raise TraceError("ds4 exporter approval runtime identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", policy.get("executable_sha256", "")) is None:
+        raise TraceError("ds4 exporter approval executable SHA-256 is invalid")
+    install_root = _approval_path(policy["install_root"], "ds4 exporter approval install root")
+    if type(policy["install_owner_uid"]) is not int or policy["install_owner_uid"] < 0:
+        raise TraceError("ds4 exporter approval install owner is invalid")
+    executable_path = _approval_path(
+        policy["executable_path"], "ds4 exporter approval executable path")
+    executable = PurePosixPath(executable_path)
+    if executable.parent != PurePosixPath(install_root) / "bin":
+        raise TraceError("ds4 exporter approval executable path is outside its install policy")
+    profile = policy["runtime_profile"]
+    if not isinstance(profile, dict):
+        raise TraceError("ds4 exporter approval runtime profile is invalid")
+    _require_exact_keys(
+        profile, {"name", "components", "selected_backend_component"},
+        "ds4 exporter approval runtime profile")
+    components = profile["components"]
+    selected_backend = profile["selected_backend_component"]
+    if profile["name"] not in {"co-located", "sibling-lib"} or not isinstance(components, list) or (
+            components != sorted(components)) or len(components) != len(set(components)) or not components or any(
+                not isinstance(component, str) or re.fullmatch(r"[a-z0-9-]+", component) is None
+                for component in components) or not isinstance(selected_backend, str) or (
+                selected_backend not in components):
+        raise TraceError("ds4 exporter approval runtime profile is invalid")
+    receipt = policy["runtime_receipt"]
+    if not isinstance(receipt, dict):
+        raise TraceError("ds4 exporter approval runtime receipt is invalid")
+    _require_exact_keys(
+        receipt, {"format", "version", "revision", "profile", "components"},
+        "ds4 exporter approval runtime receipt")
+    if receipt["format"] != "dsv41-runtime-receipt" or receipt["version"] != 1 or (
+            receipt["revision"] != DS4_REVISION) or receipt["profile"] != profile["name"]:
+        raise TraceError("ds4 exporter approval runtime receipt identity is invalid")
+    receipt_components = receipt["components"]
+    if not isinstance(receipt_components, list) or receipt_components != sorted(
+            receipt_components, key=lambda item: item.get("component", "") if isinstance(item, dict) else ""):
+        raise TraceError("ds4 exporter approval runtime receipt components are not canonical")
+    seen_components = set()
+    seen_filenames = set()
+    seen_digests = set()
+    revision_bearing = 0
+    for component in receipt_components:
+        if not isinstance(component, dict):
+            raise TraceError("ds4 exporter approval runtime receipt component is invalid")
+        _require_exact_keys(
+            component, {"component", "filename", "sha256", "revision"},
+            "ds4 exporter approval runtime receipt component")
+        name = component["component"]
+        filename = component["filename"]
+        digest = component["sha256"]
+        revision = component["revision"]
+        if name not in components or name in seen_components:
+            raise TraceError("ds4 exporter approval runtime receipt component name is invalid")
+        if not isinstance(filename, str) or re.fullmatch(r"[A-Za-z0-9._+-]+", filename) is None or (
+                filename in seen_filenames):
+            raise TraceError("ds4 exporter approval runtime receipt filename is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None or digest in seen_digests:
+            raise TraceError("ds4 exporter approval runtime receipt digest is invalid")
+        if revision not in {None, DS4_REVISION}:
+            raise TraceError("ds4 exporter approval runtime receipt revision is invalid")
+        revision_bearing += revision == DS4_REVISION
+        seen_components.add(name)
+        seen_filenames.add(filename)
+        seen_digests.add(digest)
+    if seen_components != set(components) or revision_bearing == 0:
+        raise TraceError("ds4 exporter approval receipt differs from its runtime profile")
+    return policy, _approval_digest("ds4-exporter", approval_id, policy)
+
+
 def validate_tokenizer_policy(record: object) -> dict[str, bool]:
     if not isinstance(record, dict):
         raise TraceError("tokenizer policy is missing")
@@ -1429,7 +1551,7 @@ def load_executable_approval_policy(
         policy,
         {
             "format", "version", "principal", "verifier_repository", "verifier_revision",
-            "candidate_exporters", "prompt_builders",
+            "candidate_exporters", "ds4_exporters", "prompt_builders",
         },
         "executable approval policy",
     )
@@ -1440,11 +1562,17 @@ def load_executable_approval_policy(
                 r"[0-9a-f]{40}", policy.get("verifier_revision", "")) is None:
         raise TraceError("executable approval policy identity is invalid")
     candidate_exporters = policy["candidate_exporters"]
+    ds4_exporters = policy["ds4_exporters"]
     prompt_builders = policy["prompt_builders"]
-    if not isinstance(candidate_exporters, dict) or not isinstance(prompt_builders, dict):
+    if not isinstance(candidate_exporters, dict) or not isinstance(ds4_exporters, dict) or (
+            not isinstance(prompt_builders, dict)):
         raise TraceError("executable approval policy maps are invalid")
     for approval_id in sorted(candidate_exporters):
         candidate_exporter_approval(approval_id, policies=candidate_exporters)
+    for approval_id in sorted(ds4_exporters):
+        ds4_policy, _digest = ds4_exporter_approval(approval_id, policies=ds4_exporters)
+        if ds4_policy["revision"] == policy["verifier_revision"]:
+            raise TraceError("ds4 exporter producer revision must differ from the verifier revision")
     for approval_id in sorted(prompt_builders):
         prompt_builder_approval(approval_id, policies=prompt_builders)
     if not signature.startswith("-----BEGIN SSH SIGNATURE-----\n") or not signature.endswith(
@@ -1481,6 +1609,7 @@ def load_executable_approval_policy(
         principal=expected_principal,
         verifier_revision=policy["verifier_revision"],
         candidate_exporters=candidate_exporters,
+        ds4_exporters=ds4_exporters,
         prompt_builders=prompt_builders,
         sha256=sha256_bytes(policy_bytes),
     )
@@ -1492,7 +1621,7 @@ def approval_binding(
         digest: str,
         trust_sha256: str,
 ) -> dict[str, str]:
-    if kind not in {"candidate_exporter", "prompt_builder"} or re.fullmatch(
+    if kind not in {"candidate_exporter", "ds4_exporter", "prompt_builder"} or re.fullmatch(
             r"[A-Za-z0-9._-]{1,128}", approval_id) is None or re.fullmatch(
                 r"[0-9a-f]{64}", digest) is None or re.fullmatch(
                 r"[0-9a-f]{64}", trust_sha256) is None:
@@ -1509,8 +1638,10 @@ def validate_execution_authorization(
         expected_run_id: str,
         verification_unix: int,
         candidate_exporter_policies: dict[str, dict[str, Any]],
+        ds4_exporter_policies: dict[str, dict[str, Any]],
         prompt_builder_policies: dict[str, dict[str, Any]],
         expected_candidate_exporter_policy_id: str | None,
+        expected_ds4_exporter_policy_id: str | None,
         expected_prompt_builder_policy_id: str,
         expected_approval_policy_sha256: str,
         expected_verifier_revision: str,
@@ -1577,6 +1708,8 @@ def validate_execution_authorization(
     required_approvals = {"prompt_builder"}
     if expected_lane == CANDIDATE_LANE:
         required_approvals.add("candidate_exporter")
+    else:
+        required_approvals.add("ds4_exporter")
     if not isinstance(approvals, dict):
         raise TraceError("manifest execution approval bindings are invalid")
     _require_exact_keys(approvals, required_approvals, "manifest execution approval bindings")
@@ -1589,6 +1722,8 @@ def validate_execution_authorization(
     if expected_lane == CANDIDATE_LANE:
         if expected_candidate_exporter_policy_id is None:
             raise TraceError("external candidate exporter approval ID is required")
+        if expected_ds4_exporter_policy_id is not None:
+            raise TraceError("candidate verification must not specify a ds4 exporter approval")
         _candidate_policy, candidate_digest = candidate_exporter_approval(
             expected_candidate_exporter_policy_id, policies=candidate_exporter_policies)
         candidate_binding = approvals["candidate_exporter"]
@@ -1598,8 +1733,20 @@ def validate_execution_authorization(
                 candidate_digest) or re.fullmatch(
                 r"[0-9a-f]{64}", candidate_binding.get("install_trust_sha256", "")) is None:
             raise TraceError("manifest candidate exporter approval differs from external policy")
-    elif expected_candidate_exporter_policy_id is not None:
-        raise TraceError("oracle verification must not specify a candidate exporter approval")
+    else:
+        if expected_candidate_exporter_policy_id is not None:
+            raise TraceError("oracle verification must not specify a candidate exporter approval")
+        if expected_ds4_exporter_policy_id is None:
+            raise TraceError("external ds4 exporter approval ID is required")
+        _ds4_policy, ds4_digest = ds4_exporter_approval(
+            expected_ds4_exporter_policy_id, policies=ds4_exporter_policies)
+        ds4_binding = approvals["ds4_exporter"]
+        if not isinstance(ds4_binding, dict) or set(ds4_binding) != {
+                "id", "sha256", "install_trust_sha256"} or ds4_binding.get("id") != (
+                expected_ds4_exporter_policy_id) or ds4_binding.get("sha256") != (
+                ds4_digest) or re.fullmatch(
+                r"[0-9a-f]{64}", ds4_binding.get("install_trust_sha256", "")) is None:
+            raise TraceError("manifest ds4 exporter approval differs from external policy")
     if seen_run_ids is not None:
         if expected_run_id in seen_run_ids:
             raise TraceError("trace lane run ID was reused")
@@ -1636,6 +1783,8 @@ def execution_authorization(
     required_approvals = {"prompt_builder"}
     if lane == CANDIDATE_LANE:
         required_approvals.add("candidate_exporter")
+    else:
+        required_approvals.add("ds4_exporter")
     if not isinstance(approvals, dict):
         raise TraceError("execution authorization approvals are invalid")
     _require_exact_keys(approvals, required_approvals, "execution authorization approvals")
@@ -2027,8 +2176,10 @@ def seal_bundle(
         expected_challenge: str,
         expected_run_id: str,
         candidate_exporter_policies: dict[str, dict[str, Any]] = APPROVED_CANDIDATE_EXPORTERS,
+        ds4_exporter_policies: dict[str, dict[str, Any]] = APPROVED_DS4_EXPORTERS,
         prompt_builder_policies: dict[str, dict[str, Any]] = APPROVED_PROMPT_BUILDERS,
         expected_candidate_exporter_policy_id: str | None = None,
+        expected_ds4_exporter_policy_id: str | None = None,
         expected_prompt_builder_policy_id: str = "",
         expected_approval_policy_sha256: str = "",
         expected_verifier_revision: str = "",
@@ -2058,8 +2209,10 @@ def seal_bundle(
         expected_run_id=expected_run_id,
         verification_unix=verification_time,
         candidate_exporter_policies=candidate_exporter_policies,
+        ds4_exporter_policies=ds4_exporter_policies,
         prompt_builder_policies=prompt_builder_policies,
         expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+        expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
         expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
         expected_approval_policy_sha256=expected_approval_policy_sha256,
         expected_verifier_revision=expected_verifier_revision,
@@ -2079,8 +2232,10 @@ def seal_bundle(
             expected_run_id=expected_run_id,
             verification_unix=verification_time,
             candidate_exporter_policies=candidate_exporter_policies,
+            ds4_exporter_policies=ds4_exporter_policies,
             prompt_builder_policies=prompt_builder_policies,
             expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
             expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
             expected_approval_policy_sha256=expected_approval_policy_sha256,
             expected_verifier_revision=expected_verifier_revision,
@@ -2202,8 +2357,10 @@ def verify_bundle_seal(
         expected_run_id=verifier.expected_run_id,
         verification_unix=verifier.verification_unix,
         candidate_exporter_policies=verifier.candidate_exporter_policies,
+        ds4_exporter_policies=verifier.ds4_exporter_policies,
         prompt_builder_policies=verifier.prompt_builder_policies,
         expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+        expected_ds4_exporter_policy_id=verifier.expected_ds4_exporter_policy_id,
         expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
         expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
         expected_verifier_revision=verifier.expected_verifier_revision,
@@ -2826,6 +2983,7 @@ class TraceBundle:
             expected_challenge: str | None = None,
             expected_run_id: str | None = None,
             expected_candidate_exporter_policy_id: str | None = None,
+            expected_ds4_exporter_policy_id: str | None = None,
             expected_prompt_builder_policy_id: str | None = None,
             verification_unix: int | None = None,
             seen_run_ids: set[str] | None = None):
@@ -2840,19 +2998,23 @@ class TraceBundle:
                     "external signer, lane, challenge, run ID, and prompt builder approval are required")
             if expected_lane == CANDIDATE_LANE and expected_candidate_exporter_policy_id is None:
                 raise TraceError("external candidate exporter approval is required")
+            if expected_lane == ORACLE_LANE and expected_ds4_exporter_policy_id is None:
+                raise TraceError("external ds4 exporter approval is required")
             verifier = TraceVerifier.production(
                 signer_principal,
                 expected_lane=expected_lane,
                 expected_challenge=expected_challenge,
                 expected_run_id=expected_run_id,
                 expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
                 verification_unix=verification_unix,
                 seen_run_ids=seen_run_ids,
             )
         elif any(value is not None for value in (
                 signer_principal, expected_lane, expected_challenge, expected_run_id,
-                expected_candidate_exporter_policy_id, expected_prompt_builder_policy_id,
+                expected_candidate_exporter_policy_id, expected_ds4_exporter_policy_id,
+                expected_prompt_builder_policy_id,
                 verification_unix, seen_run_ids)):
             raise TraceError("trace verifier cannot be combined with separate verification inputs")
         self.signer_principal = verifier.principal
@@ -2914,7 +3076,10 @@ class TraceBundle:
             "audits",
             "expected",
         }
-        top_level.add("candidate" if self.manifest["runtime"] == "llama.cpp" else "host")
+        if self.manifest["runtime"] == "llama.cpp":
+            top_level.add("candidate")
+        else:
+            top_level.update({"host", "oracle"})
         _require_exact_keys(self.manifest, top_level, f"{self.manifest['runtime']} manifest")
         if not isinstance(self.manifest["revision"], str) or not self.manifest["revision"]:
             raise TraceError("manifest revision is invalid")
@@ -2932,15 +3097,16 @@ class TraceBundle:
                 "runtime_libraries", "runtime_libraries_post", "runtime_module_monitor",
             }
             if self.manifest["runtime"] == "llama.cpp"
-            else {"compiler", "target", "path", "sha256"}
+            else {
+                "compiler", "target", "path", "sha256",
+                "runtime_profile", "runtime_receipt_sha256",
+                "runtime_libraries", "runtime_libraries_post", "runtime_module_monitor",
+            }
         )
         _require_exact_keys(self.manifest["build"], build_keys, "manifest build")
         build_sha256 = self.manifest["build"].get("sha256", "")
         if not isinstance(build_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", build_sha256) is None:
             raise TraceError("manifest build SHA-256 is invalid")
-        if self.manifest["runtime"] == "ds4" and (
-                APPROVED_EXPORTERS.get(build_sha256) != DS4_REVISION):
-            raise TraceError("ds4 exporter is not approved for the pinned ds4 revision")
         for key in build_keys - {
                 "sha256", "number", "runtime_profile", "runtime_receipt_sha256",
                 "runtime_libraries", "runtime_libraries_post", "runtime_module_monitor"}:
@@ -3084,6 +3250,43 @@ class TraceBundle:
             if not isinstance(receipt_sha256, str) or receipt_sha256 != sha256_bytes(
                     canonical_json(receipt).encode("ascii")):
                 raise TraceError("manifest runtime receipt SHA-256 is invalid")
+        else:
+            ds4_policy, _ds4_policy_sha256 = ds4_exporter_approval(
+                self.verifier.expected_ds4_exporter_policy_id or "",
+                policies=self.verifier.ds4_exporter_policies,
+            )
+            build_evidence = {
+                key: self.manifest["build"][key]
+                for key in (
+                    "revision",
+                    "path",
+                    "sha256",
+                    "runtime_profile",
+                    "runtime_receipt_sha256",
+                    "runtime_libraries",
+                    "runtime_libraries_post",
+                )
+                if key in self.manifest["build"]
+            }
+            build_evidence["revision"] = self.manifest["revision"]
+            validate_runtime_build_evidence(
+                build_evidence,
+                ds4_policy,
+                label="ds4 exporter",
+            )
+            module_monitor = self.manifest["build"]["runtime_module_monitor"]
+            if not isinstance(module_monitor, dict):
+                raise TraceError("ds4 manifest runtime module monitor is invalid")
+            _require_exact_keys(
+                module_monitor,
+                {"mechanism", "checked_after_trace", "project_additions"},
+                "ds4 manifest runtime module monitor",
+            )
+            if module_monitor["mechanism"] != "dyld-add-image" or (
+                    module_monitor["checked_after_trace"] is not True) or (
+                    module_monitor["project_additions"] != []):
+                raise TraceError("ds4 manifest runtime module monitor is invalid")
+            receipt = ds4_policy["runtime_receipt"]
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
@@ -3344,6 +3547,100 @@ class TraceBundle:
                     self.manifest["authorization"]["approvals"]["candidate_exporter"][
                         "install_trust_sha256"] != candidate_trust_sha256):
                 raise TraceError("candidate install trust evidence is not bound to authorization")
+        else:
+            oracle = self.manifest.get("oracle")
+            if not isinstance(oracle, dict):
+                raise TraceError("ds4 oracle attestation is missing")
+            _require_exact_keys(
+                oracle,
+                {
+                    "repository",
+                    "revision",
+                    "verifier_revision",
+                    "executable_path",
+                    "executable_sha256",
+                    "runtime_profile",
+                    "runtime_build_sha256",
+                    "runtime_libraries_sha256",
+                    "runtime_receipt_sha256",
+                    "exporter_approval_id",
+                    "exporter_approval_sha256",
+                    "install_trust",
+                    "install_trust_sha256",
+                },
+                "ds4 oracle attestation",
+            )
+            for key in (
+                    "revision",
+                    "verifier_revision",
+                    "executable_sha256",
+                    "runtime_libraries_sha256",
+                    "runtime_build_sha256",
+                    "runtime_receipt_sha256",
+                    "exporter_approval_sha256",
+                    "install_trust_sha256"):
+                value = oracle.get(key, "")
+                if not isinstance(value, str) or re.fullmatch(
+                        r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}", value) is None:
+                    raise TraceError(f"ds4 oracle {key} is invalid")
+            if oracle["repository"] != DS4_REPOSITORY or oracle["revision"] != DS4_REVISION or (
+                    oracle["revision"] == oracle["verifier_revision"]):
+                raise TraceError("ds4 oracle producer/verifier identity is invalid")
+            if re.fullmatch(
+                    r"[A-Za-z0-9._-]{1,128}", oracle.get("exporter_approval_id", "")) is None:
+                raise TraceError("ds4 exporter approval ID is invalid")
+            if oracle["executable_path"] != self.manifest["build"]["path"] or (
+                    oracle["executable_sha256"] != self.manifest["build"]["sha256"]):
+                raise TraceError("ds4 oracle executable identity does not match the trace build")
+            if oracle["runtime_profile"] != self.manifest["build"]["runtime_profile"]:
+                raise TraceError("ds4 oracle runtime profile does not match the trace build")
+            ds4_policy, ds4_policy_sha256 = ds4_exporter_approval(
+                self.verifier.expected_ds4_exporter_policy_id or "",
+                policies=self.verifier.ds4_exporter_policies,
+            )
+            build_evidence = {
+                "revision": self.manifest["revision"],
+                "path": self.manifest["build"]["path"],
+                "sha256": self.manifest["build"]["sha256"],
+                "runtime_profile": self.manifest["build"]["runtime_profile"],
+                "runtime_receipt_sha256": self.manifest["build"]["runtime_receipt_sha256"],
+                "runtime_libraries": self.manifest["build"]["runtime_libraries"],
+                "runtime_libraries_post": self.manifest["build"]["runtime_libraries_post"],
+            }
+            if oracle["runtime_build_sha256"] != runtime_build_evidence_sha256(
+                    build_evidence, ds4_policy, label="ds4 exporter"):
+                raise TraceError("ds4 oracle runtime build SHA-256 does not match the trace build")
+            runtime_libraries_sha256 = sha256_bytes(
+                canonical_json({
+                    "pre": self.manifest["build"]["runtime_libraries"],
+                    "post": self.manifest["build"]["runtime_libraries_post"],
+                }).encode("ascii"))
+            if oracle["runtime_libraries_sha256"] != runtime_libraries_sha256 or (
+                    oracle["runtime_receipt_sha256"] != self.manifest["build"]["runtime_receipt_sha256"]):
+                raise TraceError("ds4 oracle runtime evidence does not match the trace build")
+            if oracle["exporter_approval_id"] != self.verifier.expected_ds4_exporter_policy_id or (
+                    oracle["exporter_approval_sha256"] != ds4_policy_sha256):
+                raise TraceError("ds4 exporter approval differs from external policy")
+            policy_checks = {
+                "repository": oracle["repository"],
+                "revision": oracle["revision"],
+                "executable_path": oracle["executable_path"],
+                "executable_sha256": oracle["executable_sha256"],
+                "runtime_profile": oracle["runtime_profile"],
+                "runtime_receipt": receipt,
+            }
+            for key, value in policy_checks.items():
+                if ds4_policy[key] != value:
+                    raise TraceError(f"ds4 oracle {key} differs from external exporter approval")
+            if oracle["verifier_revision"] != self.verifier.expected_verifier_revision:
+                raise TraceError("ds4 oracle verifier revision differs from external approval")
+            oracle_trust = validate_install_trust_evidence(
+                oracle["install_trust"], ds4_policy)
+            oracle_trust_sha256 = install_trust_sha256(oracle_trust)
+            if oracle["install_trust_sha256"] != oracle_trust_sha256 or (
+                    self.manifest["authorization"]["approvals"]["ds4_exporter"][
+                        "install_trust_sha256"] != oracle_trust_sha256):
+                raise TraceError("ds4 exporter install trust evidence is not bound to authorization")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
@@ -3562,6 +3859,14 @@ class TraceBundle:
                     "runner_script_sha256",
                     "exporter_path",
                     "exporter_sha256",
+                    "exporter_approval_id",
+                    "exporter_approval_sha256",
+                    "exporter_install_trust_sha256",
+                    "exporter_runtime_build_sha256",
+                    "exporter_runtime_profile",
+                    "exporter_runtime_receipt_sha256",
+                    "producer_revision",
+                    "verifier_revision",
                     "checkout_path",
                     "checkout_revision",
                     "command_sha256",
@@ -3574,6 +3879,14 @@ class TraceBundle:
                 "runtime_kind": "apple-metal",
                 "source": "python-subprocess",
                 "exporter_sha256": self.manifest["build"]["sha256"],
+                "exporter_approval_id": self.manifest["oracle"]["exporter_approval_id"],
+                "exporter_approval_sha256": self.manifest["oracle"]["exporter_approval_sha256"],
+                "exporter_install_trust_sha256": self.manifest["oracle"]["install_trust_sha256"],
+                "exporter_runtime_build_sha256": self.manifest["oracle"]["runtime_build_sha256"],
+                "exporter_runtime_profile": self.manifest["oracle"]["runtime_profile"],
+                "exporter_runtime_receipt_sha256": self.manifest["oracle"]["runtime_receipt_sha256"],
+                "producer_revision": self.manifest["oracle"]["revision"],
+                "verifier_revision": self.manifest["oracle"]["verifier_revision"],
                 "checkout_revision": DS4_REVISION,
                 "checkout_path": self.manifest["paths"]["runtime_checkout"],
                 "runner_executable": self.manifest["paths"]["runner_executable"],
@@ -3592,9 +3905,21 @@ class TraceBundle:
                     "runner_executable_sha256",
                     "runner_script_sha256",
                     "exporter_sha256",
+                    "exporter_approval_sha256",
+                    "exporter_install_trust_sha256",
+                    "exporter_runtime_build_sha256",
+                    "exporter_runtime_receipt_sha256",
                     "command_sha256"):
                 if re.fullmatch(r"[0-9a-f]{64}", data.get(key, "")) is None:
                     raise TraceError(f"{phase} ds4 runner {key} is invalid")
+            if re.fullmatch(
+                    r"[A-Za-z0-9._-]{1,128}", data.get("exporter_approval_id", "")) is None:
+                raise TraceError(f"{phase} ds4 runner exporter approval ID is invalid")
+            for key in ("producer_revision", "verifier_revision"):
+                if re.fullmatch(r"[0-9a-f]{40}", data.get(key, "")) is None:
+                    raise TraceError(f"{phase} ds4 runner {key} is invalid")
+            if not isinstance(data.get("exporter_runtime_profile"), dict):
+                raise TraceError(f"{phase} ds4 runner runtime profile is invalid")
         if kind == "watchdog":
             required = (
                 "format",
@@ -4181,6 +4506,7 @@ def command_validate(args: argparse.Namespace) -> int:
                 expected_challenge=args.execution_challenge,
                 expected_run_id=args.run_id,
                 expected_candidate_exporter_policy_id=args.candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=args.ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,
@@ -4220,6 +4546,7 @@ def command_compare(args: argparse.Namespace) -> int:
             expected_challenge=challenge,
             expected_run_id=left_run_id,
             expected_candidate_exporter_policy_id=None,
+            expected_ds4_exporter_policy_id=getattr(args, "left_ds4_exporter_policy_id", None),
             expected_prompt_builder_policy_id=getattr(args, "prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
         )
@@ -4231,6 +4558,7 @@ def command_compare(args: argparse.Namespace) -> int:
             expected_run_id=right_run_id,
             expected_candidate_exporter_policy_id=getattr(
                 args, "right_candidate_exporter_policy_id", None),
+            expected_ds4_exporter_policy_id=None,
             expected_prompt_builder_policy_id=getattr(args, "prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
         )
@@ -4243,6 +4571,7 @@ def command_compare(args: argparse.Namespace) -> int:
                 expected_challenge=challenge,
                 expected_run_id=left_run_id,
                 expected_candidate_exporter_policy_id=None,
+                expected_ds4_exporter_policy_id=args.left_ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,
@@ -4257,6 +4586,7 @@ def command_compare(args: argparse.Namespace) -> int:
                 expected_challenge=challenge,
                 expected_run_id=right_run_id,
                 expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,
@@ -4345,6 +4675,7 @@ def command_compare_local(args: argparse.Namespace) -> int:
             expected_run_id=left_run_id,
             expected_candidate_exporter_policy_id=getattr(
                 args, "left_candidate_exporter_policy_id", None),
+            expected_ds4_exporter_policy_id=None,
             expected_prompt_builder_policy_id=getattr(
                 args, "left_prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
@@ -4357,6 +4688,7 @@ def command_compare_local(args: argparse.Namespace) -> int:
             expected_run_id=right_run_id,
             expected_candidate_exporter_policy_id=getattr(
                 args, "right_candidate_exporter_policy_id", None),
+            expected_ds4_exporter_policy_id=None,
             expected_prompt_builder_policy_id=getattr(
                 args, "right_prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
@@ -4370,6 +4702,7 @@ def command_compare_local(args: argparse.Namespace) -> int:
                 expected_challenge=challenge,
                 expected_run_id=left_run_id,
                 expected_candidate_exporter_policy_id=args.left_candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.left_prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,
@@ -4384,6 +4717,7 @@ def command_compare_local(args: argparse.Namespace) -> int:
                 expected_challenge=challenge,
                 expected_run_id=right_run_id,
                 expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
+                expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.right_prompt_builder_policy_id,
                 approval_policy=approval_policy,
                 verification_unix=None,
@@ -4418,6 +4752,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--execution-challenge", required=True)
     validate_parser.add_argument("--run-id", required=True)
     validate_parser.add_argument("--candidate-exporter-policy-id")
+    validate_parser.add_argument("--ds4-exporter-policy-id")
     validate_parser.add_argument("--prompt-builder-policy-id", required=True)
     add_executable_approval_arguments(validate_parser)
     validate_parser.set_defaults(func=command_validate)
@@ -4429,6 +4764,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--execution-challenge", required=True)
     compare_parser.add_argument("--left-run-id", required=True)
     compare_parser.add_argument("--right-run-id", required=True)
+    compare_parser.add_argument("--left-ds4-exporter-policy-id", required=True)
     compare_parser.add_argument("--right-candidate-exporter-policy-id", required=True)
     compare_parser.add_argument("--prompt-builder-policy-id", required=True)
     add_executable_approval_arguments(compare_parser)
