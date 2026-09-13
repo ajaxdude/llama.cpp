@@ -2313,7 +2313,7 @@ class TraceFormatTests(unittest.TestCase):
                     manifest_binary,
                     trace.sha256_file(manifest_binary),
                 )
-            with self.assertRaisesRegex(trace.TraceError, "candidate executable path"):
+            with self.assertRaisesRegex(trace.TraceError, "missing candidate"):
                 trace.TraceBundle(root)
 
             for protected_field in (
@@ -2345,7 +2345,7 @@ class TraceFormatTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("selected device is not a GPU backend", rejected.stderr)
+            self.assertIn("selected execution device must be ROCm0", rejected.stderr)
 
     def test_runtime_build_validator_rejects_closure_substitution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
