@@ -43,6 +43,7 @@ struct llama_dsv41_expert_runtime {
     void release_context();
     void release(int32_t layer);
     void release_all();
+    void release_all_after_sync(ggml_backend_sched_t sched);
 
     ggml_tensor * cache_tensor(int32_t layer, llama_expert_projection projection) const;
     size_t cache_slots() const;

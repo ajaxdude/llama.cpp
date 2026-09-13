@@ -675,7 +675,9 @@ void llama_context::sched_reserve() {
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
         switch (model.arch) {
+            case LLM_ARCH_KIMI_LINEAR:
             case LLM_ARCH_MINIMAX_01:
+                // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
@@ -1424,7 +1426,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
-        model.release_runtime_work();
+        model.release_runtime_work_after_sync(sched.get());
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
@@ -3729,6 +3731,9 @@ llama_context * llama_init_from_model(
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
+        }
+        if (model->get_split_state_ud.n_devices == 1) {
+            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
     }
 

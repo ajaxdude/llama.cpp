@@ -284,6 +284,12 @@ void llama_model_deepseek41::release_runtime_work() const {
     }
 }
 
+void llama_model_deepseek41::release_runtime_work_after_sync(ggml_backend_sched_t sched) const {
+    if (experts) {
+        experts->release_all_after_sync(sched);
+    }
+}
+
 void llama_model_deepseek41::acquire_runtime_context() const {
     if (experts) {
         experts->acquire_context();

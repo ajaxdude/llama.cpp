@@ -1326,6 +1326,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     bool requires_synchronous_graph() const override;
     std::string consume_runtime_error() const override;
     void release_runtime_work() const override;
+    void release_runtime_work_after_sync(ggml_backend_sched_t sched) const override;
     void acquire_runtime_context() const override;
     void release_runtime_context() const override;
 
@@ -2649,6 +2650,19 @@ struct llama_model_step35 : public llama_model_base {
 
     struct graph_mtp : public llm_graph_context {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llama_model_spark2_5 : public llama_model_base {
+    llama_model_spark2_5(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

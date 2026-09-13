@@ -1,11 +1,13 @@
 #include "../src/llama-dsv41-expert.h"
 #include "../src/llama-dsv41.h"
+#include "../src/llama-graph.h"
 #include "../src/llama-model-loader.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <chrono>
@@ -275,15 +277,22 @@ void test_graph_callbacks(const fixture & f) {
     REQUIRE(sched != nullptr);
 
     ggml_tensor * selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 1);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, fixture::n_embd, 3, 1);
     ggml_set_input(selected);
+    ggml_set_input(input);
     ggml_tensor * remapped = llama_dsv41_build_expert_remap(ctx, selected, runtime, 0, sched, backend);
-    ggml_tensor * release = llama_dsv41_build_expert_release(ctx, ggml_cast(ctx, remapped, GGML_TYPE_F32), runtime, 0, sched, backend);
+    ggml_tensor * expert_values = ggml_mul_mat_id(
+            ctx, runtime.cache_tensor(0, LLAMA_EXPERT_PROJECTION_GATE), input, remapped);
+    ggml_tensor * release = llama_dsv41_build_expert_release(ctx, expert_values, runtime, 0, sched, backend);
+    ggml_set_output(remapped);
     ggml_set_output(release);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, release);
     REQUIRE(ggml_backend_sched_alloc_graph(sched, graph));
     const int32_t original[] = { 3, 1, 1 };
+    std::vector<float> input_data(fixture::n_embd*3, 1.0f);
     ggml_backend_tensor_set(selected, original, 0, sizeof(original));
+    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size()*sizeof(float));
     REQUIRE(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
     const std::string error = runtime.consume_error();
     if (!error.empty()) {
@@ -299,12 +308,184 @@ void test_graph_callbacks(const fixture & f) {
     ggml_backend_tensor_set(selected, over_capacity, 0, sizeof(over_capacity));
     REQUIRE(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
     REQUIRE(!runtime.consume_error().empty());
+    int32_t safe_ids[3] = { -1, -1, -1 };
+    ggml_backend_tensor_get(remapped, safe_ids, 0, sizeof(safe_ids));
+    REQUIRE(safe_ids[0] == 0 && safe_ids[1] == 0 && safe_ids[2] == 0);
     REQUIRE(runtime.remap(0, { 0 }).front() >= 0);
     runtime.release(0);
 
     ggml_backend_sched_free(sched);
     ggml_backend_free(backend);
     ggml_free(ctx);
+}
+
+void test_graph_upload_failure_sentinel(const fixture & f) {
+    size_t calls = 0;
+    auto runtime = f.make_runtime(1, [&](ggml_tensor * tensor, size_t offset, const void * data, size_t size) {
+        if (++calls == 5) {
+            throw std::runtime_error("synthetic graph upload failure");
+        }
+        ggml_backend_tensor_set(tensor, data, offset, size);
+    });
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, &buft, 1, 64, false, true);
+    REQUIRE(sched != nullptr);
+
+    ggml_tensor * selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, fixture::n_embd, 1, 1);
+    ggml_set_input(selected);
+    ggml_set_input(input);
+    ggml_tensor * remapped = llama_dsv41_build_expert_remap(ctx, selected, runtime, 0, sched, backend);
+    ggml_tensor * expert_values = ggml_mul_mat_id(
+            ctx, runtime.cache_tensor(0, LLAMA_EXPERT_PROJECTION_GATE), input, remapped);
+    ggml_tensor * release = llama_dsv41_build_expert_release(ctx, expert_values, runtime, 0, sched, backend);
+    ggml_set_output(remapped);
+    ggml_set_output(release);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, release);
+    REQUIRE(ggml_backend_sched_alloc_graph(sched, graph));
+
+    std::vector<float> input_data(fixture::n_embd, 1.0f);
+    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size()*sizeof(float));
+    const int32_t first[] = { 0 };
+    ggml_backend_tensor_set(selected, first, 0, sizeof(first));
+    REQUIRE(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    REQUIRE(runtime.consume_error().empty());
+
+    const int32_t failed[] = { 1 };
+    ggml_backend_tensor_set(selected, failed, 0, sizeof(failed));
+    REQUIRE(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    REQUIRE(runtime.consume_error().find("synthetic graph upload failure") != std::string::npos);
+    int32_t safe_id = -1;
+    ggml_backend_tensor_get(remapped, &safe_id, 0, sizeof(safe_id));
+    REQUIRE(safe_id == 0);
+
+    REQUIRE(runtime.remap(0, { 2 }).front() == 0);
+    runtime.release(0);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
+void test_grovemoe_lookup_ids() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&backend, &buft, 1, 64, false, true);
+    REQUIRE(sched != nullptr);
+
+    ggml_tensor * selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * explicit_slots = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_set_input(selected);
+    ggml_set_input(explicit_slots);
+    const llm_moe_expert_ids grovemoe = llm_build_moe_expert_ids(
+            ctx, LLM_ARCH_GROVEMOE, selected, nullptr, 2, 8, 4);
+    const llm_moe_expert_ids deepseek = llm_build_moe_expert_ids(
+            ctx, LLM_ARCH_DEEPSEEK41, selected, explicit_slots, 8, 8, 0);
+    REQUIRE(grovemoe.routing == selected);
+    REQUIRE(grovemoe.lookup != selected);
+    REQUIRE(deepseek.routing == selected);
+    REQUIRE(deepseek.lookup == explicit_slots);
+    ggml_set_output(grovemoe.routing);
+    ggml_set_output(grovemoe.lookup);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, grovemoe.routing);
+    ggml_build_forward_expand(graph, grovemoe.lookup);
+    REQUIRE(ggml_backend_sched_alloc_graph(sched, graph));
+
+    const int32_t original[] = { 7, 1 };
+    ggml_backend_tensor_set(selected, original, 0, sizeof(original));
+    REQUIRE(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    int32_t routing_ids[2] = {};
+    int32_t chunk_ids[2] = {};
+    ggml_backend_tensor_get(grovemoe.routing, routing_ids, 0, sizeof(routing_ids));
+    ggml_backend_tensor_get(grovemoe.lookup, chunk_ids, 0, sizeof(chunk_ids));
+    REQUIRE(routing_ids[0] == 7 && routing_ids[1] == 1);
+    REQUIRE(chunk_ids[0] == 1 && chunk_ids[1] == 0);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
+struct sync_test_context {
+    llama_dsv41_expert_runtime * runtime = nullptr;
+    int synchronize_count = 0;
+    bool saw_pinned = false;
+};
+
+const char * sync_test_backend_name(ggml_backend_t) {
+    return "dsv41-sync-test";
+}
+
+void sync_test_backend_synchronize(ggml_backend_t backend) {
+    auto * state = static_cast<sync_test_context *>(backend->context);
+    state->synchronize_count++;
+    try {
+        state->runtime->remap(0, { 2 });
+    } catch (const std::exception &) {
+        state->saw_pinned = true;
+    }
+}
+
+const char * sync_test_device_name(ggml_backend_dev_t) {
+    return "dsv41-sync-test";
+}
+
+enum ggml_backend_dev_type sync_test_device_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+bool sync_test_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
+    return true;
+}
+
+bool sync_test_device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
+    return buft == ggml_backend_cpu_buffer_type();
+}
+
+void test_release_after_sync(const fixture & f) {
+    auto runtime = f.make_runtime(1);
+    REQUIRE(runtime.remap(0, { 1 }).front() == 0);
+
+    sync_test_context state = { &runtime };
+    ggml_backend_device device = {};
+    device.iface.get_name = sync_test_device_name;
+    device.iface.get_type = sync_test_device_type;
+    device.iface.supports_op = sync_test_device_supports_op;
+    device.iface.supports_buft = sync_test_device_supports_buft;
+    ggml_backend backend = {};
+    backend.iface.get_name = sync_test_backend_name;
+    backend.iface.synchronize = sync_test_backend_synchronize;
+    backend.device = &device;
+    backend.context = &state;
+    ggml_backend_t backends[] = { &backend };
+    ggml_backend_buffer_type_t bufts[] = { ggml_backend_cpu_buffer_type() };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 1, 16, false, false);
+    REQUIRE(sched != nullptr);
+
+    runtime.release_all_after_sync(sched);
+    REQUIRE(state.synchronize_count == 1);
+    REQUIRE(state.saw_pinned);
+    REQUIRE(runtime.remap(0, { 2 }).front() == 0);
+    runtime.release(0);
+    ggml_backend_sched_free(sched);
 }
 
 void test_original_and_slot_ids() {
@@ -373,6 +554,9 @@ int main() {
         test_remap_upload_and_eviction(f);
         test_capacity_and_upload_failure(f);
         test_graph_callbacks(f);
+        test_graph_upload_failure_sentinel(f);
+        test_grovemoe_lookup_ids();
+        test_release_after_sync(f);
         test_original_and_slot_ids();
     } catch (const std::exception & error) {
         std::fprintf(stderr, "test-deepseek41-expert: %s\n", error.what());
