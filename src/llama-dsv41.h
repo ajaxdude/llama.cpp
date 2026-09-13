@@ -101,7 +101,6 @@ struct llama_dsv41_config {
 
 void llama_dsv41_validate_config(const llama_dsv41_config & config);
 llama_engram_layout llama_dsv41_make_engram_layout(const llama_dsv41_config & config);
-const char * llama_dsv41_runtime_dependency_error();
 
 struct llama_dsv41_compression_plan {
     std::vector<int32_t> state_pos;

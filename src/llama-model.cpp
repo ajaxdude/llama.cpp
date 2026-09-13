@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-dsv41.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -2543,7 +2544,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK41:
-            throw std::runtime_error(llama_dsv41_runtime_dependency_error());
+            {
+                const auto & model_dsv41 = static_cast<const llama_model_deepseek41 &>(*this);
+                res = new llama_memory_dsv41(
+                        *this,
+                        params.type_k,
+                        cparams.offload_kqv,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        model_dsv41.create_memory_engram_runtime(cparams.n_ubatch));
+            } break;
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)

@@ -106,9 +106,7 @@ llama_engram_layout llama_dsv41_make_engram_layout(const llama_dsv41_config & co
     return layout;
 }
 
-const char * llama_dsv41_runtime_dependency_error() {
-    return "DeepSeek V4.1 execution requires routed-expert streaming support";
-}
+
 
 static int32_t dsv41_source_layer(const int32_t * sources, size_t n, uint32_t il) {
     int32_t result = -1;
