@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -80,7 +81,7 @@ class FakeProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         if self.returncode is None:
-            raise subprocess.TimeoutExpired("fake", timeout)
+            raise subprocess.TimeoutExpired("fake", timeout or 0.0)
         return self.returncode
 
 
@@ -225,6 +226,33 @@ class TestWatchdogBehavior(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _lease_arguments(root: Path) -> list[str]:
+        return [
+            "--lease-path",
+            str(root / "lease.json"),
+            "--heartbeat-path",
+            str(root / "heartbeat.json"),
+            "--audit-path",
+            str(root / "persistent-audit.jsonl"),
+        ]
+
+    @staticmethod
+    def _proc_stat(
+        process_id: int,
+        parent_id: int,
+        process_group_id: int,
+        start_time_ticks: int,
+    ) -> str:
+        fields = [
+            "S",
+            str(parent_id),
+            str(process_group_id),
+            *(["0"] * 16),
+            str(start_time_ticks),
+        ]
+        return f"{process_id} (python) {' '.join(fields)}\n"
+
     def test_parent_signals_leave_no_child_or_grandchild(self) -> None:
         child_code = (
             "import os,signal,sys,time;"
@@ -249,14 +277,15 @@ class TestWatchdogBehavior(unittest.TestCase):
                     root = Path(temp_dir)
                     pid_file = root / "pids"
                     self._write_procfs_fixture(root)
-                    audit_path = root / "audit.jsonl"
-                    with audit_path.open("w", encoding="utf-8") as audit:
+                    stderr_path = root / "stderr.jsonl"
+                    with stderr_path.open("w", encoding="utf-8") as audit:
                         wrapper = subprocess.Popen(
                             [
                                 sys.executable,
                                 str(SCRIPT_PATH),
                                 "--procfs-root",
                                 str(root),
+                                *self._lease_arguments(root),
                                 "--grace-seconds",
                                 "0.2",
                                 "--sample-interval-seconds",
@@ -304,7 +333,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                     )
                     records = [
                         json.loads(line)
-                        for line in audit_path.read_text(
+                        for line in stderr_path.read_text(
                             encoding="utf-8"
                         ).splitlines()
                     ]
@@ -344,6 +373,32 @@ class TestWatchdogBehavior(unittest.TestCase):
                         self.assertFalse(
                             self._process_is_running(process_id)
                         )
+                    lease = json.loads(
+                        (root / "lease.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    heartbeat = json.loads(
+                        (root / "heartbeat.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    persistent_records = [
+                        json.loads(line)
+                        for line in (
+                            root / "persistent-audit.jsonl"
+                        ).read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertEqual(lease["state"], "final")
+                    self.assertEqual(
+                        lease["final"]["classification"],
+                        "parent_signal",
+                    )
+                    self.assertEqual(heartbeat["state"], "final")
+                    self.assertEqual(
+                        persistent_records[-1]["classification"],
+                        "parent_signal",
+                    )
 
     def test_child_sigterm_handler_exits_without_escalation(self) -> None:
         child_code = (
@@ -620,26 +675,123 @@ class TestWatchdogBehavior(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "grace period"):
             config.validate()
 
+    def test_final_record_survives_artifact_failures(self) -> None:
+        class FailingLease:
+            def finalize(self, record: dict[str, Any]) -> None:
+                raise watchdog.ArtifactError("lease", "write failed")
+
+        class FailingAudit(io.StringIO):
+            def write(self, value: str) -> int:
+                raise OSError("write failed")
+
+        for component in ("lease", "audit"):
+            with self.subTest(component=component):
+                stream = io.StringIO()
+                audit = watchdog.AuditLogger(stream)
+                if component == "lease":
+                    setattr(audit, "lease_manager", FailingLease())
+                else:
+                    audit.persistent_stream = FailingAudit()
+                result = watchdog._emit_final(
+                    audit,
+                    "child_exit",
+                    0,
+                    "child exited",
+                    snapshot(50),
+                    50,
+                )
+                records = [
+                    json.loads(line)
+                    for line in stream.getvalue().splitlines()
+                ]
+                self.assertEqual(result, watchdog.EXIT_LEASE_ERROR)
+                self.assertEqual(
+                    records[-1]["classification"], "lease_error"
+                )
+                self.assertTrue(audit.finalized)
+                self.assertEqual(
+                    audit.final_exit_code, watchdog.EXIT_LEASE_ERROR
+                )
+
+    def test_invalid_artifact_path_emits_configuration_final(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--lease-path",
+                "~strix-watchdog-user-does-not-exist/lease.json",
+                "--heartbeat-path",
+                "/tmp/heartbeat.json",
+                "--audit-path",
+                "/tmp/audit.jsonl",
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, watchdog.EXIT_PROCFS_ERROR)
+        final = json.loads(result.stderr.splitlines()[-1])
+        self.assertEqual(final["classification"], "configuration_error")
+
     def test_cli_fixture_launches_command_and_propagates_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            child_result_path = root / "child-result.json"
             self._write_procfs_fixture(root)
+            child_code = (
+                "import json,os,sys,time\n"
+                "keys=('STRIX_MEMORY_WATCHDOG_LEASE_PATH',"
+                "'STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH',"
+                "'STRIX_MEMORY_WATCHDOG_AUDIT_PATH')\n"
+                "deadline=time.monotonic()+5\n"
+                "while True:\n"
+                " try:\n"
+                "  with open(os.environ[keys[0]],encoding='utf-8') as stream:\n"
+                "   lease=json.load(stream)\n"
+                "  break\n"
+                " except (OSError,json.JSONDecodeError):\n"
+                "  if time.monotonic()>=deadline: raise\n"
+                "  time.sleep(0.01)\n"
+                "assert os.getpgrp()==lease['child_process_group_id']\n"
+                "open(sys.argv[1],'w').write(json.dumps({"
+                "key:os.environ[key] for key in keys}))\n"
+                "raise SystemExit(23)\n"
+            )
             result = subprocess.run(
                 [
                     sys.executable,
                     str(SCRIPT_PATH),
                     "--procfs-root",
                     str(root),
+                    *self._lease_arguments(root),
                     "--sample-interval-seconds",
                     "0.01",
                     "--",
                     sys.executable,
                     "-c",
-                    "raise SystemExit(23)",
+                    child_code,
+                    str(child_result_path),
                 ],
                 capture_output=True,
                 check=False,
                 text=True,
+            )
+            lease = json.loads(
+                (root / "lease.json").read_text(encoding="utf-8")
+            )
+            persistent_records = [
+                json.loads(line)
+                for line in (
+                    root / "persistent-audit.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            child_result = json.loads(
+                child_result_path.read_text(encoding="utf-8")
             )
 
         self.assertEqual(result.returncode, 23)
@@ -648,6 +800,277 @@ class TestWatchdogBehavior(unittest.TestCase):
         ]
         self.assertEqual(records[-1]["classification"], "child_exit")
         self.assertEqual(records[-1]["child_returncode"], 23)
+        self.assertEqual(lease["format"], watchdog.LEASE_FORMAT)
+        self.assertEqual(lease["version"], watchdog.LEASE_VERSION)
+        self.assertEqual(lease["state"], "final")
+        self.assertEqual(lease["soft_bytes"], 116 * 1024**3)
+        self.assertEqual(
+            lease["emergency_bytes"], 118 * 1024**3
+        )
+        self.assertEqual(
+            lease["child_command_sha256"],
+            watchdog._command_sha256(
+                (
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(child_result_path),
+                )
+            ),
+        )
+        self.assertEqual(
+            lease["final"]["classification"], "child_exit"
+        )
+        self.assertEqual(
+            persistent_records[-1]["classification"], "child_exit"
+        )
+        self.assertEqual(
+            child_result["STRIX_MEMORY_WATCHDOG_LEASE_PATH"],
+            str((root / "lease.json").resolve()),
+        )
+        self.assertEqual(
+            child_result["STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH"],
+            str((root / "heartbeat.json").resolve()),
+        )
+        self.assertEqual(
+            child_result["STRIX_MEMORY_WATCHDOG_AUDIT_PATH"],
+            str((root / "persistent-audit.jsonl").resolve()),
+        )
+
+    def test_existing_lease_fails_closed_and_stops_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_procfs_fixture(root)
+            lease_path = root / "lease.json"
+            lease_path.write_text("untrusted\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--procfs-root",
+                    str(root),
+                    *self._lease_arguments(root),
+                    "--grace-seconds",
+                    "0.1",
+                    "--sample-interval-seconds",
+                    "0.05",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time;time.sleep(30)",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+            records = [
+                json.loads(line) for line in result.stderr.splitlines()
+            ]
+            child_pid = records[-1]["child_pid"]
+            self.assertEqual(
+                lease_path.read_text(encoding="utf-8"), "untrusted\n"
+            )
+
+        self.assertEqual(result.returncode, watchdog.EXIT_LEASE_ERROR)
+        self.assertEqual(records[-1]["classification"], "lease_error")
+        self.assertFalse(self._process_is_running(child_pid))
+
+    def test_active_lease_validation_rejects_tamper_and_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            process_root = root / "proc"
+            watchdog_pid = 1200
+            child_pid = 1300
+            current_pid = 1400
+            watchdog_start_ticks = 456789
+            script_path = root / "watchdog.py"
+            script_path.write_text("print('watchdog')\n", encoding="utf-8")
+            cmdline = (
+                b"/usr/bin/python3\0watchdog.py\0--lease-path\0"
+            )
+            for process_id, parent_id, group_id, start_ticks in (
+                (watchdog_pid, 1, watchdog_pid, watchdog_start_ticks),
+                (child_pid, watchdog_pid, child_pid, 456790),
+                (current_pid, child_pid, child_pid, 456791),
+            ):
+                process_dir = process_root / str(process_id)
+                process_dir.mkdir(parents=True)
+                (process_dir / "stat").write_text(
+                    self._proc_stat(
+                        process_id,
+                        parent_id,
+                        group_id,
+                        start_ticks,
+                    ),
+                    encoding="utf-8",
+                )
+            (process_root / str(watchdog_pid) / "cwd").symlink_to(
+                root, target_is_directory=True
+            )
+            (process_root / str(watchdog_pid) / "cmdline").write_bytes(
+                cmdline
+            )
+
+            lease_path = root / "lease.json"
+            heartbeat_path = root / "heartbeat.json"
+            audit_path = root / "audit.jsonl"
+            audit_path.write_text(
+                '{"event":"child_started","timestamp":"2026-01-01T00:00:00Z"}\n',
+                encoding="utf-8",
+            )
+            command = ["python3", "run_matrix.py"]
+            lease = {
+                "format": watchdog.LEASE_FORMAT,
+                "version": watchdog.LEASE_VERSION,
+                "lease_id": "test-lease",
+                "state": "active",
+                "watchdog_pid": watchdog_pid,
+                "watchdog_start_time_utc": "2026-01-01T00:00:00.000Z",
+                "watchdog_start_time_ticks": watchdog_start_ticks,
+                "watchdog_command_sha256": hashlib.sha256(
+                    cmdline
+                ).hexdigest(),
+                "watchdog_script_path": str(script_path),
+                "watchdog_script_sha256": hashlib.sha256(
+                    script_path.read_bytes()
+                ).hexdigest(),
+                "soft_bytes": watchdog.DEFAULT_SOFT_BYTES,
+                "emergency_bytes": watchdog.DEFAULT_EMERGENCY_BYTES,
+                "strict_ceiling_bytes": watchdog.STRICT_CEILING_BYTES,
+                "child_pid": child_pid,
+                "child_process_group_id": child_pid,
+                "command": command,
+                "child_command_sha256": watchdog._command_sha256(
+                    command
+                ),
+                "heartbeat_path": str(heartbeat_path),
+                "max_heartbeat_age_seconds": 5.0,
+                "audit_path": str(audit_path),
+                "procfs_root": "/proc",
+            }
+            heartbeat = {
+                "format": watchdog.HEARTBEAT_FORMAT,
+                "version": watchdog.HEARTBEAT_VERSION,
+                "lease_id": "test-lease",
+                "sequence": 4,
+                "state": "active",
+                "updated_at": "2026-01-01T00:00:01.000Z",
+                "updated_monotonic_ns": 9_000_000_000,
+                "watchdog_pid": watchdog_pid,
+                "watchdog_start_time_ticks": (
+                    watchdog_start_ticks
+                ),
+                "child_pid": child_pid,
+                "child_process_group_id": child_pid,
+            }
+            lease_path.write_text(json.dumps(lease), encoding="utf-8")
+            heartbeat_path.write_text(
+                json.dumps(heartbeat), encoding="utf-8"
+            )
+
+            validated = watchdog.validate_active_lease(
+                lease_path,
+                expected_script_path=script_path,
+                expected_command_sha256=watchdog._command_sha256(
+                    command
+                ),
+                expected_heartbeat_path=heartbeat_path,
+                expected_audit_path=audit_path,
+                expected_max_heartbeat_age_seconds=5.0,
+                current_process_id=current_pid,
+                process_procfs_root=process_root,
+                monotonic_ns=lambda: 10_000_000_000,
+            )
+            self.assertEqual(validated["lease_id"], "test-lease")
+
+            with self.subTest("tampered script SHA"):
+                tampered = dict(lease)
+                tampered["watchdog_script_sha256"] = "0" * 64
+                lease_path.write_text(
+                    json.dumps(tampered), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    watchdog.LeaseValidationError, "script SHA"
+                ):
+                    watchdog.validate_active_lease(
+                        lease_path,
+                        expected_script_path=script_path,
+                        expected_heartbeat_path=heartbeat_path,
+                        expected_audit_path=audit_path,
+                        current_process_id=current_pid,
+                        process_procfs_root=process_root,
+                        monotonic_ns=lambda: 10_000_000_000,
+                    )
+
+            with self.subTest("stale heartbeat"):
+                lease_path.write_text(
+                    json.dumps(lease), encoding="utf-8"
+                )
+                heartbeat["updated_monotonic_ns"] = 1
+                heartbeat_path.write_text(
+                    json.dumps(heartbeat), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    watchdog.LeaseValidationError, "heartbeat is stale"
+                ):
+                    watchdog.validate_active_lease(
+                        lease_path,
+                        expected_script_path=script_path,
+                        expected_heartbeat_path=heartbeat_path,
+                        expected_audit_path=audit_path,
+                        current_process_id=current_pid,
+                        process_procfs_root=process_root,
+                        monotonic_ns=lambda: 10_000_000_000,
+                    )
+
+            with self.subTest("arbitrary heartbeat"):
+                heartbeat["updated_monotonic_ns"] = 9_000_000_000
+                heartbeat["lease_id"] = "helper-lease"
+                heartbeat_path.write_text(
+                    json.dumps(heartbeat), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    watchdog.LeaseValidationError,
+                    "heartbeat identity",
+                ):
+                    watchdog.validate_active_lease(
+                        lease_path,
+                        expected_script_path=script_path,
+                        expected_heartbeat_path=heartbeat_path,
+                        expected_audit_path=audit_path,
+                        current_process_id=current_pid,
+                        process_procfs_root=process_root,
+                        monotonic_ns=lambda: 10_000_000_000,
+                    )
+
+            with self.subTest("outside process group"):
+                heartbeat["lease_id"] = "test-lease"
+                heartbeat_path.write_text(
+                    json.dumps(heartbeat), encoding="utf-8"
+                )
+                (process_root / str(current_pid) / "stat").write_text(
+                    self._proc_stat(
+                        current_pid,
+                        child_pid,
+                        9999,
+                        456791,
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    watchdog.LeaseValidationError,
+                    "outside the monitored process group",
+                ):
+                    watchdog.validate_active_lease(
+                        lease_path,
+                        expected_script_path=script_path,
+                        expected_heartbeat_path=heartbeat_path,
+                        expected_audit_path=audit_path,
+                        current_process_id=current_pid,
+                        process_procfs_root=process_root,
+                        monotonic_ns=lambda: 10_000_000_000,
+                    )
 
     def test_zero_swap_gate_launches_and_propagates_child_exit(self) -> None:
         harness = Harness([snapshot(50)], FakeProcess(returncode=37))
@@ -702,13 +1125,29 @@ class TestWatchdogBehavior(unittest.TestCase):
             signal_handler=exit_on_term,
         )
 
-        result = harness.run()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = harness.run(
+                lease_path=root / "lease.json",
+                heartbeat_path=root / "heartbeat.json",
+                audit_path=root / "audit.jsonl",
+            )
+            harness.audit.close()
+            heartbeat = json.loads(
+                (root / "heartbeat.json").read_text(encoding="utf-8")
+            )
+            lease = json.loads(
+                (root / "lease.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(result, watchdog.EXIT_SOFT_LIMIT)
         self.assertEqual(harness.signals, [signal.SIGTERM])
         self.assertEqual(
             harness.records()[-1]["classification"], "soft_limit"
         )
+        self.assertEqual(heartbeat["state"], "final")
+        self.assertEqual(heartbeat["sequence"], 3)
+        self.assertEqual(lease["final"]["classification"], "soft_limit")
 
     def test_emergency_limit_sends_sigkill(self) -> None:
         def exit_on_kill(process: FakeProcess, signal_number: int) -> None:
@@ -804,7 +1243,23 @@ class TestWatchdogBehavior(unittest.TestCase):
             signal_handler=exit_on_kill,
         )
 
-        result = harness.run()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = harness.run(
+                lease_path=root / "lease.json",
+                heartbeat_path=root / "heartbeat.json",
+                audit_path=root / "audit.jsonl",
+            )
+            harness.audit.close()
+            lease = json.loads(
+                (root / "lease.json").read_text(encoding="utf-8")
+            )
+            persistent_records = [
+                json.loads(line)
+                for line in (root / "audit.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
 
         self.assertEqual(result, watchdog.EXIT_INTERNAL_ERROR)
         self.assertEqual(
@@ -814,6 +1269,10 @@ class TestWatchdogBehavior(unittest.TestCase):
         final = harness.records()[-1]
         self.assertEqual(final["classification"], "internal_error")
         self.assertIn("RuntimeError: unexpected", final["error"])
+        self.assertEqual(lease["final"]["classification"], "internal_error")
+        self.assertEqual(
+            persistent_records[-1]["classification"], "internal_error"
+        )
 
     def test_launch_failure_is_explicit(self) -> None:
         harness = Harness([snapshot(50)], FakeProcess())
@@ -823,7 +1282,7 @@ class TestWatchdogBehavior(unittest.TestCase):
         ) -> FakeProcess:
             raise FileNotFoundError(2, "No such file or directory")
 
-        harness.launcher = fail_launch
+        setattr(harness, "launcher", fail_launch)
 
         result = harness.run()
 
