@@ -203,6 +203,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-engram.cpp)
     llama_build_and_test(test-llama-archs.cpp)
 
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-deepseek41-trace
+            LABEL main
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek41-trace.py
+        )
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
