@@ -2,7 +2,8 @@ if(NOT DEFINED DSV41_BUILD_DIR OR NOT DEFINED DSV41_INSTALL_ROOT OR
         NOT DEFINED DSV41_COMPONENT OR NOT DEFINED DSV41_EXECUTABLE OR
         NOT DEFINED DSV41_SOURCE_EXECUTABLE OR
         NOT DEFINED DSV41_REVISION OR NOT DEFINED DSV41_PYTHON OR
-        NOT DEFINED DSV41_RECEIPT OR NOT DEFINED DSV41_VERIFY_SCRIPT)
+        NOT DEFINED DSV41_RECEIPT OR NOT DEFINED DSV41_CONTAINMENT_HELPER OR
+        NOT DEFINED DSV41_CONTAINMENT_HELPER_RECEIPT OR NOT DEFINED DSV41_VERIFY_SCRIPT)
     message(FATAL_ERROR "DeepSeek V4.1 install smoke test arguments are incomplete")
 endif()
 
@@ -23,6 +24,24 @@ file(SHA256 "${DSV41_SOURCE_EXECUTABLE}" source_executable_sha256)
 file(SHA256 "${DSV41_INSTALL_ROOT}/bin/${DSV41_EXECUTABLE}" installed_executable_sha256)
 if(NOT source_executable_sha256 STREQUAL installed_executable_sha256)
     message(FATAL_ERROR "installed DeepSeek V4.1 trace executable differs from linked bytes")
+endif()
+
+get_filename_component(containment_helper_name "${DSV41_CONTAINMENT_HELPER}" NAME)
+file(SHA256 "${DSV41_CONTAINMENT_HELPER}" source_helper_sha256)
+file(SHA256 "${DSV41_INSTALL_ROOT}/bin/${containment_helper_name}" installed_helper_sha256)
+if(NOT source_helper_sha256 STREQUAL installed_helper_sha256)
+    message(FATAL_ERROR "installed DeepSeek V4.1 containment helper differs from linked bytes")
+endif()
+file(
+    SHA256 "${DSV41_CONTAINMENT_HELPER_RECEIPT}"
+    source_containment_helper_receipt_sha256)
+file(
+    SHA256
+    "${DSV41_INSTALL_ROOT}/share/deepseek-v41-trace/dsv41-containment-helper-receipt.json"
+    installed_containment_helper_receipt_sha256)
+if(NOT source_containment_helper_receipt_sha256 STREQUAL
+        installed_containment_helper_receipt_sha256)
+    message(FATAL_ERROR "installed DeepSeek V4.1 containment helper receipt differs from build bytes")
 endif()
 
 execute_process(
@@ -61,4 +80,20 @@ if(NOT smoke_result EQUAL 0)
 endif()
 if(NOT smoke_output MATCHES "commit ${DSV41_REVISION}")
     message(FATAL_ERROR "installed DeepSeek V4.1 trace reported the wrong revision:\n${smoke_output}")
+endif()
+
+execute_process(
+    COMMAND "${DSV41_INSTALL_ROOT}/bin/${containment_helper_name}" --version
+    RESULT_VARIABLE helper_smoke_result
+    OUTPUT_VARIABLE helper_smoke_output
+    ERROR_VARIABLE helper_smoke_error)
+if(NOT helper_smoke_result EQUAL 0)
+    message(FATAL_ERROR
+        "installed DeepSeek V4.1 containment helper --version failed:\n"
+        "${helper_smoke_output}${helper_smoke_error}")
+endif()
+if(NOT helper_smoke_output MATCHES "${DSV41_REVISION}")
+    message(FATAL_ERROR
+        "installed DeepSeek V4.1 containment helper reported the wrong revision:\n"
+        "${helper_smoke_output}")
 endif()

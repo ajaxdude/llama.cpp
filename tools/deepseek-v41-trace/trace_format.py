@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import array
 import ctypes
 import hashlib
 import json
 import math
 import os
 import re
+import select
 import selectors
 import signal
+import socket
 import stat
 import struct
 import subprocess
@@ -143,8 +146,6 @@ PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS = 5
 PROCESS_TREE_TERM_GRACE_SECONDS = 1
 WINDOWS_CREATE_SUSPENDED = 0x00000004
 WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-LINUX_PR_SET_CHILD_SUBREAPER = 36
-LINUX_PR_GET_CHILD_SUBREAPER = 37
 
 
 @dataclass(frozen=True)
@@ -171,8 +172,8 @@ class ExecutionIntegrityError(TraceError):
 class _ProcessContainment:
     process: Any
     linux_root_pidfd: int | None = None
+    linux_namespace_pidfd: int | None = None
     linux_lock_held: bool = False
-    linux_prior_subreaper: int | None = None
     linux_exec_released: bool = False
     test_process_group_id: int | None = None
     job_handle: int | None = None
@@ -196,8 +197,9 @@ class _ContainmentCleanup:
     quiescence_proven: bool
 
 
-_LINUX_SUBREAPER_LOCK = threading.Lock()
-_LINUX_SUBREAPER_POISONED = False
+_LINUX_HELPER_LOCK = threading.Lock()
+_LINUX_HELPER_POISONED = False
+_LINUX_POISONED_CONTAINMENT: _ProcessContainment | None = None
 _TEST_PROCESS_GROUP_CONTAINMENT = threading.local()
 
 
@@ -905,70 +907,105 @@ def _test_only_process_group_containment() -> Iterable[None]:
         _TEST_PROCESS_GROUP_CONTAINMENT.enabled = previous
 
 
-class _LinuxForkExecProcess:
+class _LinuxNativeHelperProcess:
     def __init__(
             self,
             command: list[str],
             pid: int,
             *,
-            barrier_fd: int,
-            exec_error_fd: int,
+            protocol_socket: socket.socket,
             stdin_fd: int | None,
             stdout_fd: int | None,
             stderr_fd: int | None):
         self.args = command
         self.pid = pid
         self.returncode = None
-        self._barrier_fd = barrier_fd
-        self._exec_error_fd = exec_error_fd
+        self.root_pidfd = None
+        self.namespace_pidfd = None
+        self.completion_proven = False
+        self.launch_primary_error = None
+        self.launch_integrity_failures = []
+        self._protocol_socket = protocol_socket
         self._stdin_fd = stdin_fd
         self._stdout_fd = stdout_fd
         self._stderr_fd = stderr_fd
 
+    def _receive_protocol(self, expected: bytes, *, receive_pidfd: bool = False) -> None:
+        item_size = array.array("i").itemsize
+        data, ancillary, flags, _address = self._protocol_socket.recvmsg(
+            128,
+            socket.CMSG_SPACE(item_size),
+            getattr(socket, "MSG_CMSG_CLOEXEC", 0),
+        )
+        received = []
+        for level, kind, content in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptor_bytes = array.array("i")
+                descriptor_bytes.frombytes(content[:item_size])
+                received.extend(descriptor_bytes)
+        if flags != 0 or data != expected:
+            for descriptor in received:
+                os.close(descriptor)
+            raise TraceError(
+                f"Linux containment helper protocol expected {expected.decode('ascii')}")
+        if receive_pidfd:
+            if len(received) != 1:
+                for descriptor in received:
+                    os.close(descriptor)
+                raise TraceError("Linux containment helper did not provide one namespace pidfd")
+            self.namespace_pidfd = received[0]
+        elif received:
+            for descriptor in received:
+                os.close(descriptor)
+            raise TraceError("Linux containment helper sent an unexpected descriptor")
+
     def release_exec(self) -> None:
-        try:
-            os.write(self._barrier_fd, b"1")
-        finally:
-            os.close(self._barrier_fd)
-            self._barrier_fd = -1
-        error_bytes = bytearray()
-        try:
-            while True:
-                chunk = os.read(self._exec_error_fd, 4096)
-                if not chunk:
-                    break
-                error_bytes.extend(chunk)
-        finally:
-            os.close(self._exec_error_fd)
-            self._exec_error_fd = -1
-        if error_bytes:
-            self.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
-            raise OSError(error_bytes.decode("ascii", "strict"))
+        self._receive_protocol(b"READY")
+        self._protocol_socket.sendall(b"PREPARE")
+        self._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self._protocol_socket.sendall(b"EXEC")
+        self._receive_protocol(b"RELEASED")
 
     def abort_blocked(self) -> _ContainmentCleanup:
         failures = []
-        if self._barrier_fd >= 0:
-            try:
-                os.close(self._barrier_fd)
-                self._barrier_fd = -1
-            except BaseException as error:
-                failures.append(_IntegrityFailure("linux-exec-barrier-close", error))
         try:
-            self.kill()
+            self._protocol_socket.shutdown(socket.SHUT_RDWR)
         except BaseException as error:
-            failures.append(_IntegrityFailure("linux-blocked-child-termination", error))
+            failures.append(_IntegrityFailure("linux-helper-protocol-shutdown", error))
+            try:
+                self._protocol_socket.close()
+            except BaseException as close_error:
+                failures.append(_IntegrityFailure(
+                    "linux-process-fd-close:protocol", close_error))
+            self._protocol_socket = None
         try:
             self.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
         except BaseException as error:
             failures.append(_IntegrityFailure("linux-blocked-child-reap", error))
+            if self._protocol_socket is not None:
+                try:
+                    self._protocol_socket.close()
+                except BaseException as close_error:
+                    failures.append(_IntegrityFailure(
+                        "linux-process-fd-close:protocol", close_error))
+                self._protocol_socket = None
+            try:
+                self.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
+            except BaseException as retry_error:
+                failures.append(_IntegrityFailure("linux-blocked-child-reap-retry", retry_error))
         return _ContainmentCleanup(failures, not failures and self.returncode is not None)
 
     def close_streams(self) -> list[_IntegrityFailure]:
         failures = []
-        for attribute in (
-                "_barrier_fd", "_exec_error_fd", "_stdin_fd", "_stdout_fd", "_stderr_fd"):
+        if self._protocol_socket is not None:
+            try:
+                self._protocol_socket.close()
+            except BaseException as error:
+                failures.append(_IntegrityFailure("linux-process-fd-close:protocol", error))
+            self._protocol_socket = None
+        for attribute in ("_stdin_fd", "_stdout_fd", "_stderr_fd"):
             descriptor = getattr(self, attribute)
-            if descriptor is None or descriptor < 0:
+            if descriptor is None:
                 continue
             try:
                 os.close(descriptor)
@@ -977,7 +1014,7 @@ class _LinuxForkExecProcess:
                     f"linux-process-fd-close:{attribute.removeprefix('_').removesuffix('_fd')}",
                     error,
                 ))
-            setattr(self, attribute, -1 if attribute in {"_barrier_fd", "_exec_error_fd"} else None)
+            setattr(self, attribute, None)
         return failures
 
     def poll(self) -> int | None:
@@ -1004,7 +1041,7 @@ class _LinuxForkExecProcess:
 
     def kill(self) -> None:
         if self.poll() is None:
-            os.kill(self.pid, signal.SIGKILL)
+            raise TraceError("owned Linux helper termination requires its stable pidfd")
 
     def communicate(
             self,
@@ -1073,6 +1110,8 @@ class _LinuxForkExecProcess:
                 if not selector.get_map() and self.poll() is None:
                     time.sleep(0.01)
             self.wait(timeout=0)
+            self._receive_protocol(b"COMPLETE")
+            self.completion_proven = True
         finally:
             selector.close()
         self._stdout_fd = None
@@ -1100,189 +1139,175 @@ def _linux_child_file_descriptors(
         return None, descriptor
     if mode == subprocess.STDOUT and target_fd == 2:
         return None, subprocess.STDOUT
-    raise TraceError("Linux fork/exec containment received unsupported stream controls")
+    raise TraceError("Linux native helper containment received unsupported stream controls")
 
 
-def _start_linux_blocked_process(command: list[str], launch: dict[str, Any]) -> _LinuxForkExecProcess:
+def _all_catchable_signals() -> set[int]:
+    return {
+        int(member) for member in signal.valid_signals()
+        if int(member) not in {signal.SIGKILL, signal.SIGSTOP}
+    }
+
+
+def _start_linux_native_helper_process(
+        command: list[str],
+        launch: dict[str, Any],
+) -> _LinuxNativeHelperProcess:
     controls = dict(launch)
-    unknown_controls = set(controls) - {
-        "cwd", "env", "executable", "pass_fds", "stderr", "stdin", "stdout"}
-    if unknown_controls:
-        raise TraceError(
-            f"Linux fork/exec containment received unsupported controls: {sorted(unknown_controls)}")
-    executable = str(controls.pop("executable", command[0]))
+    helper_path = str(controls.pop("_containment_helper_path"))
+    helper_descriptor = int(controls.pop("_containment_helper_descriptor"))
+    target_executable = str(controls.pop("executable", command[0]))
     pass_fds = tuple(int(fd) for fd in controls.pop("pass_fds", ()))
     environment = controls.pop("env", None)
     working_directory = controls.pop("cwd", None)
-    opened_descriptors = set()
+    if working_directory is not None:
+        raise TraceError("Linux native containment helper does not support cwd")
+    unknown_controls = set(controls) - {"stderr", "stdin", "stdout"}
+    if unknown_controls:
+        raise TraceError(
+            f"Linux native containment helper received unsupported controls: {sorted(unknown_controls)}")
+    parent_socket = None
+    child_socket = None
+    inheritable_before = {}
+    stdin_parent = None
+    stdin_child = None
+    stdout_parent = None
+    stdout_child = None
+    stderr_parent = None
+    stderr_child = None
+    process = None
+    primary_error = None
+    integrity_failures = []
     try:
         stdin_parent, stdin_child = _linux_child_file_descriptors(controls.pop("stdin", None), 0)
-        opened_descriptors.update(
-            descriptor for descriptor in (stdin_parent, stdin_child)
-            if descriptor is not None and descriptor != subprocess.STDOUT)
         stdout_parent, stdout_child = _linux_child_file_descriptors(controls.pop("stdout", None), 1)
-        opened_descriptors.update(
-            descriptor for descriptor in (stdout_parent, stdout_child)
-            if descriptor is not None and descriptor != subprocess.STDOUT)
         stderr_parent, stderr_child = _linux_child_file_descriptors(controls.pop("stderr", None), 2)
-        opened_descriptors.update(
-            descriptor for descriptor in (stderr_parent, stderr_child)
-            if descriptor is not None and descriptor != subprocess.STDOUT)
-        barrier_read, barrier_write = os.pipe()
-        opened_descriptors.update((barrier_read, barrier_write))
-        error_read, error_write = os.pipe()
-        opened_descriptors.update((error_read, error_write))
-        os.set_inheritable(error_write, False)
+        parent_socket, child_socket = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        parent_socket.settimeout(PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
         child_descriptors = [
             descriptor for descriptor in (stdin_child, stdout_child, stderr_child)
             if descriptor is not None and descriptor != subprocess.STDOUT]
         if any(descriptor <= 2 for descriptor in child_descriptors):
-            raise TraceError("Linux fork/exec containment requires intact standard descriptors")
-    except BaseException:
-        for descriptor in opened_descriptors:
+            raise TraceError("Linux native containment helper requires intact standard descriptors")
+        inherited = {child_socket.fileno(), *pass_fds}
+        for descriptor in inherited:
+            inheritable_before[descriptor] = os.get_inheritable(descriptor)
+            os.set_inheritable(descriptor, True)
+        helper_argv = [
+            helper_path,
+            "--protocol-fd", str(child_socket.fileno()),
+            "--expected-parent", str(os.getpid()),
+            "--exec-path", target_executable,
+        ]
+        for descriptor in pass_fds:
+            helper_argv.extend(("--keep-fd", str(descriptor)))
+        helper_argv.append("--")
+        helper_argv.extend(command)
+        file_actions = []
+        for child_fd, target_fd in (
+                (stdin_child, 0), (stdout_child, 1), (stderr_child, 2)):
+            if child_fd == subprocess.STDOUT:
+                file_actions.append((os.POSIX_SPAWN_DUP2, 1, 2))
+            elif child_fd is not None:
+                file_actions.append((os.POSIX_SPAWN_DUP2, child_fd, target_fd))
+        helper_exec_path = f"/proc/self/fd/{helper_descriptor}"
+        process_id = os.posix_spawn(
+            helper_exec_path,
+            helper_argv,
+            os.environ if environment is None else environment,
+            file_actions=file_actions,
+            setsigmask=_all_catchable_signals(),
+            setsigdef=_all_catchable_signals(),
+        )
+        process = _LinuxNativeHelperProcess(
+            command,
+            process_id,
+            protocol_socket=parent_socket,
+            stdin_fd=stdin_parent,
+            stdout_fd=stdout_parent,
+            stderr_fd=stderr_parent,
+        )
+        parent_socket = None
+        stdin_parent = None
+        stdout_parent = None
+        stderr_parent = None
+        process.root_pidfd = _linux_open_pidfd(process_id)
+    except BaseException as error:
+        primary_error = error
+    for descriptor, previous in inheritable_before.items():
+        try:
+            os.set_inheritable(descriptor, previous)
+        except BaseException as error:
+            integrity_failures.append(_IntegrityFailure(
+                "linux-launch-descriptor-inheritability-restore", error))
+    if child_socket is not None:
+        try:
+            child_socket.close()
+        except BaseException as error:
+            integrity_failures.append(_IntegrityFailure(
+                "linux-helper-child-protocol-close", error))
+    for component, descriptor in (
+            ("stdin", stdin_child),
+            ("stdout", stdout_child),
+            ("stderr", stderr_child)):
+        if descriptor is not None and descriptor != subprocess.STDOUT:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
-        raise
-    try:
-        process_id = os.fork()
-    except BaseException:
-        for descriptor in opened_descriptors:
-            os.close(descriptor)
-        raise
-    if process_id == 0:
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure(
+                    f"linux-helper-child-{component}-close", error))
+    if process is not None:
+        process.launch_primary_error = primary_error
+        process.launch_integrity_failures = integrity_failures
+        return process
+    if parent_socket is not None:
         try:
-            os.close(barrier_write)
-            os.close(error_read)
-            for parent_fd in (stdin_parent, stdout_parent, stderr_parent):
-                if parent_fd is not None:
-                    os.close(parent_fd)
-            for child_fd, target_fd in (
-                    (stdin_child, 0), (stdout_child, 1), (stderr_child, 2)):
-                if child_fd == subprocess.STDOUT:
-                    os.dup2(1, 2)
-                elif child_fd is not None:
-                    os.dup2(child_fd, target_fd)
-            for descriptor in pass_fds:
-                os.set_inheritable(descriptor, True)
-            keep = {0, 1, 2, barrier_read, error_write, *pass_fds}
-            for descriptor_name in os.listdir("/proc/self/fd"):
-                descriptor = int(descriptor_name)
-                if descriptor not in keep:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        pass
-            if os.read(barrier_read, 1) != b"1":
-                os._exit(126)
-            os.close(barrier_read)
-            if working_directory is not None:
-                os.chdir(working_directory)
-            os.execve(executable, command, os.environ if environment is None else environment)
+            parent_socket.close()
         except BaseException as error:
+            integrity_failures.append(_IntegrityFailure(
+                "linux-helper-parent-protocol-close", error))
+    for component, descriptor in (
+            ("stdin", stdin_parent),
+            ("stdout", stdout_parent),
+            ("stderr", stderr_parent)):
+        if descriptor is not None:
             try:
-                os.write(error_write, f"{type(error).__name__}: {error}".encode("ascii", "backslashreplace"))
-            finally:
-                os._exit(127)
-    process = _LinuxForkExecProcess(
-        command,
-        process_id,
-        barrier_fd=barrier_write,
-        exec_error_fd=error_read,
-        stdin_fd=stdin_parent,
-        stdout_fd=stdout_parent,
-        stderr_fd=stderr_parent,
-    )
-    parent_close_failures = []
-    for descriptor, component in (
-            (barrier_read, "linux-parent-barrier-read-close"),
-            (error_write, "linux-parent-error-write-close"),
-            (stdin_child, "linux-parent-stdin-child-close"),
-            (stdout_child, "linux-parent-stdout-child-close"),
-            (stderr_child, "linux-parent-stderr-child-close")):
-        if descriptor is None or descriptor == subprocess.STDOUT:
-            continue
-        try:
-            os.close(descriptor)
-        except BaseException as error:
-            parent_close_failures.append(_IntegrityFailure(component, error))
-    if parent_close_failures:
-        primary_failure = parent_close_failures.pop(0)
-        cleanup = process.abort_blocked()
-        parent_close_failures.extend(cleanup.failures)
-        parent_close_failures.extend(process.close_streams())
+                os.close(descriptor)
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure(
+                    f"linux-helper-parent-{component}-close", error))
+    if primary_error is None and not integrity_failures:
+        raise TraceError("Linux native helper launch did not return a process")
+    if primary_error is None:
+        primary_error = integrity_failures.pop(0).error
+    if integrity_failures:
         raise ExecutionIntegrityError(
-            f"Linux blocked-child setup primary failure "
-            f"[{type(primary_failure.error).__name__}: {primary_failure.error}]; "
-            f"secondary integrity failures: {_format_integrity_failures(parent_close_failures)}",
-            primary_error=primary_failure.error,
-            secondary_errors=parent_close_failures,
+            f"Linux helper launch primary failure "
+            f"[{type(primary_error).__name__}: {primary_error}]"
+            + (f"; secondary integrity failures: "
+               f"{_format_integrity_failures(integrity_failures)}" if integrity_failures else ""),
+            primary_error=primary_error,
+            secondary_errors=integrity_failures,
             quiescence_proven=False,
-        ) from primary_failure.error
-    return process
-
-
-def _linux_direct_children() -> set[int]:
-    children = set()
-    task_root = Path("/proc/self/task")
-    if not task_root.is_dir():
-        raise TraceError("Linux subreaper containment requires procfs task children")
-    for task in task_root.iterdir():
-        child_file = task / "children"
-        try:
-            values = child_file.read_text(encoding="ascii").split()
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            raise TraceError(f"cannot read Linux subreaper child ownership: {error}") from error
-        for value in values:
-            try:
-                children.add(int(value))
-            except ValueError as error:
-                raise TraceError("Linux subreaper child ownership is invalid") from error
-    return children
+        ) from primary_error
+    raise primary_error
 
 
 def _linux_task_ids() -> set[int]:
     task_root = Path("/proc/self/task")
     if not task_root.is_dir():
-        raise TraceError("Linux subreaper containment requires procfs task identities")
+        raise TraceError("Linux native containment requires procfs task identities")
     try:
         return {int(task.name) for task in task_root.iterdir()}
     except (OSError, ValueError) as error:
-        raise TraceError(f"cannot read Linux subreaper task identities: {error}") from error
-
-
-def _linux_get_child_subreaper() -> int:
-    libc = ctypes.CDLL(None, use_errno=True)
-    enabled = ctypes.c_int()
-    if libc.prctl(LINUX_PR_GET_CHILD_SUBREAPER, ctypes.byref(enabled), 0, 0, 0) != 0:
-        error_number = ctypes.get_errno()
-        raise TraceError(f"cannot read Linux child subreaper: {os.strerror(error_number)}")
-    if enabled.value not in (0, 1):
-        raise TraceError(f"invalid Linux child subreaper state {enabled.value}")
-    return enabled.value
-
-
-def _linux_set_child_subreaper(value: int) -> None:
-    if value not in (0, 1):
-        raise TraceError(f"invalid Linux child subreaper state {value}")
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(LINUX_PR_SET_CHILD_SUBREAPER, value, 0, 0, 0) != 0:
-        error_number = ctypes.get_errno()
-        raise TraceError(f"cannot set Linux child subreaper: {os.strerror(error_number)}")
-    actual = _linux_get_child_subreaper()
-    if actual != value:
-        raise TraceError(
-            f"Linux child subreaper verification failed: expected {value}, got {actual}")
+        raise TraceError(f"cannot read Linux native containment task identities: {error}") from error
 
 
 def _linux_open_pidfd(process_id: int) -> int:
     opener = getattr(os, "pidfd_open", None)
     sender = getattr(signal, "pidfd_send_signal", None)
     if opener is None or sender is None:
-        raise TraceError("Linux subreaper containment requires pidfd signaling")
+        raise TraceError("Linux native containment requires pidfd signaling")
     try:
         return int(opener(process_id, 0))
     except ProcessLookupError:
@@ -1293,28 +1318,20 @@ def _linux_open_pidfd(process_id: int) -> int:
 
 def _linux_require_pidfd_support() -> None:
     if getattr(os, "pidfd_open", None) is None or getattr(signal, "pidfd_send_signal", None) is None:
-        raise TraceError("Linux subreaper containment requires pidfd signaling")
+        raise TraceError("Linux native containment requires pidfd signaling")
 
 
 def _linux_signal_pidfd(pidfd: int, requested_signal: int) -> None:
     sender = getattr(signal, "pidfd_send_signal", None)
     if sender is None:
-        raise TraceError("Linux subreaper containment requires pidfd signaling")
+        raise TraceError("Linux native containment requires pidfd signaling")
     sender(pidfd, requested_signal)
 
 
-def _linux_reap_owned_descendants(root_pid: int) -> list[_IntegrityFailure]:
-    failures = []
-    for process_id in sorted(_linux_direct_children()):
-        if process_id == root_pid:
-            continue
-        try:
-            os.waitpid(process_id, os.WNOHANG)
-        except ChildProcessError:
-            continue
-        except BaseException as error:
-            failures.append(_IntegrityFailure("linux-descendant-reap", error))
-    return failures
+def _linux_pidfd_has_exited(pidfd: int) -> bool:
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return bool(poller.poll(0))
 
 
 def _linux_signal_owned_children(
@@ -1322,101 +1339,89 @@ def _linux_signal_owned_children(
         requested_signal: int,
 ) -> list[_IntegrityFailure]:
     failures = []
-    root_pid = containment.process.pid
-    try:
-        process_ids = _linux_direct_children()
-    except BaseException as error:
-        return [_IntegrityFailure("linux-child-ownership", error)]
-    for process_id in sorted(process_ids):
-        pidfd = containment.linux_root_pidfd if process_id == root_pid else None
-        close_pidfd = False
+    for component, pidfd in (
+            ("linux-namespace-termination", containment.linux_namespace_pidfd),
+            ("linux-helper-termination", containment.linux_root_pidfd)):
+        if pidfd is None:
+            continue
         try:
-            if pidfd is None:
-                pidfd = _linux_open_pidfd(process_id)
-                close_pidfd = True
             _linux_signal_pidfd(pidfd, requested_signal)
         except ProcessLookupError:
             pass
         except BaseException as error:
-            failures.append(_IntegrityFailure("linux-process-termination", error))
-        finally:
-            if close_pidfd and pidfd is not None:
-                try:
-                    os.close(pidfd)
-                except BaseException as error:
-                    failures.append(_IntegrityFailure("linux-pidfd-close", error))
+            failures.append(_IntegrityFailure(component, error))
     return failures
 
 
-def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
-    global _LINUX_SUBREAPER_POISONED
-    if not _LINUX_SUBREAPER_LOCK.acquire(blocking=False):
-        raise TraceError("Linux subreaper containment is already active")
+def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
+    global _LINUX_HELPER_POISONED
+    if not _LINUX_HELPER_LOCK.acquire(blocking=False):
+        raise TraceError("Linux native containment helper is already active")
+    if _LINUX_HELPER_POISONED:
+        _LINUX_HELPER_LOCK.release()
+        raise TraceError("Linux native containment helper supervisor is not reusable")
     process = None
     pidfd = None
-    prior_subreaper = None
     exec_released = False
     try:
-        if _LINUX_SUBREAPER_POISONED:
-            raise TraceError("Linux subreaper containment supervisor is not reusable")
-        prior_subreaper = _linux_get_child_subreaper()
-        if prior_subreaper != 1:
-            _linux_set_child_subreaper(1)
         _linux_require_pidfd_support()
         if len(_linux_task_ids()) != 1:
-            raise TraceError("Linux subreaper containment requires a single-threaded supervisor")
-        if _linux_direct_children():
-            raise TraceError("Linux subreaper containment process owns unrelated children")
-        process = _start_linux_blocked_process(command, launch)
-        pidfd = _linux_open_pidfd(process.pid)
+            raise TraceError("Linux native containment requires a single-threaded Python supervisor")
+        process = _start_linux_native_helper_process(command, launch)
+        pidfd = process.root_pidfd
         containment = _ProcessContainment(
             process=process,
             linux_root_pidfd=pidfd,
             linux_lock_held=True,
-            linux_prior_subreaper=prior_subreaper,
         )
+        if process.launch_primary_error is not None or process.launch_integrity_failures:
+            launch_primary = process.launch_primary_error
+            launch_failures = list(process.launch_integrity_failures)
+            if launch_primary is None:
+                launch_primary = launch_failures.pop(0).error
+            raise ExecutionIntegrityError(
+                f"Linux helper launch primary failure "
+                f"[{type(launch_primary).__name__}: {launch_primary}]"
+                + (f"; secondary integrity failures: "
+                   f"{_format_integrity_failures(launch_failures)}" if launch_failures else ""),
+                primary_error=launch_primary,
+                secondary_errors=launch_failures,
+                quiescence_proven=False,
+            ) from launch_primary
+        if pidfd is None:
+            raise TraceError("Linux native containment helper identity is unavailable")
+        process.release_exec()
+        if process.namespace_pidfd is None or _linux_pidfd_has_exited(process.namespace_pidfd):
+            raise TraceError("Linux target PID namespace authority is unavailable before exec")
+        containment.linux_namespace_pidfd = process.namespace_pidfd
         exec_released = True
         containment.linux_exec_released = True
-        process.release_exec()
         return containment
     except BaseException as primary_error:
         failures = []
-        startup_quiescence_proven = False
         if isinstance(primary_error, ExecutionIntegrityError):
             failures.extend(primary_error.secondary_errors)
-            startup_quiescence_proven = primary_error.quiescence_proven
             primary_error = primary_error.primary_error or primary_error
         if process is not None:
             failed_containment = _ProcessContainment(
                 process=process,
                 linux_root_pidfd=pidfd,
+                linux_namespace_pidfd=process.namespace_pidfd,
                 linux_lock_held=True,
-                linux_prior_subreaper=prior_subreaper,
                 linux_exec_released=exec_released,
             )
-            if exec_released:
+            if process.namespace_pidfd is not None or exec_released:
                 cleanup = _terminate_process_tree(failed_containment)
-                failures.extend(cleanup.failures)
-                startup_quiescence_proven = cleanup.quiescence_proven
             else:
                 cleanup = process.abort_blocked()
-                failures.extend(cleanup.failures)
-                startup_quiescence_proven = cleanup.quiescence_proven
+            failures.extend(cleanup.failures)
             close_failures = _close_process_containment(
                 failed_containment,
-                quiescence_proven=startup_quiescence_proven,
+                quiescence_proven=cleanup.quiescence_proven,
             )
             failures.extend(close_failures)
-            startup_quiescence_proven = (
-                pidfd is not None and startup_quiescence_proven and not close_failures)
         else:
-            if prior_subreaper is not None:
-                try:
-                    _linux_set_child_subreaper(prior_subreaper)
-                except BaseException as error:
-                    _LINUX_SUBREAPER_POISONED = True
-                    failures.append(_IntegrityFailure("linux-subreaper-restore", error))
-            _LINUX_SUBREAPER_LOCK.release()
+            _LINUX_HELPER_LOCK.release()
         if failures:
             raise ExecutionIntegrityError(
                 f"Linux containment startup primary failure "
@@ -1424,7 +1429,7 @@ def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -
                 f"secondary integrity failures: {_format_integrity_failures(failures)}",
                 primary_error=primary_error,
                 secondary_errors=failures,
-                quiescence_proven=startup_quiescence_proven,
+                quiescence_proven=False,
             ) from primary_error
         if process is not None:
             raise ExecutionIntegrityError(
@@ -1432,7 +1437,7 @@ def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -
                 f"[{type(primary_error).__name__}: {primary_error}]",
                 primary_error=primary_error,
                 secondary_errors=[],
-                quiescence_proven=startup_quiescence_proven,
+                quiescence_proven=False,
             ) from primary_error
         raise
 
@@ -1441,7 +1446,7 @@ def _start_contained_process(command: list[str], launch: dict[str, Any]) -> _Pro
     if sys.platform == "win32":
         return _start_windows_job_process(command, launch)
     if sys.platform == "linux":
-        return _start_linux_subreaper_process(command, launch)
+        return _start_linux_native_helper(command, launch)
     if sys.platform == "darwin" and getattr(_TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False):
         launch["start_new_session"] = True
         process = subprocess.Popen(command, **launch)
@@ -1497,10 +1502,10 @@ def _process_tree_is_quiescent(containment: _ProcessContainment) -> bool:
     if containment.job_handle is not None:
         return _windows_job_active_processes(containment.job_handle) == 0
     if containment.linux_lock_held:
-        reap_failures = _linux_reap_owned_descendants(containment.process.pid)
-        if reap_failures:
-            raise reap_failures[0].error
-        return containment.process.poll() is not None and not _linux_direct_children()
+        helper_exited = containment.process.poll() is not None
+        if containment.linux_namespace_pidfd is None:
+            return helper_exited and not containment.linux_exec_released
+        return helper_exited and _linux_pidfd_has_exited(containment.linux_namespace_pidfd)
     if containment.test_process_group_id is not None:
         return not _test_process_group_exists(containment.test_process_group_id)
     raise TraceError("process containment identity is missing")
@@ -1539,23 +1544,7 @@ def _terminate_process_tree(containment: _ProcessContainment) -> _ContainmentCle
                 failures.append(_IntegrityFailure("direct-child-reap", error))
         except BaseException as error:
             failures.append(_IntegrityFailure("direct-child-reap", error))
-        descendant_term_deadline = min(
-            deadline, time.monotonic() + PROCESS_TREE_TERM_GRACE_SECONDS)
-        failures.extend(_linux_signal_owned_children(containment, signal.SIGTERM))
-        try:
-            _wait_for_process_tree_quiescence(containment, descendant_term_deadline)
-        except BaseException:
-            failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
-            while time.monotonic() < deadline:
-                failures.extend(_linux_reap_owned_descendants(process.pid))
-                try:
-                    if _process_tree_is_quiescent(containment):
-                        break
-                except BaseException as error:
-                    failures.append(_IntegrityFailure("linux-child-ownership", error))
-                    break
-                failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
-                time.sleep(0.01)
+        failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
     elif containment.test_process_group_id is not None:
         try:
             if _test_process_group_exists(containment.test_process_group_id):
@@ -1585,6 +1574,12 @@ def _terminate_process_tree(containment: _ProcessContainment) -> _ContainmentCle
         _wait_for_process_tree_quiescence(containment, deadline)
     except BaseException as error:
         failures.append(_IntegrityFailure("process-tree-quiescence", error))
+    if containment.linux_exec_released and isinstance(
+            process, _LinuxNativeHelperProcess) and not process.completion_proven:
+        failures.append(_IntegrityFailure(
+            "linux-helper-completion",
+            TraceError("Linux native helper did not prove containment teardown"),
+        ))
     quiescence_proven = not failures
     if quiescence_proven:
         try:
@@ -1644,10 +1639,18 @@ def _close_process_containment(
         *,
         quiescence_proven: bool,
 ) -> list[_IntegrityFailure]:
-    global _LINUX_SUBREAPER_POISONED
+    global _LINUX_HELPER_POISONED
+    global _LINUX_POISONED_CONTAINMENT
     if containment is None:
         return []
     failures = []
+    if containment.linux_lock_held and not quiescence_proven:
+        failures.append(_IntegrityFailure(
+            "linux-helper-teardown",
+            TraceError("Linux native helper cannot be released before full tree quiescence")))
+        _LINUX_HELPER_POISONED = True
+        _LINUX_POISONED_CONTAINMENT = containment
+        return failures
     if containment.job_handle is not None:
         try:
             if not _windows_kernel32().CloseHandle(containment.job_handle):
@@ -1659,33 +1662,29 @@ def _close_process_containment(
             _close_windows_process_handle(containment.process)
         except BaseException as error:
             failures.append(_IntegrityFailure("windows-process-handle-close", error))
+    linux_failure_count = len(failures)
     if containment.linux_root_pidfd is not None:
         try:
             os.close(containment.linux_root_pidfd)
             containment.linux_root_pidfd = None
+            if isinstance(containment.process, _LinuxNativeHelperProcess):
+                containment.process.root_pidfd = None
         except BaseException as error:
             failures.append(_IntegrityFailure("linux-root-pidfd-close", error))
-    if isinstance(containment.process, _LinuxForkExecProcess):
+    if containment.linux_namespace_pidfd is not None:
+        try:
+            os.close(containment.linux_namespace_pidfd)
+            containment.linux_namespace_pidfd = None
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-namespace-pidfd-close", error))
+    if isinstance(containment.process, _LinuxNativeHelperProcess):
         failures.extend(containment.process.close_streams())
     if containment.linux_lock_held:
-        if not quiescence_proven:
-            failures.append(_IntegrityFailure(
-                "linux-subreaper-restore",
-                TraceError("Linux child-subreaper state cannot be restored before full tree quiescence")))
-            _LINUX_SUBREAPER_POISONED = True
-        elif containment.linux_prior_subreaper is None:
-            failures.append(_IntegrityFailure(
-                "linux-subreaper-restore",
-                TraceError("Linux child-subreaper prior state is missing")))
-            _LINUX_SUBREAPER_POISONED = True
-        else:
-            try:
-                _linux_set_child_subreaper(containment.linux_prior_subreaper)
-            except BaseException as error:
-                _LINUX_SUBREAPER_POISONED = True
-                failures.append(_IntegrityFailure("linux-subreaper-restore", error))
+        if len(failures) != linux_failure_count:
+            _LINUX_HELPER_POISONED = True
+            _LINUX_POISONED_CONTAINMENT = containment
         containment.linux_lock_held = False
-        _LINUX_SUBREAPER_LOCK.release()
+        _LINUX_HELPER_LOCK.release()
     return failures
 
 
@@ -1787,6 +1786,23 @@ def run_approved_executable(
         label=label,
         executable=True,
     )
+    containment_helper: tuple[ExecutableFileReceipt, int] | None = None
+    if sys.platform == "linux":
+        helper_policy = _validate_containment_helper_policy(
+            runtime_policy.get("containment_helper"),
+            install_root=runtime_policy["install_root"],
+            revision=runtime_policy["revision"],
+            label=label,
+        )
+        containment_helper = _approved_file_identity(
+            Path(helper_policy["path"]),
+            install_root=Path(runtime_policy["install_root"]),
+            expected_owner_uid=runtime_policy["install_owner_uid"],
+            expected_path=helper_policy["path"],
+            expected_sha256=helper_policy["sha256"],
+            label=f"{label} containment helper",
+            executable=True,
+        )
     runtime_files: list[tuple[ExecutableFileReceipt, int]] = []
     containment = None
     result = None
@@ -1808,18 +1824,29 @@ def run_approved_executable(
                 executable=False,
             ))
         verify_approved_executable_identity(path, identity, label=label)
+        if containment_helper is not None:
+            verify_approved_executable_identity(
+                Path(containment_helper[0].path),
+                containment_helper[0],
+                label=f"{label} containment helper",
+            )
         for runtime_identity, _runtime_descriptor in runtime_files:
             verify_approved_executable_identity(
                 Path(runtime_identity.path),
                 runtime_identity,
                 label=f"{label} runtime component",
             )
-        retained_descriptors = (descriptor, *(item[1] for item in runtime_files))
+        retained_descriptors = (
+            descriptor,
+            *(item[1] for item in runtime_files),
+        )
         launch = dict(kwargs)
         if sys.platform != "win32":
             launch["pass_fds"] = retained_descriptors
         if sys.platform == "linux":
             launch["executable"] = f"/proc/self/fd/{descriptor}"
+            launch["_containment_helper_path"] = containment_helper[0].path
+            launch["_containment_helper_descriptor"] = containment_helper[1]
         contained = _run_contained_process(
             command,
             label=label,
@@ -1862,6 +1889,34 @@ def run_approved_executable(
             verify_approved_executable_identity(path, identity, label=label)
         except BaseException as error:
             integrity_failures.append(_IntegrityFailure("executable-path-root", error))
+        if containment_helper is not None:
+            helper_identity, helper_descriptor = containment_helper
+            try:
+                helper_after = os.fstat(helper_descriptor)
+                if (
+                        helper_after.st_dev,
+                        helper_after.st_ino,
+                        helper_after.st_size,
+                        helper_after.st_mtime_ns,
+                        helper_after.st_ctime_ns,
+                ) != (
+                        helper_identity.device,
+                        helper_identity.inode,
+                        helper_identity.byte_count,
+                        helper_identity.modified_ns,
+                        helper_identity.changed_ns,
+                ):
+                    raise TraceError(f"{label} containment helper descriptor changed during execution")
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure("containment-helper-descriptor", error))
+            try:
+                verify_approved_executable_identity(
+                    Path(helper_identity.path),
+                    helper_identity,
+                    label=f"{label} containment helper",
+                )
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure("containment-helper-path-root", error))
         for runtime_identity, runtime_descriptor in runtime_files:
             try:
                 runtime_after = os.fstat(runtime_descriptor)
@@ -1903,21 +1958,28 @@ def run_approved_executable(
         else:
             integrity_failures.append(_IntegrityFailure("launcher-orchestration", error))
     finally:
+        teardown_failures = []
         for _runtime_identity, runtime_descriptor in runtime_files:
             try:
                 os.close(runtime_descriptor)
             except BaseException as error:
-                integrity_failures.append(_IntegrityFailure("runtime-descriptor-close", error))
+                teardown_failures.append(_IntegrityFailure("runtime-descriptor-close", error))
+        if containment_helper is not None:
+            try:
+                os.close(containment_helper[1])
+            except BaseException as error:
+                teardown_failures.append(_IntegrityFailure("containment-helper-descriptor-close", error))
         try:
             os.close(descriptor)
         except BaseException as error:
-            integrity_failures.append(_IntegrityFailure("executable-descriptor-close", error))
+            teardown_failures.append(_IntegrityFailure("executable-descriptor-close", error))
         containment_failures = _close_process_containment(
             containment,
             quiescence_proven=quiescence_proven,
         )
-        integrity_failures.extend(containment_failures)
-        if containment_failures:
+        teardown_failures.extend(containment_failures)
+        integrity_failures.extend(teardown_failures)
+        if teardown_failures:
             quiescence_proven = False
     if result is not None and primary_error is None:
         try:
@@ -1944,8 +2006,9 @@ def run_approved_executable(
 def install_trust_evidence(
         executable: ExecutableFileReceipt,
         runtime_files: list[ExecutableFileReceipt],
+        additional_files: tuple[ExecutableFileReceipt, ...] = (),
 ) -> dict[str, Any]:
-    files = [executable, *runtime_files]
+    files = [executable, *runtime_files, *additional_files]
     if any(item.install_root != executable.install_root or item.owner_uid != executable.owner_uid for item in files):
         raise TraceError("approved install trust evidence spans multiple roots or owners")
     directories: dict[str, tuple[str, int, int, int, int]] = {}
@@ -2084,6 +2147,14 @@ def validate_install_trust_evidence(
                 for component in policy["runtime_receipt"]["components"]
             },
         }
+        if "containment_helper" in policy:
+            helper = _validate_containment_helper_policy(
+                policy["containment_helper"],
+                install_root=install_root,
+                revision=policy["revision"],
+                label="external approval",
+            )
+            expected_files[helper["path"]] = helper["sha256"]
         observed_files = {item["path"]: item["sha256"] for item in files}
         if observed_files != expected_files:
             raise TraceError("install trust files differ from external approval")
@@ -2295,6 +2366,51 @@ def _approval_digest(kind: str, approval_id: str, policy: dict[str, Any]) -> str
     return sha256_bytes(canonical_json(record).encode("ascii"))
 
 
+def _validate_containment_helper_policy(
+        record: object,
+        *,
+        install_root: str,
+        revision: str,
+        label: str,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise TraceError(f"{label} containment helper receipt is missing")
+    _require_exact_keys(
+        record,
+        {"format", "version", "revision", "filename", "sha256"},
+        f"{label} containment helper receipt",
+    )
+    if record["format"] != "dsv41-containment-helper" or record["version"] != 1 or (
+            record["revision"] != revision) or (
+            record["filename"] != "llama-deepseek-v41-containment-helper") or re.fullmatch(
+                r"[0-9a-f]{64}", record.get("sha256", "")) is None:
+        raise TraceError(f"{label} containment helper receipt is invalid")
+    result = dict(record)
+    result["path"] = f"{install_root}/bin/{record['filename']}"
+    return result
+
+
+def approved_containment_helper_identity(
+        policy: dict[str, Any],
+        *,
+        label: str,
+) -> ExecutableFileReceipt:
+    helper = _validate_containment_helper_policy(
+        policy.get("containment_helper"),
+        install_root=policy["install_root"],
+        revision=policy["revision"],
+        label=label,
+    )
+    return approved_executable_identity(
+        Path(helper["path"]),
+        install_root=policy["install_root"],
+        expected_owner_uid=policy["install_owner_uid"],
+        expected_path=helper["path"],
+        expected_sha256=helper["sha256"],
+        label=f"{label} containment helper",
+    )
+
+
 def candidate_exporter_approval(
         approval_id: str,
         *,
@@ -2315,6 +2431,7 @@ def candidate_exporter_approval(
             "install_owner_uid",
             "executable_path",
             "executable_sha256",
+            "containment_helper",
             "runtime_profile",
             "runtime_receipt",
         },
@@ -2335,6 +2452,12 @@ def candidate_exporter_approval(
         policy["executable_path"], "candidate exporter approval executable path")
     if executable_path != f"{install_root}/bin/llama-deepseek-v41-trace":
         raise TraceError("candidate exporter approval executable path is outside its install policy")
+    _validate_containment_helper_policy(
+        policy["containment_helper"],
+        install_root=install_root,
+        revision=policy["revision"],
+        label="candidate exporter approval",
+    )
     profile = policy["runtime_profile"]
     if not isinstance(profile, dict):
         raise TraceError("candidate exporter approval runtime profile is invalid")
@@ -2537,6 +2660,7 @@ def prompt_builder_approval(
             "install_owner_uid",
             "executable_path",
             "executable_sha256",
+            "containment_helper",
             "source_root",
             "runtime_receipt",
             "model_sha256",
@@ -2561,6 +2685,12 @@ def prompt_builder_approval(
     source_root = _approval_path(policy["source_root"], "prompt builder approval source root")
     if executable_path != f"{install_root}/bin/llama-deepseek-v41-prompt-builder":
         raise TraceError("prompt builder approval executable path is outside its install policy")
+    _validate_containment_helper_policy(
+        policy["containment_helper"],
+        install_root=install_root,
+        revision=policy["revision"],
+        label="prompt builder approval",
+    )
     profile = policy["runtime_profile"]
     if not isinstance(profile, dict):
         raise TraceError("prompt builder approval runtime profile is invalid")

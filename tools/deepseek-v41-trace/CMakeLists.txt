@@ -2,7 +2,7 @@ set(TARGET llama-deepseek-v41-trace)
 set(DSV41_INSTALL_COMPONENT DeepSeekV41Trace)
 
 if(NOT BUILD_SHARED_LIBS)
-    message(STATUS "Skipping DeepSeek V4.1 trace exporter because BUILD_SHARED_LIBS is disabled")
+    message(STATUS "Skipping DeepSeek V4.1 trace tools because BUILD_SHARED_LIBS is disabled")
     return()
 endif()
 
@@ -29,6 +29,30 @@ foreach(backend IN LISTS DSV41_BACKEND_TARGETS)
     endif()
 endforeach()
 list(REMOVE_DUPLICATES DSV41_RECEIPT_TARGETS)
+
+set(CONTAINMENT_HELPER_TARGET llama-deepseek-v41-containment-helper)
+add_executable(${CONTAINMENT_HELPER_TARGET} linux-containment-helper.cpp)
+target_compile_features(${CONTAINMENT_HELPER_TARGET} PRIVATE cxx_std_17)
+target_compile_definitions(
+    ${CONTAINMENT_HELPER_TARGET}
+    PRIVATE DSV41_BUILD_REVISION="${DSV41_BUILD_REVISION}")
+set(DSV41_CONTAINMENT_HELPER_RECEIPT
+    "${CMAKE_CURRENT_BINARY_DIR}/dsv41-containment-helper-receipt.json")
+add_custom_command(
+    OUTPUT "${DSV41_CONTAINMENT_HELPER_RECEIPT}"
+    COMMAND
+        ${Python3_EXECUTABLE}
+        "${CMAKE_CURRENT_SOURCE_DIR}/generate-containment-helper-receipt.py"
+        --output "${DSV41_CONTAINMENT_HELPER_RECEIPT}"
+        --helper "$<TARGET_FILE:${CONTAINMENT_HELPER_TARGET}>"
+        --revision "${DSV41_BUILD_REVISION}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/generate-containment-helper-receipt.py"
+        ${CONTAINMENT_HELPER_TARGET}
+    VERBATIM)
+add_custom_target(
+    dsv41-containment-helper-receipt
+    DEPENDS "${DSV41_CONTAINMENT_HELPER_RECEIPT}")
 
 if(WIN32)
     set(DSV41_RUNTIME_PROFILE co-located)
@@ -102,7 +126,7 @@ set_source_files_properties(
     PROPERTIES OBJECT_DEPENDS "${DSV41_RECEIPT_HEADER}")
 
 add_executable(${TARGET} llama-trace.cpp)
-add_dependencies(${TARGET} dsv41-runtime-receipt)
+add_dependencies(${TARGET} dsv41-runtime-receipt dsv41-containment-helper-receipt)
 target_link_libraries(${TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
@@ -117,7 +141,7 @@ endif()
 
 set(PROMPT_TARGET llama-deepseek-v41-prompt-builder)
 add_executable(${PROMPT_TARGET} prompt-builder.cpp)
-add_dependencies(${PROMPT_TARGET} dsv41-runtime-receipt)
+add_dependencies(${PROMPT_TARGET} dsv41-runtime-receipt dsv41-containment-helper-receipt)
 target_link_libraries(${PROMPT_TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 target_include_directories(${PROMPT_TARGET} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_features(${PROMPT_TARGET} PRIVATE cxx_std_17)
@@ -131,6 +155,16 @@ if(NOT WIN32)
 endif()
 
 if(LLAMA_TOOLS_INSTALL)
+    install(
+        TARGETS ${CONTAINMENT_HELPER_TARGET}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT ${DSV41_INSTALL_COMPONENT}
+        PERMISSIONS OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    install(
+        FILES "${DSV41_CONTAINMENT_HELPER_RECEIPT}"
+        DESTINATION "share/deepseek-v41-trace"
+        COMPONENT ${DSV41_INSTALL_COMPONENT}
+        PERMISSIONS OWNER_READ GROUP_READ WORLD_READ)
     install(
         TARGETS ${TARGET}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -155,7 +189,10 @@ endif()
 if(LLAMA_BUILD_TESTS)
     set(MANIFEST_TEST_TARGET test-deepseek41-trace-manifest)
     add_executable(${MANIFEST_TEST_TARGET} llama-trace.cpp)
-    add_dependencies(${MANIFEST_TEST_TARGET} dsv41-runtime-receipt)
+    add_dependencies(
+        ${MANIFEST_TEST_TARGET}
+        dsv41-runtime-receipt
+        dsv41-containment-helper-receipt)
     target_link_libraries(
         ${MANIFEST_TEST_TARGET}
         PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
@@ -206,6 +243,8 @@ if(LLAMA_BUILD_TESTS)
                 -DDSV41_CONFIG=$<CONFIG>
                 -DDSV41_PYTHON=${Python3_EXECUTABLE}
                 -DDSV41_RECEIPT=${DSV41_RECEIPT_JSON}
+                -DDSV41_CONTAINMENT_HELPER=$<TARGET_FILE:${CONTAINMENT_HELPER_TARGET}>
+                -DDSV41_CONTAINMENT_HELPER_RECEIPT=${DSV41_CONTAINMENT_HELPER_RECEIPT}
                 -DDSV41_VERIFY_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/verify-runtime-install.py
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test-install.cmake)
         set_property(TEST test-deepseek41-trace-install PROPERTY LABELS main)

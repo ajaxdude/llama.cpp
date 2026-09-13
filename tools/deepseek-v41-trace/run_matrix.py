@@ -22,6 +22,7 @@ from trace_format import (
     REQUIRED_EXPERT_SLOTS,
     TraceError,
     approval_binding,
+    approved_containment_helper_identity,
     approved_executable_identity,
     approved_prompt_record,
     approved_runtime_file_identities,
@@ -130,6 +131,8 @@ def prepare_prompt(
     )
     runtime_identities = approved_runtime_file_identities(
         builder_policy, label="prompt builder")
+    helper_identity = approved_containment_helper_identity(
+        builder_policy, label="prompt builder")
     expected_source = Path(builder_policy["source_root"]) / "tests" / "corpus" / corpus_name
     if source_corpus != expected_source or sha256_file(source_corpus) != corpus_sha256 or (
             sha256_file(corpus) != corpus_sha256):
@@ -200,7 +203,8 @@ def prepare_prompt(
     if prompt_sha256 != expected_prompt["prompt_sha256"] or (
             prompt_byte_count != expected_prompt["prompt_byte_count"]):
         raise RuntimeError("prompt builder output differs from external approval")
-    trust_evidence = install_trust_evidence(builder_identity, runtime_identities)
+    trust_evidence = install_trust_evidence(
+        builder_identity, runtime_identities, (helper_identity,))
     record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
@@ -313,8 +317,10 @@ def main() -> int:
         )
         candidate_runtime_identities = approved_runtime_file_identities(
             candidate_policy, label="candidate exporter")
+        candidate_helper_identity = approved_containment_helper_identity(
+            candidate_policy, label="candidate exporter")
         candidate_trust = install_trust_evidence(
-            candidate_identity, candidate_runtime_identities)
+            candidate_identity, candidate_runtime_identities, (candidate_helper_identity,))
         prompt_builder = args.llama_prompt_builder
         prompt_identity = approved_executable_identity(
             prompt_builder,
@@ -326,7 +332,10 @@ def main() -> int:
         )
         prompt_runtime_identities = approved_runtime_file_identities(
             prompt_policy, label="prompt builder")
-        prompt_trust = install_trust_evidence(prompt_identity, prompt_runtime_identities)
+        prompt_helper_identity = approved_containment_helper_identity(
+            prompt_policy, label="prompt builder")
+        prompt_trust = install_trust_evidence(
+            prompt_identity, prompt_runtime_identities, (prompt_helper_identity,))
         if args.candidate_revision != candidate_policy["revision"] or (
                 args.base_revision != candidate_policy["base_revision"]) or (
                 args.candidate_diff_sha256 != candidate_policy["diff_sha256"]):

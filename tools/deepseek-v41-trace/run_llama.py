@@ -40,6 +40,7 @@ from trace_format import (
     TraceError,
     TraceVerifier,
     approval_binding,
+    approved_containment_helper_identity,
     approved_executable_identity,
     approved_runtime_file_identities,
     bind_execution_authorization,
@@ -545,7 +546,10 @@ def main() -> int:
         )
         runtime_identities = approved_runtime_file_identities(
             candidate_policy, label="candidate exporter")
-        candidate_trust = install_trust_evidence(exporter_identity, runtime_identities)
+        helper_identity = approved_containment_helper_identity(
+            candidate_policy, label="candidate exporter")
+        candidate_trust = install_trust_evidence(
+            exporter_identity, runtime_identities, (helper_identity,))
         exporter_sha256 = exporter_identity.sha256
         if args.candidate_revision != candidate_policy["revision"] or (
                 args.base_revision != candidate_policy["base_revision"]) or (
