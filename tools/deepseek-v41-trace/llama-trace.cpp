@@ -700,29 +700,40 @@ static json storage_policy_json() {
     };
 }
 
+static void write_manifest_type_probe(const fs::path & path, int argc, char ** argv) {
+    const std::vector<uint8_t> bytes = read_file(path);
+    json manifest = json::parse(bytes.begin(), bytes.end());
+    if (!manifest.is_object()) {
+        throw std::runtime_error("manifest type probe input is not a JSON object");
+    }
+    common_params params;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+#if defined(__linux__)
+    manifest["environment"]["system_info"] = runtime_system_info(params);
+#endif
+    manifest["environment"]["command"] = command_line_json(argc, argv);
+    manifest["config"]["flash_attention"] = flash_attention_enabled(params.flash_attn_type);
+    manifest["storage_policy"] = storage_policy_json();
+
+    const fs::path temp = path.string() + ".tmp";
+    {
+        std::ofstream stream(temp, std::ios::binary | std::ios::trunc);
+        stream << manifest.dump() << '\n';
+        if (!stream) {
+            throw std::runtime_error("cannot write manifest type probe");
+        }
+    }
+    fs::rename(temp, path);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
         if (argc >= 2 && std::string(argv[1]) == "--dsv41-manifest-type-probe") {
-            common_params params;
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-            json probe = {
-                {"environment", {
-                    {"system_info", runtime_system_info(params)},
-                    {"command", command_line_json(argc, argv)},
-                }},
-                {"config", {
-                    {"flash_attention", flash_attention_enabled(params.flash_attn_type)},
-                }},
-            };
-            json audit_reference_probe;
-            bind_memory_audit_metadata(audit_reference_probe, {
-                {"accelerator", json::object()},
-                {"storage", json::object()},
-                {"storage_policy", storage_policy_json()},
-            });
-            probe["storage_policy"] = audit_reference_probe["storage_policy"];
-            std::cout << probe.dump() << '\n';
+            if (argc != 3) {
+                throw std::runtime_error("--dsv41-manifest-type-probe requires a manifest path");
+            }
+            write_manifest_type_probe(argv[2], argc, argv);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {

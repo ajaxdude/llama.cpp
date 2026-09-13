@@ -85,15 +85,17 @@ def reject_forbidden_path(
 
 def require_safe_tmpdir_path(path: Path) -> Path:
     lexical_path = reject_forbidden_path(path, "TMPDIR")
-    require_no_symlink_components(lexical_path, "TMPDIR")
     try:
-        status = os.lstat(lexical_path)
+        status = os.lstat(path)
     except OSError as error:
         raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path") from error
+    if stat.S_ISLNK(status.st_mode):
+        raise PreflightError("TMPDIR must not be a symlink or contain symlink components")
     if not stat.S_ISDIR(status.st_mode):
         raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path")
-    if not os.access(lexical_path, os.W_OK | os.X_OK):
+    if not os.access(path, os.W_OK | os.X_OK):
         raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path")
+    require_no_symlink_components(lexical_path, "TMPDIR")
     return lexical_path
 
 
@@ -621,6 +623,49 @@ def _load_watchdog_module(script: Path) -> object:
     return module
 
 
+def _watchdog_audit_result(
+        lease: dict[str, object],
+        *,
+        watchdog_revision: str,
+        lease_path: Path,
+        heartbeat_path: Path,
+        audit_path: Path,
+        audit_event_count: int,
+        procfs_root: Path = Path("/proc")) -> dict[str, object]:
+    try:
+        heartbeat_record = strict_json_loads(heartbeat_path.read_text(encoding="ascii"))
+        updated = datetime.fromisoformat(str(heartbeat_record["updated_at"]).replace("Z", "+00:00"))
+        heartbeat_unix = int(updated.timestamp())
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise PreflightError(f"canonical watchdog heartbeat is invalid: {error}") from error
+    try:
+        audit_sha256 = sha256_bytes(audit_path.read_bytes())
+    except OSError as error:
+        raise PreflightError(f"cannot hash canonical watchdog audit: {error}") from error
+    watchdog_command = lease.get("watchdog_command")
+    if not isinstance(watchdog_command, str) or not watchdog_command:
+        try:
+            command_bytes = (
+                procfs_root / str(lease["watchdog_pid"]) / "cmdline").read_bytes()
+        except (OSError, KeyError) as error:
+            raise PreflightError(f"cannot read canonical watchdog command: {error}") from error
+        watchdog_command = command_bytes.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        if not watchdog_command:
+            raise PreflightError("canonical watchdog command is empty")
+    result = dict(lease)
+    result.update({
+        "watchdog_revision": watchdog_revision,
+        "lease_path": str(lease_path),
+        "watchdog_command": watchdog_command,
+        "heartbeat_unix": heartbeat_unix,
+        "audit_live_path": str(audit_path),
+        "audit_path": str(audit_path),
+        "audit_sha256": audit_sha256,
+        "audit_event_count": audit_event_count,
+    })
+    return result
+
+
 def _canonical_watchdog_audit(
         repo: Path,
         *,
@@ -689,37 +734,14 @@ def _canonical_watchdog_audit(
         monotonic=monotonic,
         sleeper=sleeper,
     )
-    try:
-        heartbeat_record = strict_json_loads(heartbeat_path.read_text(encoding="ascii"))
-        updated = datetime.fromisoformat(str(heartbeat_record["updated_at"]).replace("Z", "+00:00"))
-        heartbeat_unix = int(updated.timestamp())
-    except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
-        raise PreflightError(f"canonical watchdog heartbeat is invalid: {error}") from error
-    try:
-        audit_sha256 = sha256_bytes(audit_path.read_bytes())
-    except OSError as error:
-        raise PreflightError(f"cannot hash canonical watchdog audit: {error}") from error
-    watchdog_command = lease.get("watchdog_command")
-    if not isinstance(watchdog_command, str) or not watchdog_command:
-        try:
-            command_bytes = (
-                Path("/proc") / str(lease["watchdog_pid"]) / "cmdline").read_bytes()
-        except (OSError, KeyError) as error:
-            raise PreflightError(f"cannot read canonical watchdog command: {error}") from error
-        watchdog_command = command_bytes.replace(b"\0", b" ").decode("utf-8", "replace").strip()
-        if not watchdog_command:
-            raise PreflightError("canonical watchdog command is empty")
-    result = dict(lease)
-    result.update({
-        "watchdog_revision": watchdog_revision,
-        "lease_path": str(lease_path),
-        "watchdog_command": watchdog_command,
-        "heartbeat_unix": heartbeat_unix,
-        "audit_path": str(audit_path),
-        "audit_sha256": audit_sha256,
-        "audit_event_count": len(events),
-    })
-    return result
+    return _watchdog_audit_result(
+        lease,
+        watchdog_revision=watchdog_revision,
+        lease_path=lease_path,
+        heartbeat_path=heartbeat_path,
+        audit_path=audit_path,
+        audit_event_count=len(events),
+    )
 
 
 def watchdog_audit(

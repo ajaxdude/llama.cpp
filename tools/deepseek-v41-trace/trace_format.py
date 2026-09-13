@@ -406,6 +406,15 @@ WATCHDOG_STATE_KEYS = {
     "process_group_status",
     "threshold_reason",
 }
+WATCHDOG_ERROR_CLASSIFICATIONS = {
+    "configuration_error",
+    "internal_error",
+    "launch_error",
+    "lease_error",
+    "procfs_error",
+    "signal_error",
+    "termination_timeout",
+}
 
 
 def validate_watchdog_event(event: Any) -> dict[str, Any]:
@@ -485,7 +494,10 @@ def validate_watchdog_event(event: Any) -> dict[str, Any]:
             raise TraceError("watchdog JSONL classification is invalid")
         if type(event["exit_code"]) is not int:
             raise TraceError("watchdog JSONL exit code is invalid")
-        if "error" in event and (not isinstance(event["error"], str) or not event["error"]):
+        requires_error = event["classification"] in WATCHDOG_ERROR_CLASSIFICATIONS
+        if ("error" in event) != requires_error:
+            raise TraceError("watchdog JSONL error presence does not match classification")
+        if requires_error and (not isinstance(event["error"], str) or not event["error"]):
             raise TraceError("watchdog JSONL error is invalid")
         secondary_errors = event.get("secondary_errors")
         if secondary_errors is not None:
@@ -1203,6 +1215,10 @@ class TraceBundle:
                 "version",
                 "lease_id",
                 "state",
+                "file_device",
+                "file_inode",
+                "file_uid",
+                "file_mode",
                 "lease_path",
                 "watchdog_pid",
                 "watchdog_start_time_utc",
@@ -1233,6 +1249,7 @@ class TraceBundle:
                 "audit_uid",
                 "audit_mode",
                 "audit_fd",
+                "audit_sha256",
                 "audit",
             )
             _require_exact_keys(record["data"], set(required), f"{phase} watchdog audit evidence")
@@ -1241,6 +1258,11 @@ class TraceBundle:
                 raise TraceError(f"{phase} watchdog audit format is invalid")
             if data["state"] != "active":
                 raise TraceError(f"{phase} watchdog audit state is invalid")
+            for key in ("file_device", "file_inode", "file_uid"):
+                if type(data[key]) is not int or data[key] < 0:
+                    raise TraceError(f"{phase} watchdog lease {key} is invalid")
+            if data["file_mode"] != 0o600:
+                raise TraceError(f"{phase} watchdog lease file mode is invalid")
             if not isinstance(data["lease_id"], str) or re.fullmatch(r"[0-9a-f]{32,64}", data["lease_id"]) is None:
                 raise TraceError(f"{phase} watchdog audit lease ID is invalid")
             if type(data["watchdog_pid"]) is not int or data["watchdog_pid"] <= 1:
@@ -1308,6 +1330,8 @@ class TraceBundle:
             jsonl_digest = audit_jsonl.get("sha256", "")
             if not isinstance(jsonl_digest, str) or re.fullmatch(r"[0-9a-f]{64}", jsonl_digest) is None:
                 raise TraceError(f"{phase} watchdog JSONL SHA-256 is invalid")
+            if data["audit_sha256"] != jsonl_digest:
+                raise TraceError(f"{phase} watchdog live and embedded audit SHA-256 differ")
             if audit_jsonl.get("path") != f"audits/{phase}/{jsonl_digest}.jsonl":
                 raise TraceError(f"{phase} watchdog JSONL path is invalid")
             if type(audit_jsonl.get("event_count")) is not int or audit_jsonl["event_count"] < 2:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import importlib.util
 import io
 import json
@@ -9,9 +10,10 @@ import struct
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from argparse import Namespace
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 TRACE_DIR = Path(__file__).parents[1] / "tools" / "deepseek-v41-trace"
 sys.path.insert(0, str(TRACE_DIR))
@@ -224,6 +226,10 @@ AUDIT_RECORDS = {
             "version": trace.WATCHDOG_VERSION,
             "lease_id": "1" * 32,
             "state": "active",
+            "file_device": 1,
+            "file_inode": 2,
+            "file_uid": 1000,
+            "file_mode": 0o600,
             "lease_path": "/run/user/123/watchdog.lease",
             "watchdog_pid": 123,
             "watchdog_start_time_utc": "1970-01-01T00:00:01.000Z",
@@ -254,6 +260,7 @@ AUDIT_RECORDS = {
             "audit_uid": 1000,
             "audit_mode": 0o600,
             "audit_fd": 3,
+            "audit_sha256": WATCHDOG_JSONL_SHA256,
             "audit": {
                 "path": "",
                 "sha256": WATCHDOG_JSONL_SHA256,
@@ -322,6 +329,26 @@ def replace_audit_record(root: Path, phase: str, kind: str, record: dict[str, ob
         json.dumps(manifest_record, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
+
+
+def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, object]]) -> None:
+    records = []
+    for event in events:
+        record = json.loads(json.dumps(event))
+        records.append(record)
+    data = b"".join(
+        (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+        for record in records
+    )
+    digest = trace.sha256_bytes(data)
+    path = root / "audits" / phase / f"{digest}.jsonl"
+    path.write_bytes(data)
+    record = json.loads(json.dumps(AUDIT_RECORDS["watchdog"]))
+    record["data"]["audit_sha256"] = digest
+    record["data"]["audit"]["path"] = f"audits/{phase}/{digest}.jsonl"
+    record["data"]["audit"]["sha256"] = digest
+    record["data"]["audit"]["event_count"] = len(records)
+    replace_audit_record(root, phase, "watchdog", record)
 
 
 def provenance_bytes(prompt: bytes = b"abc") -> bytes:
@@ -1202,21 +1229,41 @@ class TraceFormatTests(unittest.TestCase):
             actual.mkdir()
             link = root / "link"
             link.symlink_to(actual, target_is_directory=True)
+            home = root / "home"
+            (home / "tmp").mkdir(parents=True)
+            literal_home = Path("~/tmp")
             self.assertFalse(unusable.is_dir())
             self.assertFalse(os.access(unusable, os.W_OK | os.X_OK))
+            self.assertFalse(literal_home.is_dir())
+            self.assertFalse(os.access(literal_home, os.W_OK | os.X_OK))
             self.assertTrue(link.is_symlink())
             cases = (
                 (unusable, "original lexical path"),
                 (link, "symlink"),
+                (literal_home, "existing writable directory"),
             )
+
+            def strix_storage(_path: Path, label: str) -> dict[str, object]:
+                if label == "temporary directory":
+                    raise AssertionError("unusable TMPDIR reached storage attestation")
+                return storage_record("/home/test")
+
+            def oracle_storage(
+                    _path: Path,
+                    label: str,
+                    **_kwargs: object) -> dict[str, object]:
+                if label == "temporary directory":
+                    raise AssertionError("unusable TMPDIR reached storage attestation")
+                return metal_storage_record("/Users/oracle/test")
+
             for tmpdir, message in cases:
                 with self.subTest(runtime="strix-rocm", tmpdir=tmpdir), mock.patch.dict(
                         preflight.os.environ,
-                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(tmpdir)},
+                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(tmpdir), "HOME": str(home)},
                         clear=True), mock.patch.object(
                         preflight,
                         "storage_attestation",
-                        return_value=storage_record("/home/test")):
+                        side_effect=strix_storage):
                     with self.assertRaisesRegex(preflight.PreflightError, message):
                         preflight.run_strix_preflight(
                             model=Path("/home/model.gguf"),
@@ -1227,11 +1274,11 @@ class TraceFormatTests(unittest.TestCase):
                         )
                 with self.subTest(runtime="apple-metal", tmpdir=tmpdir), mock.patch.dict(
                         preflight.os.environ,
-                        {"TMPDIR": str(tmpdir)},
+                        {"TMPDIR": str(tmpdir), "HOME": str(home)},
                         clear=True), mock.patch.object(
                         preflight,
                         "darwin_storage_attestation",
-                        return_value=metal_storage_record("/Users/oracle/test")):
+                        side_effect=oracle_storage):
                     with self.assertRaisesRegex(preflight.PreflightError, message):
                         preflight.run_oracle_preflight(
                             model=Path("/Users/oracle/model.gguf"),
@@ -1495,6 +1542,163 @@ class TraceFormatTests(unittest.TestCase):
         self.assertEqual(trace.APPROVED_WATCHDOGS, expected)
         self.assertEqual(preflight.WATCHDOG_VERSION, 2)
         self.assertEqual(trace.WATCHDOG_VERSION, 2)
+
+    def test_canonical_watchdog_artifacts_embed_and_validate(self) -> None:
+        revision = preflight.WATCHDOG_REVISION
+        repository = Path(__file__).parents[1]
+        source = subprocess.check_output(
+            ["git", "show", f"{revision}:scripts/strix_memory_watchdog.py"],
+            cwd=repository,
+        )
+        self.assertEqual(preflight.sha256_bytes(source), preflight.WATCHDOG_SCRIPT_SHA256)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            repo = root / "repo"
+            script = repo / "scripts" / "strix_memory_watchdog.py"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(source)
+            watchdog = preflight._load_watchdog_module(script)
+
+            lease_path = root / "watchdog.lease"
+            heartbeat_path = root / "watchdog.heartbeat"
+            audit_path = root / "watchdog.jsonl"
+            child_command = ["python3", "run_matrix.py"]
+            arguments = [
+                "--soft-gib", "116",
+                "--emergency-gib", "118",
+                "--grace-seconds", "30",
+                "--sample-interval-seconds", "1",
+                "--heartbeat-max-age-seconds", "5",
+                "--lease-path", str(lease_path),
+                "--heartbeat-path", str(heartbeat_path),
+                "--audit-path", str(audit_path),
+                "--",
+                *child_command,
+            ]
+            config = watchdog.parse_args(arguments)
+            paths = config.validate()
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            monotonic_ns = 1_000_000_000
+            procfs = root / "proc"
+            watchdog_pid = os.getpid()
+            guardian_pid = watchdog_pid + 100000
+            child_pid = guardian_pid + 1
+
+            def proc_stat(pid: int, parent: int, group: int, start: int) -> str:
+                fields = ["S", str(parent), str(group), *(["0"] * 16), str(start)]
+                return f"{pid} (test) " + " ".join(fields) + "\n"
+
+            for pid in (watchdog_pid, guardian_pid, child_pid):
+                (procfs / str(pid)).mkdir(parents=True)
+            (procfs / str(watchdog_pid) / "stat").write_text(
+                proc_stat(watchdog_pid, 1, watchdog_pid, 1000), encoding="ascii")
+            (procfs / str(guardian_pid) / "stat").write_text(
+                proc_stat(guardian_pid, watchdog_pid, guardian_pid, 2000), encoding="ascii")
+            (procfs / str(child_pid) / "stat").write_text(
+                proc_stat(child_pid, guardian_pid, guardian_pid, 3000), encoding="ascii")
+            watchdog_argv = [sys.executable, str(script), *arguments]
+            watchdog_cmdline = b"\0".join(os.fsencode(value) for value in watchdog_argv) + b"\0"
+            (procfs / str(watchdog_pid) / "cmdline").write_bytes(watchdog_cmdline)
+            (procfs / str(watchdog_pid) / "exe").symlink_to(Path(sys.executable).resolve())
+            (procfs / str(watchdog_pid) / "cwd").symlink_to(repo)
+
+            class FakeProcess:
+                pid = guardian_pid
+
+                @staticmethod
+                def poll() -> None:
+                    return None
+
+                @staticmethod
+                def wait(timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            guardian = watchdog.GuardianProcess(FakeProcess(), child_pid, -1)
+            snapshot = watchdog.HostSnapshot(
+                128 * 1024 * 1024 * 1024,
+                64 * 1024 * 1024 * 1024,
+                (),
+            )
+            logger = watchdog.AuditLogger(io.StringIO(), wall_clock=lambda: now)
+            logger.open_persistent(audit_path)
+            state = watchdog._state_fields(
+                snapshot, snapshot.used_bytes, None, None, "not_created", "none")
+            logger.emit(
+                "preflight",
+                **state,
+                soft_bytes=config.soft_bytes,
+                emergency_bytes=config.emergency_bytes,
+                strict_ceiling_bytes=watchdog.STRICT_CEILING_BYTES,
+            )
+            manager = watchdog.LeaseManager(
+                config,
+                paths,
+                process_procfs_root=procfs,
+                wall_clock=lambda: now,
+                monotonic_ns=lambda: monotonic_ns,
+            )
+            manager.start(guardian, logger)
+            logger.lease_manager = manager
+            state = watchdog._state_fields(
+                snapshot, snapshot.used_bytes, guardian, None, "active", "none")
+            logger.emit("child_started", **state, command=child_command)
+            logger.heartbeat(state)
+            fd_path = procfs / str(watchdog_pid) / "fd"
+            fd_path.mkdir()
+            (fd_path / str(logger.persistent_identity()["fd"])).symlink_to(audit_path)
+
+            validated = watchdog.validate_active_lease(
+                lease_path,
+                expected_script_path=script,
+                expected_executable_path=Path(sys.executable),
+                expected_soft_bytes=trace.SOFT_MEMORY_LIMIT,
+                expected_emergency_bytes=trace.WATCHDOG_EMERGENCY_LIMIT,
+                expected_procfs_root=Path("/proc"),
+                expected_command=child_command,
+                expected_heartbeat_path=heartbeat_path,
+                expected_audit_path=audit_path,
+                expected_max_heartbeat_age_seconds=5.0,
+                current_process_id=child_pid,
+                process_procfs_root=procfs,
+                monotonic_ns=lambda: monotonic_ns,
+                pidfd_open=lambda _: os.open("/dev/null", os.O_RDONLY),
+            )
+            watchdog_audit = preflight._watchdog_audit_result(
+                validated,
+                watchdog_revision=revision,
+                lease_path=lease_path,
+                heartbeat_path=heartbeat_path,
+                audit_path=audit_path,
+                audit_event_count=2,
+                procfs_root=procfs,
+            )
+            created_unix = int(now.timestamp())
+            audit = {
+                "created_unix": created_unix,
+                "runtime_kind": "strix-rocm",
+                "memory": copy.deepcopy(AUDIT_RECORDS["memory"]["data"]),
+                "swap": copy.deepcopy(AUDIT_RECORDS["swap"]["data"]),
+                "watchdog": watchdog_audit,
+                "environment": copy.deepcopy(AUDIT_RECORDS["memory"]["environment"]),
+                "storage": copy.deepcopy(STORAGE_ATTESTATION),
+                "storage_policy": copy.deepcopy(trace.NO_EXTERNAL_STATE_STORAGE),
+                "accelerator": copy.deepcopy(ACCELERATOR_ATTESTATION),
+            }
+            trace_root = root / "trace"
+            with trace.TraceBundleWriter(trace_root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            audit_sets = {}
+            for phase in ("pre", "post"):
+                paths = preflight.write_audits(root / f"{phase}-audits", audit)
+                preflight.seal_audits(paths)
+                audit_sets[phase] = paths
+            preflight.bind_embedded_audits(trace_root, audit_sets)
+            try:
+                trace.TraceBundle(trace_root)
+            finally:
+                logger.close()
 
     def test_workload_scan_ignores_guarded_process_ancestry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1783,23 +1987,18 @@ class TraceFormatTests(unittest.TestCase):
         ))
         if not binary.is_file():
             self.skipTest("native trace exporter is not built")
-        command = [str(binary), "--dsv41-manifest-type-probe", "argument with space"]
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        native = trace.strict_json_loads(result.stdout)
-        self.assertIsInstance(native["environment"]["command"], str)
-        self.assertEqual(json.loads(native["environment"]["command"]), command)
-        self.assertIs(native["config"]["flash_attention"], True)
-        self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "trace"
-            trace_manifest = manifest("llama.cpp")
-            if sys.platform.startswith("linux"):
-                trace_manifest["environment"]["system_info"] = native["environment"]["system_info"]
-            trace_manifest["environment"]["command"] = native["environment"]["command"]
-            trace_manifest["config"]["flash_attention"] = native["config"]["flash_attention"]
-            trace_manifest["storage_policy"] = native["storage_policy"]
-            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+            root = Path(temp) / "trace with space"
+            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
                 add_required_events(writer)
+            manifest_path = root / trace.MANIFEST_NAME
+            command = [str(binary), "--dsv41-manifest-type-probe", str(manifest_path)]
+            subprocess.run(command, check=True)
+            native = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            self.assertIsInstance(native["environment"]["command"], str)
+            self.assertEqual(json.loads(native["environment"]["command"]), command)
+            self.assertIs(native["config"]["flash_attention"], True)
+            self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
             trace.TraceBundle(root)
 
     def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
@@ -1901,6 +2100,61 @@ class TraceFormatTests(unittest.TestCase):
                 add_required_events(writer)
             trace.TraceBundle(root)
 
+        for field, value, message in (
+                ("file_inode", True, "file_inode is invalid"),
+                ("file_mode", 0o644, "file mode is invalid"),
+                ("audit_sha256", "f" * 64, "live and embedded audit SHA-256 differ")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                for phase in ("pre", "post"):
+                    record = copy.deepcopy(AUDIT_RECORDS["watchdog"])
+                    record["data"]["audit"]["path"] = (
+                        f"audits/{phase}/{WATCHDOG_JSONL_SHA256}.jsonl")
+                    record["data"][field] = value
+                    replace_audit_record(root, phase, "watchdog", record)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
+    def test_enforces_watchdog_final_error_classification(self) -> None:
+        terminal = {
+            key: copy.deepcopy(value)
+            for key, value in WATCHDOG_EVENTS[1].items()
+            if key not in {"command", "event_id", "parent_event_sha256", "record_sha256"}
+        }
+        terminal.update({
+            "event": "final",
+            "classification": "internal_error",
+            "exit_code": 1,
+            "error": "test internal error",
+        })
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            for phase in ("pre", "post"):
+                replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, terminal])
+            trace.TraceBundle(root)
+
+        for classification, error in (
+                ("internal_error", None),
+                ("child_exit", "fabricated error")):
+            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                candidate = copy.deepcopy(terminal)
+                candidate["classification"] = classification
+                if error is None:
+                    candidate.pop("error")
+                else:
+                    candidate["error"] = error
+                for phase in ("pre", "post"):
+                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
+                with self.assertRaisesRegex(trace.TraceError, "error presence does not match"):
+                    trace.TraceBundle(root)
+
     def test_rejects_boolean_accelerator_identities(self) -> None:
         for runtime, field in (
                 ("llama.cpp", "gpu_id"),
@@ -1931,6 +2185,7 @@ class TraceFormatTests(unittest.TestCase):
                 jsonl = root / "audits" / phase / f"{digest}.jsonl"
                 jsonl.write_bytes(data)
                 record = json.loads(json.dumps(AUDIT_RECORDS["watchdog"]))
+                record["data"]["audit_sha256"] = digest
                 record["data"]["audit"]["path"] = f"audits/{phase}/{digest}.jsonl"
                 record["data"]["audit"]["sha256"] = digest
                 record["data"]["audit"]["event_count"] = len(events)
