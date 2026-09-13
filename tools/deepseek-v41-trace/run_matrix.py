@@ -12,6 +12,8 @@ from preflight import PreflightError, require_nvme_path, resolved, run_strix_pre
 from trace_format import (
     ADMITTED_BATCH,
     ADMITTED_UBATCH,
+    APPROVED_CANDIDATE_EXPORTERS,
+    APPROVED_PROMPT_BUILDERS,
     APPROVED_TRACE_SIGNERS,
     CANDIDATE_LANE,
     CORPUS_SHA256,
@@ -19,11 +21,21 @@ from trace_format import (
     REQUIRED_EXPERT_CACHE_MIB,
     REQUIRED_EXPERT_SLOTS,
     TraceError,
+    approval_binding,
+    approved_executable_identity,
+    approved_prompt_record,
+    approved_runtime_file_identities,
+    candidate_exporter_approval,
     execution_authorization,
+    load_executable_approval_policy,
+    prompt_builder_approval,
     reject_loader_overrides,
+    run_approved_executable,
     sha256_file,
     strict_json_loads,
     validate_signing_identity,
+    verify_approved_executable_identity,
+    verify_approved_runtime_file_identities,
 )
 
 CORPORA = (
@@ -46,16 +58,54 @@ def run(command: list[str]) -> None:
         raise RuntimeError(f"command failed with status {result.returncode}")
 
 
+def file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    record = path.stat()
+    return (
+        record.st_dev,
+        record.st_ino,
+        record.st_size,
+        record.st_mtime_ns,
+        record.st_ctime_ns,
+    )
+
+
 def prepare_prompt(
     *,
     builder: Path,
+    builder_approval_id: str,
+    builder_policy: dict[str, object],
+    builder_policy_sha256: str,
     model: Path,
     corpus: Path,
+    source_corpus: Path,
     corpus_name: str,
     corpus_sha256: str,
     output: Path,
-    target_tokens: int,
+    context: int,
+    decode_steps: int,
 ) -> dict[str, object]:
+    target_tokens = context - decode_steps
+    expected_prompt = approved_prompt_record(
+        builder_policy,
+        corpus_name=corpus_name,
+        context=context,
+        decode_steps=decode_steps,
+    )
+    builder_identity = approved_executable_identity(
+        builder,
+        expected_path=builder_policy["executable_path"],
+        expected_sha256=builder_policy["executable_sha256"],
+        label="prompt builder",
+    )
+    runtime_identities = approved_runtime_file_identities(
+        builder_policy, label="prompt builder")
+    expected_source = Path(builder_policy["source_root"]) / "tests" / "corpus" / corpus_name
+    if source_corpus != expected_source or sha256_file(source_corpus) != corpus_sha256 or (
+            sha256_file(corpus) != corpus_sha256):
+        raise RuntimeError("prompt builder corpus path or bytes differ from external approval")
+    source_identity = file_identity(source_corpus)
+    corpus_identity = file_identity(corpus)
+    verify_approved_runtime_file_identities(runtime_identities, label="prompt builder")
     command = [
         str(builder),
         "--model", str(model),
@@ -64,7 +114,23 @@ def prepare_prompt(
         "--tokens", str(target_tokens),
     ]
     print("exec:", " ".join(command), file=sys.stderr)
-    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    result, executed_identity = run_approved_executable(
+        command,
+        path=builder,
+        expected_path=builder_policy["executable_path"],
+        expected_sha256=builder_policy["executable_sha256"],
+        label="prompt builder",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if executed_identity != builder_identity:
+        raise RuntimeError("prompt builder execution identity differs from external approval")
+    verify_approved_executable_identity(builder, builder_identity, label="prompt builder")
+    verify_approved_runtime_file_identities(runtime_identities, label="prompt builder")
+    if file_identity(source_corpus) != source_identity or file_identity(corpus) != corpus_identity or (
+            sha256_file(source_corpus) != corpus_sha256) or sha256_file(corpus) != corpus_sha256:
+        raise RuntimeError("prompt builder corpus changed during execution")
     if result.returncode != 0:
         raise RuntimeError(f"prompt builder failed: {result.stderr.strip()}")
     try:
@@ -84,15 +150,29 @@ def prepare_prompt(
     expected_temporary_directory = os.environ.get("TMPDIR")
     if not expected_temporary_directory or temporary_directory != str(resolved(Path(expected_temporary_directory))):
         raise RuntimeError("prompt builder did not attest the selected temporary directory")
+    prompt_sha256 = sha256_file(output)
+    prompt_byte_count = output.stat().st_size
+    if prompt_sha256 != expected_prompt["prompt_sha256"] or (
+            prompt_byte_count != expected_prompt["prompt_byte_count"]) or (
+            native_record["add_bos"] != expected_prompt["add_bos"]):
+        raise RuntimeError("prompt builder output differs from external approval")
     record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
         "corpus_name": corpus_name,
         "corpus_sha256": corpus_sha256,
+        "corpus_path": str(source_corpus),
         "model_sha256": MODEL_SHA256,
-        "prompt_sha256": sha256_file(output),
-        "prompt_byte_count": output.stat().st_size,
-        "builder_sha256": sha256_file(builder),
+        "prompt_sha256": prompt_sha256,
+        "prompt_byte_count": prompt_byte_count,
+        "context": context,
+        "decode_steps": decode_steps,
+        "builder_approval_id": builder_approval_id,
+        "builder_approval_sha256": builder_policy_sha256,
+        "builder_path": str(builder),
+        "builder_sha256": builder_identity.sha256,
+        "builder_revision": builder_policy["revision"],
+        "builder_runtime_profile": builder_policy["runtime_profile"],
         "target_tokens": target_tokens,
         "actual_tokens": target_tokens,
     }
@@ -120,6 +200,11 @@ def main() -> int:
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--base-revision", required=True)
     parser.add_argument("--candidate-diff-sha256", required=True)
+    parser.add_argument("--candidate-exporter-policy-id", required=True)
+    parser.add_argument("--prompt-builder-policy-id", required=True)
+    parser.add_argument("--approval-policy", type=Path, required=True)
+    parser.add_argument("--approval-signature", type=Path, required=True)
+    parser.add_argument("--approval-principal", required=True)
     parser.add_argument("--llama-only", action="store_true")
     parser.add_argument("--contexts", type=int, nargs="+", default=[32768])
     parser.add_argument("--ubatches", type=int, nargs="+", default=[ADMITTED_UBATCH])
@@ -152,14 +237,52 @@ def main() -> int:
             raise PreflightError(
                 f"DeepSeek V4.1 correctness matrix requires {REQUIRED_EXPERT_CACHE_MIB} MiB expert cache")
         reject_loader_overrides()
+        output_candidate = resolved(args.output)
+        approval_policy = load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(output_candidate,),
+        )
+        candidate_policy, candidate_policy_sha256 = candidate_exporter_approval(
+            args.candidate_exporter_policy_id,
+            policies=approval_policy.candidate_exporters,
+        )
+        prompt_policy, prompt_policy_sha256 = prompt_builder_approval(
+            args.prompt_builder_policy_id,
+            policies=approval_policy.prompt_builders,
+        )
+        approved_executable_identity(
+            args.llama_exporter,
+            expected_path=candidate_policy["executable_path"],
+            expected_sha256=candidate_policy["executable_sha256"],
+            label="candidate exporter",
+        )
+        if args.candidate_revision != candidate_policy["revision"] or (
+                args.base_revision != candidate_policy["base_revision"]) or (
+                args.candidate_diff_sha256 != candidate_policy["diff_sha256"]):
+            raise PreflightError("matrix candidate identity differs from external exporter approval")
         execution_authorization(
             lane=CANDIDATE_LANE,
             challenge=args.execution_challenge,
             run_id=f"{args.run_id_prefix}-preflight",
             issued_unix=args.authorization_issued_unix,
             expires_unix=args.authorization_expires_unix,
+            approval_policy_sha256=approval_policy.sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            approvals={
+                "candidate_exporter": approval_binding(
+                    "candidate_exporter",
+                    args.candidate_exporter_policy_id,
+                    candidate_policy_sha256,
+                ),
+                "prompt_builder": approval_binding(
+                    "prompt_builder",
+                    args.prompt_builder_policy_id,
+                    prompt_policy_sha256,
+                ),
+            },
         )
-        output_candidate = resolved(args.output)
         if not args.llama_only:
             raise PreflightError(
                 "cross-runtime capture must run on separate Strix and Apple hosts; "
@@ -171,6 +294,12 @@ def main() -> int:
             forbidden_root=output_candidate,
         )
         repo = resolved(args.repo)
+        revision = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            stderr=subprocess.STDOUT,
+        ).decode("ascii").strip()
+        if revision != approval_policy.verifier_revision:
+            raise PreflightError("matrix verifier checkout differs from the external approval policy")
         output = require_nvme_path(output_candidate, "matrix output")
         model = require_nvme_path(args.model, "model")
         if not model.is_file():
@@ -189,9 +318,15 @@ def main() -> int:
             repo=repo,
             busy_patterns=args.busy_pattern,
         )
-        prompt_builder = resolved(args.llama_prompt_builder)
-        if not prompt_builder.is_file() or not os.access(prompt_builder, os.X_OK):
-            raise PreflightError(f"prompt builder is not executable: {prompt_builder}")
+        prompt_builder = args.llama_prompt_builder
+        approved_executable_identity(
+            prompt_builder,
+            expected_path=prompt_policy["executable_path"],
+            expected_sha256=prompt_policy["executable_sha256"],
+            label="prompt builder",
+        )
+        if str(repo) != prompt_policy["source_root"] or args.candidate_revision != prompt_policy["revision"]:
+            raise PreflightError("matrix repository or revision differs from prompt builder approval")
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"matrix output directory is not empty: {output}")
         inputs = output / "inputs"
@@ -239,12 +374,17 @@ def main() -> int:
                 )
                 prepared = prepare_prompt(
                     builder=resolved(args.llama_prompt_builder),
+                    builder_approval_id=args.prompt_builder_policy_id,
+                    builder_policy=prompt_policy,
+                    builder_policy_sha256=prompt_policy_sha256,
                     model=model,
                     corpus=Path(corpus["path"]),
+                    source_corpus=Path(corpus["source"]),
                     corpus_name=corpus["name"],
                     corpus_sha256=corpus["sha256"],
                     output=prompt,
-                    target_tokens=target_tokens,
+                    context=context,
+                    decode_steps=args.decode_steps,
                 )
                 prepared.update({"corpus": corpus["name"], "context": context})
                 prepared_prompts[corpus["name"]] = prepared
@@ -276,6 +416,11 @@ def main() -> int:
                         "--candidate-revision", args.candidate_revision,
                         "--base-revision", args.base_revision,
                         "--candidate-diff-sha256", args.candidate_diff_sha256,
+                        "--candidate-exporter-policy-id", args.candidate_exporter_policy_id,
+                        "--prompt-builder-policy-id", args.prompt_builder_policy_id,
+                        "--approval-policy", str(resolved(args.approval_policy)),
+                        "--approval-signature", str(resolved(args.approval_signature)),
+                        "--approval-principal", args.approval_principal,
                         "--output", str(llama_output),
                         "--batch", str(args.batch),
                         "--ubatch", str(ubatch),

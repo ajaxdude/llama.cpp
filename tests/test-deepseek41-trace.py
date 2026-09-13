@@ -41,6 +41,8 @@ TEST_RUN_IDS = {
     "llama.cpp": "strix-llama-test-run",
     "ds4": "apple-ds4-test-run",
 }
+TEST_CANDIDATE_EXPORTER_POLICY_ID = "test-candidate-exporter"
+TEST_PROMPT_BUILDER_POLICY_ID = "test-prompt-builder"
 
 WATCHDOG_EVENTS = [
     {
@@ -363,24 +365,115 @@ def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, objec
     replace_audit_record(root, phase, "watchdog", record)
 
 
-def provenance_bytes(prompt: bytes = b"abc") -> bytes:
+def fixture_prompt_builder_policy(
+        prompt: bytes,
+        *,
+        context: int = 3,
+        decode_steps: int = 1,
+        builder_path: str = "/home/repo/build/bin/llama-deepseek-v41-prompt-builder",
+        builder_sha256: str = "8" * 64,
+        source_root: str = "/home/repo") -> dict[str, object]:
+    runtime_components = [
+        ("ggml", "libggml.so", "4", None),
+        ("ggml-base", "libggml-base.so", "5", "a" * 40),
+        ("ggml-hip", "libggml-hip.so", "6", None),
+        ("llama", "libllama.so", "7", None),
+        ("llama-common", "libllama-common.so", "9", "a" * 40),
+    ]
+    runtime_profile = {
+        "name": "sibling-lib",
+        "components": sorted(component for component, *_rest in runtime_components),
+        "selected_backend_component": "ggml-hip",
+    }
+    return {
+        "runtime": "llama.cpp",
+        "runtime_profile": runtime_profile,
+        "repository": trace.REPOSITORY,
+        "revision": "a" * 40,
+        "install_root": str(Path(builder_path).parent.parent),
+        "executable_path": builder_path,
+        "executable_sha256": builder_sha256,
+        "source_root": source_root,
+        "runtime_receipt": {
+            "format": "dsv41-runtime-receipt",
+            "version": 1,
+            "revision": "a" * 40,
+            "profile": "sibling-lib",
+            "components": [
+                {
+                    "component": component,
+                    "filename": filename,
+                    "sha256": digest * 64,
+                    "revision": revision,
+                }
+                for component, filename, digest, revision in runtime_components
+            ],
+        },
+        "model_sha256": trace.MODEL_SHA256,
+        "corpora": dict(trace.CORPUS_SHA256),
+        "prompts": [{
+            "corpus_name": "correctness-prose.txt",
+            "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
+            "context": context,
+            "decode_steps": decode_steps,
+            "target_tokens": context - decode_steps,
+            "prompt_sha256": trace.sha256_bytes(prompt),
+            "prompt_byte_count": len(prompt),
+            "add_bos": True,
+        }],
+    }
+
+
+def materialize_policy_runtime(policy: dict[str, object]) -> None:
+    library_root = Path(policy["install_root"]) / "lib"
+    library_root.mkdir(parents=True, exist_ok=True)
+    for component in policy["runtime_receipt"]["components"]:
+        path = library_root / component["filename"]
+        path.write_bytes(component["component"].encode("ascii"))
+        component["sha256"] = trace.sha256_file(path)
+
+
+def provenance_bytes(
+        prompt: bytes = b"abc",
+        *,
+        context: int = 3,
+        decode_steps: int = 1) -> bytes:
+    policy = fixture_prompt_builder_policy(prompt, context=context, decode_steps=decode_steps)
+    _validated, policy_sha256 = trace.prompt_builder_approval(
+        TEST_PROMPT_BUILDER_POLICY_ID,
+        policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
+    )
     record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
         "corpus_name": "correctness-prose.txt",
         "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
+        "corpus_path": "/home/repo/tests/corpus/correctness-prose.txt",
         "model_sha256": trace.MODEL_SHA256,
         "prompt_sha256": trace.sha256_bytes(prompt),
         "prompt_byte_count": len(prompt),
-        "target_tokens": 2,
-        "actual_tokens": 2,
+        "context": context,
+        "decode_steps": decode_steps,
+        "target_tokens": context - decode_steps,
+        "actual_tokens": context - decode_steps,
+        "builder_approval_id": TEST_PROMPT_BUILDER_POLICY_ID,
+        "builder_approval_sha256": policy_sha256,
+        "builder_path": policy["executable_path"],
         "builder_sha256": "8" * 64,
+        "builder_revision": "a" * 40,
+        "builder_runtime_profile": policy["runtime_profile"],
     }
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
 
-def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
-    provenance_sha256 = trace.sha256_bytes(provenance_bytes(prompt))
+def manifest(
+        runtime: str = "llama.cpp",
+        prompt: bytes = b"abc",
+        *,
+        context: int = 3,
+        decode_steps: int = 1) -> dict:
+    provenance_sha256 = trace.sha256_bytes(
+        provenance_bytes(prompt, context=context, decode_steps=decode_steps))
     is_ds4 = runtime == "ds4"
     storage = DS4_STORAGE_ATTESTATION if is_ds4 else STORAGE_ATTESTATION
     audit_kinds = ("memory", "swap", "runner") if is_ds4 else ("memory", "swap", "watchdog")
@@ -420,13 +513,6 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
     result = {
         "runtime": runtime,
         "revision": trace.DS4_REVISION if is_ds4 else "a" * 40,
-        "authorization": trace.execution_authorization(
-            lane=trace.ORACLE_LANE if is_ds4 else trace.CANDIDATE_LANE,
-            challenge=TEST_CHALLENGE,
-            run_id=TEST_RUN_IDS[runtime],
-            issued_unix=TEST_AUTH_ISSUED,
-            expires_unix=TEST_AUTH_EXPIRES,
-        ),
         "build": (
             {
                 "compiler": "clang",
@@ -472,15 +558,15 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "byte_count": len(prompt),
             "corpus_name": "correctness-prose.txt",
             "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
-            "target_tokens": 2,
+            "target_tokens": context - decode_steps,
             "provenance": {
                 "path": f"provenance/{provenance_sha256}.json",
                 "sha256": provenance_sha256,
             },
         },
         "config": {
-            "context": 3,
-            "decode_steps": 1,
+            "context": context,
+            "decode_steps": decode_steps,
             "deepseek41": {
                 "layer_count": 40,
                 "vocab_size": 129280,
@@ -511,8 +597,8 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "logits": "byte-identical-f32",
         },
         "expected": {
-            "prompt_tokens": 2,
-            "decode_steps": 1,
+            "prompt_tokens": context - decode_steps,
+            "decode_steps": decode_steps,
             "components": {
                 "prompt.bytes": {"layers": None, "input": "tokens"},
                 "prompt.tokens": {"layers": None, "input": "tokens"},
@@ -579,6 +665,47 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
         result["config"]["prefill_chunk"] = trace.ADMITTED_UBATCH
         result["config"]["device_backend"] = "Metal"
         result["config"]["device_registry_id"] = METAL_ACCELERATOR_ATTESTATION["metal_registry_id"]
+    prompt_policy = fixture_prompt_builder_policy(
+        prompt, context=context, decode_steps=decode_steps)
+    _prompt_policy, prompt_policy_sha256 = trace.prompt_builder_approval(
+        TEST_PROMPT_BUILDER_POLICY_ID,
+        policies={TEST_PROMPT_BUILDER_POLICY_ID: prompt_policy},
+    )
+    approvals = {
+        "prompt_builder": trace.approval_binding(
+            "prompt_builder", TEST_PROMPT_BUILDER_POLICY_ID, prompt_policy_sha256),
+    }
+    if not is_ds4:
+        candidate_policy = {
+            "runtime": "llama.cpp",
+            "repository": trace.REPOSITORY,
+            "revision": result["candidate"]["revision"],
+            "base_revision": result["candidate"]["base_revision"],
+            "diff_sha256": result["candidate"]["diff_sha256"],
+            "install_root": "/home/repo/build",
+            "executable_path": result["candidate"]["executable_path"],
+            "executable_sha256": result["candidate"]["executable_sha256"],
+            "runtime_profile": copy.deepcopy(result["build"]["runtime_profile"]),
+            "runtime_receipt": runtime_receipt,
+        }
+        _candidate_policy, candidate_policy_sha256 = trace.candidate_exporter_approval(
+            TEST_CANDIDATE_EXPORTER_POLICY_ID,
+            policies={TEST_CANDIDATE_EXPORTER_POLICY_ID: candidate_policy},
+        )
+        result["candidate"]["exporter_approval_id"] = TEST_CANDIDATE_EXPORTER_POLICY_ID
+        result["candidate"]["exporter_approval_sha256"] = candidate_policy_sha256
+        approvals["candidate_exporter"] = trace.approval_binding(
+            "candidate_exporter", TEST_CANDIDATE_EXPORTER_POLICY_ID, candidate_policy_sha256)
+    result["authorization"] = trace.execution_authorization(
+        lane=trace.ORACLE_LANE if is_ds4 else trace.CANDIDATE_LANE,
+        challenge=TEST_CHALLENGE,
+        run_id=TEST_RUN_IDS[runtime],
+        issued_unix=TEST_AUTH_ISSUED,
+        expires_unix=TEST_AUTH_EXPIRES,
+        approval_policy_sha256="e" * 64,
+        verifier_revision="a" * 40,
+        approvals=approvals,
+    )
     return result
 
 
@@ -595,7 +722,11 @@ def add_required_events(writer: object, logits: bytes | None = None, prompt: byt
             (audit_root / f"{WATCHDOG_JSONL_SHA256}.jsonl").write_bytes(WATCHDOG_JSONL)
     provenance_root = writer.root / "provenance"
     provenance_root.mkdir(exist_ok=True)
-    data = provenance_bytes(prompt)
+    data = provenance_bytes(
+        prompt,
+        context=writer.manifest["config"]["context"],
+        decode_steps=writer.manifest["config"]["decode_steps"],
+    )
     (provenance_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
     writer.add_event(
         component="prompt.bytes",
@@ -887,12 +1018,60 @@ class TraceFormatTests(unittest.TestCase):
             cls,
             runtime: str,
             *,
+            manifest_record: dict[str, object] | None = None,
             expected_challenge: str = TEST_CHALLENGE,
             expected_run_id: str | None = None,
             verification_unix: int | None = None,
             seen_run_ids: set[str] | None = None) -> trace.TraceVerifier:
         principal = cls.signer_principals[runtime]
         policy = cls.test_signers[principal]
+        manifest_record = manifest_record or manifest(runtime)
+        prompt_policy = fixture_prompt_builder_policy(b"abc")
+        prompt_policy["prompts"][0].update({
+            "corpus_name": manifest_record["prompt"]["corpus_name"],
+            "corpus_sha256": manifest_record["prompt"]["corpus_sha256"],
+            "context": manifest_record["config"]["context"],
+            "decode_steps": manifest_record["config"]["decode_steps"],
+            "target_tokens": manifest_record["prompt"]["target_tokens"],
+            "prompt_sha256": manifest_record["prompt"]["sha256"],
+            "prompt_byte_count": manifest_record["prompt"]["byte_count"],
+        })
+        prompt_policies = {TEST_PROMPT_BUILDER_POLICY_ID: prompt_policy}
+        candidate_policies = {}
+        candidate_policy_id = None
+        if runtime == "llama.cpp":
+            receipt = {
+                "format": "dsv41-runtime-receipt",
+                "version": 1,
+                "revision": manifest_record["candidate"]["revision"],
+                "profile": manifest_record["build"]["runtime_profile"]["name"],
+                "components": sorted(
+                    [
+                        {
+                            "component": library["component"],
+                            "filename": library["filename"],
+                            "sha256": library["sha256"],
+                            "revision": library["revision"],
+                        }
+                        for library in manifest_record["build"]["runtime_libraries"]
+                    ],
+                    key=lambda item: item["component"],
+                ),
+            }
+            candidate_policy = {
+                "runtime": "llama.cpp",
+                "repository": manifest_record["candidate"]["repository"],
+                "revision": manifest_record["candidate"]["revision"],
+                "base_revision": manifest_record["candidate"]["base_revision"],
+                "diff_sha256": manifest_record["candidate"]["diff_sha256"],
+                "install_root": "/home/repo/build",
+                "executable_path": manifest_record["candidate"]["executable_path"],
+                "executable_sha256": manifest_record["candidate"]["executable_sha256"],
+                "runtime_profile": copy.deepcopy(manifest_record["build"]["runtime_profile"]),
+                "runtime_receipt": receipt,
+            }
+            candidate_policies[TEST_CANDIDATE_EXPORTER_POLICY_ID] = candidate_policy
+            candidate_policy_id = TEST_CANDIDATE_EXPORTER_POLICY_ID
         return trace.TraceVerifier.for_tests(
             principal,
             policy["public_key"],
@@ -901,6 +1080,10 @@ class TraceFormatTests(unittest.TestCase):
             runtime_profile=policy["runtime_profile"],
             expected_challenge=expected_challenge,
             expected_run_id=expected_run_id or TEST_RUN_IDS[runtime],
+            candidate_exporter_policies=candidate_policies,
+            prompt_builder_policies=prompt_policies,
+            expected_candidate_exporter_policy_id=candidate_policy_id,
+            expected_prompt_builder_policy_id=TEST_PROMPT_BUILDER_POLICY_ID,
             verification_unix=verification_unix or int(time.time()),
             ssh_keygen=cls.ssh_keygen,
             seen_run_ids=seen_run_ids,
@@ -925,6 +1108,12 @@ class TraceFormatTests(unittest.TestCase):
             runtime = manifest_record["runtime"]
             principal = self.signer_principals[runtime]
             authorization = manifest_record["authorization"]
+            verifier = self._verifier_for_runtime(
+                runtime,
+                manifest_record=manifest_record,
+                expected_challenge=authorization["challenge"],
+                expected_run_id=authorization["run_id"],
+            )
             trace.seal_bundle(
                 Path(root),
                 private_key=self.signing_keys[runtime],
@@ -932,17 +1121,19 @@ class TraceFormatTests(unittest.TestCase):
                 expected_lane=authorization["lane"],
                 expected_challenge=authorization["challenge"],
                 expected_run_id=authorization["run_id"],
+                candidate_exporter_policies=verifier.candidate_exporter_policies,
+                prompt_builder_policies=verifier.prompt_builder_policies,
+                expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
+                expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
+                expected_verifier_revision=verifier.expected_verifier_revision,
                 trusted_signers=self.test_signers,
                 ssh_keygen=self.ssh_keygen,
             )
             return self._trace_bundle_class(
                 Path(root),
                 verify_blobs,
-                verifier=self._verifier_for_runtime(
-                    runtime,
-                    expected_challenge=authorization["challenge"],
-                    expected_run_id=authorization["run_id"],
-                ),
+                verifier=verifier,
             )
 
         trace.TraceBundle = test_bundle
@@ -960,6 +1151,12 @@ class TraceFormatTests(unittest.TestCase):
         runtime = manifest_record["runtime"]
         principal = self.signer_principals[runtime]
         authorization = manifest_record["authorization"]
+        verifier = self._verifier_for_runtime(
+            runtime,
+            manifest_record=manifest_record,
+            expected_challenge=authorization["challenge"],
+            expected_run_id=authorization["run_id"],
+        )
         return trace.seal_bundle(
             root,
             private_key=self.signing_keys[runtime],
@@ -967,6 +1164,12 @@ class TraceFormatTests(unittest.TestCase):
             expected_lane=authorization["lane"],
             expected_challenge=authorization["challenge"],
             expected_run_id=authorization["run_id"],
+            candidate_exporter_policies=verifier.candidate_exporter_policies,
+            prompt_builder_policies=verifier.prompt_builder_policies,
+            expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+            expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
+            expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
+            expected_verifier_revision=verifier.expected_verifier_revision,
             trusted_signers=self.test_signers,
             ssh_keygen=self.ssh_keygen,
         )
@@ -1027,7 +1230,9 @@ class TraceFormatTests(unittest.TestCase):
                 add_required_events(writer)
             self._seal_test_bundle(root)
             self._read_sealed_bundle(root)
-            with self.assertRaisesRegex(trace.TraceError, "external signer, lane, challenge, and run ID"):
+            with self.assertRaisesRegex(
+                    trace.TraceError,
+                    "external signer, lane, challenge, run ID, and prompt builder approval"):
                 self._trace_bundle_class(root)
             with self.assertRaisesRegex(trace.TraceError, "not approved"):
                 self._trace_bundle_class(
@@ -1036,6 +1241,8 @@ class TraceFormatTests(unittest.TestCase):
                     expected_lane=trace.CANDIDATE_LANE,
                     expected_challenge=TEST_CHALLENGE,
                     expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                    expected_candidate_exporter_policy_id=TEST_CANDIDATE_EXPORTER_POLICY_ID,
+                    expected_prompt_builder_policy_id=TEST_PROMPT_BUILDER_POLICY_ID,
                 )
             candidate_policy = self.test_signers[self.signer_principal]
             unknown = trace.TraceVerifier.for_tests(
@@ -1105,6 +1312,321 @@ class TraceFormatTests(unittest.TestCase):
                     trusted_signers=self.test_signers,
                     ssh_keygen=self.ssh_keygen,
                 )
+
+    def test_production_executable_approval_maps_fail_closed(self) -> None:
+        self.assertEqual(trace.APPROVED_CANDIDATE_EXPORTERS, {})
+        self.assertEqual(trace.APPROVED_PROMPT_BUILDERS, {})
+        self.assertEqual(trace.APPROVED_EXECUTABLE_APPROVERS, {})
+        with self.assertRaisesRegex(trace.TraceError, "candidate exporter approval is not trusted"):
+            trace.candidate_exporter_approval(TEST_CANDIDATE_EXPORTER_POLICY_ID)
+        with self.assertRaisesRegex(trace.TraceError, "prompt builder approval is not trusted"):
+            trace.prompt_builder_approval(TEST_PROMPT_BUILDER_POLICY_ID)
+
+    def test_external_executable_approval_signature_and_tamper(self) -> None:
+        verifier = self._verifier_for_runtime("llama.cpp")
+        principal = "dsv41-test-executable-approver"
+        public_key = self.test_signers[self.signer_principal]["public_key"]
+        policy = {
+            "format": trace.EXECUTABLE_APPROVAL_FORMAT,
+            "version": trace.EXECUTABLE_APPROVAL_VERSION,
+            "principal": principal,
+            "verifier_repository": trace.REPOSITORY,
+            "verifier_revision": "a" * 40,
+            "candidate_exporters": verifier.candidate_exporter_policies,
+            "prompt_builders": verifier.prompt_builder_policies,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy_path = root / "approval.json"
+            policy_path.write_text(trace.canonical_json(policy) + "\n", encoding="ascii")
+            subprocess.run(
+                [
+                    str(self.ssh_keygen),
+                    "-Y", "sign",
+                    "-f", str(self.signing_key),
+                    "-n", trace.EXECUTABLE_APPROVAL_NAMESPACE,
+                    str(policy_path),
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+            )
+            signature_path = policy_path.with_suffix(".json.sig")
+            loaded = trace.load_executable_approval_policy(
+                policy_path,
+                signature_path,
+                expected_principal=principal,
+                trusted_approvers={principal: public_key},
+                ssh_keygen=self.ssh_keygen,
+            )
+            self.assertEqual(loaded.verifier_revision, "a" * 40)
+            self.assertEqual(loaded.sha256, trace.sha256_file(policy_path))
+            self.assertEqual(
+                loaded.candidate_exporters,
+                verifier.candidate_exporter_policies,
+            )
+            with self.assertRaisesRegex(trace.TraceError, "outside protected output roots"):
+                trace.load_executable_approval_policy(
+                    policy_path,
+                    signature_path,
+                    expected_principal=principal,
+                    trusted_approvers={principal: public_key},
+                    ssh_keygen=self.ssh_keygen,
+                    forbidden_roots=(root,),
+                )
+            tampered = copy.deepcopy(policy)
+            tampered["verifier_revision"] = "b" * 40
+            policy_path.write_text(trace.canonical_json(tampered) + "\n", encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "signature verification failed"):
+                trace.load_executable_approval_policy(
+                    policy_path,
+                    signature_path,
+                    expected_principal=principal,
+                    trusted_approvers={principal: public_key},
+                    ssh_keygen=self.ssh_keygen,
+                )
+            with self.assertRaisesRegex(trace.TraceError, "principal is not trusted"):
+                trace.load_executable_approval_policy(
+                    policy_path,
+                    signature_path,
+                    expected_principal=principal,
+                    trusted_approvers={},
+                    ssh_keygen=self.ssh_keygen,
+                )
+
+    def test_candidate_runner_rejects_unapproved_exporter_before_execution(self) -> None:
+        argv = [
+            "run_llama.py",
+            "--exporter", "/usr/bin/true",
+            "--repo", "/tmp/repo",
+            "--candidate-revision", "a" * 40,
+            "--base-revision", "b" * 40,
+            "--candidate-diff-sha256", "c" * 64,
+            "--candidate-exporter-policy-id", "unapproved-exporter",
+            "--prompt-builder-policy-id", "unapproved-builder",
+            "--approval-policy", "/tmp/approval.json",
+            "--approval-signature", "/tmp/approval.sig",
+            "--approval-principal", "unapproved",
+            "--corpus-name", "correctness-prose.txt",
+            "--corpus-sha256", trace.CORPUS_SHA256["correctness-prose.txt"],
+            "--prompt-provenance", "/tmp/prompt.json",
+            "--model", "/tmp/model.gguf",
+            "--prompt", "/tmp/prompt.txt",
+            "--output", "/tmp/output",
+            "--signer-principal", "candidate",
+            "--signing-key", "/tmp/key",
+            "--execution-challenge", TEST_CHALLENGE,
+            "--run-id", TEST_RUN_IDS["llama.cpp"],
+            "--authorization-issued-unix", str(TEST_AUTH_ISSUED),
+            "--authorization-expires-unix", str(TEST_AUTH_EXPIRES),
+            "--preflight-only",
+        ]
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", argv), mock.patch.object(
+                sys, "stderr", io.StringIO()), mock.patch.object(
+                run_llama, "query_runtime_build_attestation") as build_query, mock.patch.object(
+                run_llama, "query_accelerator_attestation") as accelerator_query:
+            self.assertEqual(run_llama.main(), 1)
+        build_query.assert_not_called()
+        accelerator_query.assert_not_called()
+
+    def test_prompt_builder_rejects_unapproved_identity_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            builder = root / "actual" / "bin" / "llama-deepseek-v41-prompt-builder"
+            approved_builder = root / "approved" / "bin" / "llama-deepseek-v41-prompt-builder"
+            builder.parent.mkdir(parents=True)
+            builder.write_bytes(b"builder")
+            builder.chmod(0o755)
+            policy = fixture_prompt_builder_policy(
+                b"prompt",
+                builder_path=str(approved_builder),
+                builder_sha256=trace.sha256_file(builder),
+                source_root=str(Path(__file__).parents[1].resolve()),
+            )
+            _validated, policy_sha256 = trace.prompt_builder_approval(
+                TEST_PROMPT_BUILDER_POLICY_ID,
+                policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
+            )
+            with mock.patch.object(run_matrix.subprocess, "run") as execute, self.assertRaisesRegex(
+                    run_matrix.TraceError, "path differs from external approval"):
+                run_matrix.prepare_prompt(
+                    builder=builder,
+                    builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                    builder_policy=policy,
+                    builder_policy_sha256=policy_sha256,
+                    model=root / "model.gguf",
+                    corpus=root / "corpus.txt",
+                    source_corpus=Path(__file__).parents[1] / "tests" / "corpus" / "correctness-prose.txt",
+                    corpus_name="correctness-prose.txt",
+                    corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
+                    output=root / "prompt.txt",
+                    context=3,
+                    decode_steps=1,
+                )
+            execute.assert_not_called()
+
+    def test_approved_executable_uses_linux_descriptor_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp).resolve() / "approved"
+            executable.write_bytes(b"approved")
+            executable.chmod(0o755)
+            completed = subprocess.CompletedProcess([str(executable)], 0, "", "")
+            with mock.patch.object(trace.sys, "platform", "linux"), mock.patch.object(
+                    trace.subprocess, "run", return_value=completed) as execute:
+                result, identity = trace.run_approved_executable(
+                    [str(executable), "--version"],
+                    path=executable,
+                    expected_path=str(executable),
+                    expected_sha256=trace.sha256_file(executable),
+                    label="approved executable",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            self.assertIs(result, completed)
+            self.assertEqual(identity.path, str(executable))
+            kwargs = execute.call_args.kwargs
+            self.assertRegex(kwargs["executable"], r"^/proc/self/fd/[0-9]+$")
+            self.assertEqual(len(kwargs["pass_fds"]), 1)
+
+    def test_prompt_builder_rejects_runtime_receipt_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            builder = root / "install" / "bin" / "llama-deepseek-v41-prompt-builder"
+            builder.parent.mkdir(parents=True)
+            builder.write_bytes(b"builder")
+            builder.chmod(0o755)
+            policy = fixture_prompt_builder_policy(
+                b"prompt",
+                builder_path=str(builder),
+                builder_sha256=trace.sha256_file(builder),
+                source_root=str(Path(__file__).parents[1].resolve()),
+            )
+            materialize_policy_runtime(policy)
+            _validated, policy_sha256 = trace.prompt_builder_approval(
+                TEST_PROMPT_BUILDER_POLICY_ID,
+                policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
+            )
+            runtime_component = policy["runtime_receipt"]["components"][0]
+            (Path(policy["install_root"]) / "lib" / runtime_component["filename"]).write_bytes(
+                b"changed")
+            with mock.patch.object(run_matrix, "run_approved_executable") as execute, self.assertRaisesRegex(
+                    run_matrix.TraceError, "runtime component .* SHA-256 differs from external approval"):
+                run_matrix.prepare_prompt(
+                    builder=builder,
+                    builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                    builder_policy=policy,
+                    builder_policy_sha256=policy_sha256,
+                    model=root / "model.gguf",
+                    corpus=root / "corpus.txt",
+                    source_corpus=Path(__file__).parents[1] / "tests" / "corpus" / "correctness-prose.txt",
+                    corpus_name="correctness-prose.txt",
+                    corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
+                    output=root / "prompt.txt",
+                    context=3,
+                    decode_steps=1,
+                )
+            execute.assert_not_called()
+
+    def test_prompt_builder_rejects_output_binary_and_corpus_mutation(self) -> None:
+        for mutation, message in (
+                ("output", "output differs from external approval"),
+                ("builder", "SHA-256 differs from external approval"),
+                ("corpus", "corpus changed during execution"),
+                ("runtime", "runtime component SHA-256 differs from external approval"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                builder = root / "install" / "bin" / "llama-deepseek-v41-prompt-builder"
+                model = root / "model.gguf"
+                corpus = root / "corpus.txt"
+                source_root = Path(__file__).parents[1].resolve()
+                source_corpus = source_root / "tests" / "corpus" / "correctness-prose.txt"
+                output = root / "prompt.txt"
+                tmpdir = root / "tmp"
+                builder.parent.mkdir(parents=True)
+                builder.write_bytes(b"builder")
+                builder.chmod(0o755)
+                model.write_bytes(b"model")
+                shutil.copyfile(source_corpus, corpus)
+                tmpdir.mkdir()
+                approved_output = b"approved" if mutation == "output" else b"prompt"
+                policy = fixture_prompt_builder_policy(
+                    approved_output,
+                    builder_path=str(builder),
+                    builder_sha256=trace.sha256_file(builder),
+                    source_root=str(source_root),
+                )
+                materialize_policy_runtime(policy)
+                _validated, policy_sha256 = trace.prompt_builder_approval(
+                    TEST_PROMPT_BUILDER_POLICY_ID,
+                    policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
+                )
+                initial_identity = run_matrix.approved_executable_identity(
+                    builder,
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="prompt builder",
+                )
+
+                def run_builder(command, **_kwargs):
+                    output.write_bytes(b"prompt")
+                    if mutation == "builder":
+                        builder.write_bytes(b"changed")
+                    if mutation == "corpus":
+                        corpus.write_bytes(b"changed")
+                    if mutation == "runtime":
+                        runtime_component = policy["runtime_receipt"]["components"][0]
+                        (Path(policy["install_root"]) / "lib" / runtime_component["filename"]).write_bytes(
+                            b"changed")
+                    return (
+                        subprocess.CompletedProcess(
+                            command,
+                            0,
+                            json.dumps({
+                                "target_tokens": 2,
+                                "actual_tokens": 2,
+                                "byte_count": 6,
+                                "add_bos": True,
+                                "temporary_directory": str(tmpdir),
+                            }),
+                            "",
+                        ),
+                        initial_identity,
+                    )
+
+                with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
+                        run_matrix, "run_approved_executable", side_effect=run_builder), self.assertRaisesRegex(
+                        (RuntimeError, run_matrix.TraceError), message):
+                    run_matrix.prepare_prompt(
+                        builder=builder,
+                        builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                        builder_policy=policy,
+                        builder_policy_sha256=policy_sha256,
+                        model=model,
+                        corpus=corpus,
+                        source_corpus=source_corpus,
+                        corpus_name="correctness-prose.txt",
+                        corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
+                        output=output,
+                        context=3,
+                        decode_steps=1,
+                    )
+
+    def test_signed_approval_binding_tamper_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            trace_manifest = trace.strict_json_loads(
+                (root / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+            trace_manifest["authorization"]["approvals"]["candidate_exporter"]["sha256"] = "f" * 64
+            (root / trace.MANIFEST_NAME).write_text(
+                trace.canonical_json(trace_manifest) + "\n", encoding="ascii")
+            with self.assertRaisesRegex(
+                    trace.TraceError, "candidate exporter approval differs from external policy"):
+                self._seal_test_bundle(root)
 
     def test_seal_rejects_protected_bundle_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2544,20 +3066,20 @@ class TraceFormatTests(unittest.TestCase):
         short_revision_manifest = manifest()
         short_revision_manifest["revision"] = "a" * 9
         short_revision_manifest["candidate"]["revision"] = "a" * 9
-        cases.append((short_revision_manifest, "exact full Git revision"))
+        cases.append((short_revision_manifest, "candidate exporter approval revision"))
 
         revision_manifest = manifest()
         revision_manifest["candidate"]["revision"] = "d" * 40
-        cases.append((revision_manifest, "candidate revision"))
+        cases.append((revision_manifest, "candidate exporter approval"))
 
         executable_manifest = manifest()
         executable_manifest["candidate"]["executable_path"] = "/home/repo/build/bin/other-exporter"
-        cases.append((executable_manifest, "candidate executable path"))
+        cases.append((executable_manifest, "candidate exporter approval executable path"))
 
         library_manifest = manifest()
         library_manifest["build"]["runtime_libraries"][0]["sha256"] = "e" * 64
         library_manifest["build"]["runtime_libraries_post"][0]["sha256"] = "e" * 64
-        cases.append((library_manifest, "runtime receipt SHA-256"))
+        cases.append((library_manifest, "candidate exporter approval"))
 
         added_module_manifest = manifest()
         added_module_manifest["build"]["runtime_module_monitor"]["project_additions"] = [
@@ -2591,7 +3113,7 @@ class TraceFormatTests(unittest.TestCase):
         ]
         omitted_library_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
             omitted_library_manifest["build"]["runtime_libraries"])
-        cases.append((omitted_library_manifest, "set differs from the runtime profile"))
+        cases.append((omitted_library_manifest, "candidate exporter approval receipt"))
 
         duplicate_path_manifest = manifest()
         duplicate_path_manifest["build"]["runtime_libraries"][1]["path"] = (
@@ -2610,7 +3132,7 @@ class TraceFormatTests(unittest.TestCase):
         unknown_component_manifest = manifest()
         unknown_component_manifest["build"]["runtime_libraries"][0]["component"] = "ggml-injected"
         unknown_component_manifest["build"]["runtime_libraries_post"][0]["component"] = "ggml-injected"
-        cases.append((unknown_component_manifest, "runtime library component is invalid"))
+        cases.append((unknown_component_manifest, "candidate exporter approval runtime receipt component"))
 
         revision_library_manifest = manifest()
         revision_library = next(
@@ -2622,7 +3144,7 @@ class TraceFormatTests(unittest.TestCase):
             library
             for library in revision_library_manifest["build"]["runtime_libraries_post"]
             if library["role"] == "build-info")["revision"] = "b" * 40
-        cases.append((revision_library_manifest, "runtime library revision is invalid"))
+        cases.append((revision_library_manifest, "candidate exporter approval runtime receipt revision"))
 
         unexpected_revision_manifest = manifest()
         unexpected_revision = next(
@@ -2634,7 +3156,7 @@ class TraceFormatTests(unittest.TestCase):
             library
             for library in unexpected_revision_manifest["build"]["runtime_libraries_post"]
             if library["role"].startswith("runtime:"))["revision"] = "a" * 40
-        cases.append((unexpected_revision_manifest, "runtime library revision is unexpected"))
+        cases.append((unexpected_revision_manifest, "candidate exporter approval runtime receipt revision"))
 
         for trace_manifest, message in cases:
             with self.subTest(message=message), tempfile.TemporaryDirectory() as temp:
@@ -2957,6 +3479,10 @@ class TraceFormatTests(unittest.TestCase):
                     native["accelerator"],
                     manifest_binary,
                     trace.sha256_file(manifest_binary),
+                    {
+                        "runtime_profile": native["build"]["runtime_profile"],
+                        "runtime_receipt": receipt,
+                    },
                 )
             with self.assertRaisesRegex(trace.TraceError, "execution authorization is missing"):
                 trace.seal_bundle(
@@ -3070,11 +3596,16 @@ class TraceFormatTests(unittest.TestCase):
                     },
                 },
             }
+            approval = {
+                "runtime_profile": copy.deepcopy(build_manifest["build"]["runtime_profile"]),
+                "runtime_receipt": copy.deepcopy(receipt),
+            }
             libraries_digest, receipt_digest = run_llama.validate_runtime_build(
                 build_manifest,
                 exporter=exporter,
                 exporter_sha256=trace.sha256_file(exporter),
                 candidate_revision="a" * 40,
+                approval=approval,
             )
             self.assertEqual(
                 libraries_digest,
@@ -3198,6 +3729,7 @@ class TraceFormatTests(unittest.TestCase):
                         exporter=exporter,
                         exporter_sha256=trace.sha256_file(exporter),
                         candidate_revision="a" * 40,
+                        approval=approval,
                     )
 
     @unittest.skipUnless(sys.platform.startswith(("darwin", "linux")), "loader injection test")
@@ -3245,50 +3777,87 @@ class TraceFormatTests(unittest.TestCase):
     def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            builder = root / "prompt-builder"
+            builder = root / "install" / "bin" / "llama-deepseek-v41-prompt-builder"
             model = root / "model.gguf"
             corpus = root / "corpus.txt"
+            source_root = Path(__file__).parents[1]
+            source_corpus = source_root / "tests" / "corpus" / "correctness-prose.txt"
             output = root / "prompt.txt"
             tmpdir = root / "tmp"
+            builder.parent.mkdir(parents=True)
             builder.write_bytes(b"builder")
+            builder.chmod(0o755)
             model.write_bytes(b"model")
-            corpus.write_bytes(b"corpus")
+            shutil.copyfile(source_corpus, corpus)
             tmpdir.mkdir()
+            builder = builder.resolve()
+            model = model.resolve()
+            corpus = corpus.resolve()
+            output = output.resolve()
+            tmpdir = tmpdir.resolve()
+            builder_policy = fixture_prompt_builder_policy(
+                b"prompt",
+                builder_path=str(builder.resolve()),
+                builder_sha256=trace.sha256_file(builder),
+                source_root=str(source_root.resolve()),
+            )
+            materialize_policy_runtime(builder_policy)
+            _validated, builder_policy_sha256 = trace.prompt_builder_approval(
+                TEST_PROMPT_BUILDER_POLICY_ID,
+                policies={TEST_PROMPT_BUILDER_POLICY_ID: builder_policy},
+            )
+            builder_identity = run_matrix.approved_executable_identity(
+                builder,
+                expected_path=builder_policy["executable_path"],
+                expected_sha256=builder_policy["executable_sha256"],
+                label="prompt builder",
+            )
 
             def run_builder(command, **_kwargs):
                 output.write_bytes(b"prompt")
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    json.dumps({
-                        "target_tokens": 2,
-                        "actual_tokens": 2,
-                        "byte_count": 6,
-                        "add_bos": True,
-                        "temporary_directory": str(tmpdir.resolve()),
-                    }),
-                    "",
+                return (
+                    subprocess.CompletedProcess(
+                        command,
+                        0,
+                        json.dumps({
+                            "target_tokens": 2,
+                            "actual_tokens": 2,
+                            "byte_count": 6,
+                            "add_bos": True,
+                            "temporary_directory": str(tmpdir.resolve()),
+                        }),
+                        "",
+                    ),
+                    builder_identity,
                 )
 
             with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
-                    run_matrix.subprocess, "run", side_effect=run_builder), mock.patch.object(
+                    run_matrix, "run_approved_executable", side_effect=run_builder), mock.patch.object(
                     sys, "stderr", io.StringIO()):
                 result = run_matrix.prepare_prompt(
                     builder=builder,
+                    builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                    builder_policy=builder_policy,
+                    builder_policy_sha256=builder_policy_sha256,
                     model=model,
                     corpus=corpus,
+                    source_corpus=source_corpus,
                     corpus_name="correctness-prose.txt",
                     corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
                     output=output,
-                    target_tokens=2,
+                    context=3,
+                    decode_steps=1,
                 )
             provenance_path = Path(result["provenance_path"])
             provenance = trace.strict_json_loads(provenance_path.read_text(encoding="ascii"))
             self.assertEqual(
                 set(provenance),
                 {
-                    "format", "version", "corpus_name", "corpus_sha256", "model_sha256",
-                    "prompt_sha256", "prompt_byte_count", "builder_sha256", "target_tokens", "actual_tokens",
+                    "format", "version", "corpus_name", "corpus_sha256", "corpus_path",
+                    "model_sha256", "prompt_sha256", "prompt_byte_count", "context",
+                    "decode_steps", "builder_approval_id", "builder_approval_sha256",
+                    "builder_path", "builder_sha256", "builder_revision",
+                    "builder_runtime_profile", "target_tokens", "actual_tokens",
                 },
             )
             preflight.validate_prompt_provenance(
@@ -3297,7 +3866,12 @@ class TraceFormatTests(unittest.TestCase):
                 corpus_name="correctness-prose.txt",
                 corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
                 model_sha256=trace.MODEL_SHA256,
+                context=3,
+                decode_steps=1,
                 target_tokens=2,
+                builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
+                builder_policy=builder_policy,
+                builder_policy_sha256=builder_policy_sha256,
                 path_resolver=lambda path, _label: path.resolve(),
             )
 
@@ -3545,6 +4119,10 @@ class TraceFormatTests(unittest.TestCase):
                 "--corpus-name", "correctness-prose.txt",
                 "--corpus-sha256", trace.CORPUS_SHA256["correctness-prose.txt"],
                 "--prompt-provenance", str(root / "prompt.json"),
+                "--prompt-builder-policy-id", TEST_PROMPT_BUILDER_POLICY_ID,
+                "--approval-policy", str(root / "approval.json"),
+                "--approval-signature", str(root / "approval.sig"),
+                "--approval-principal", "unapproved",
                 "--signer-principal", self.signer_principals["ds4"],
                 "--signing-key", str(self.signing_keys["ds4"]),
                 "--execution-challenge", TEST_CHALLENGE,
@@ -3949,6 +4527,20 @@ class TraceFormatTests(unittest.TestCase):
                     "post": base_manifest["build"]["runtime_libraries_post"],
                 }).encode("ascii"))
             base_manifest["candidate"]["runtime_receipt_sha256"] = receipt_sha256
+            base_verifier = self._verifier_for_runtime(
+                "llama.cpp", manifest_record=base_manifest)
+            _candidate_policy, candidate_policy_sha256 = trace.candidate_exporter_approval(
+                TEST_CANDIDATE_EXPORTER_POLICY_ID,
+                policies=base_verifier.candidate_exporter_policies,
+            )
+            base_manifest["candidate"]["exporter_approval_sha256"] = candidate_policy_sha256
+            base_manifest["authorization"]["approvals"]["candidate_exporter"] = (
+                trace.approval_binding(
+                    "candidate_exporter",
+                    TEST_CANDIDATE_EXPORTER_POLICY_ID,
+                    candidate_policy_sha256,
+                )
+            )
             with trace.TraceBundleWriter(base, base_manifest) as writer:
                 add_required_events(writer)
             with trace.TraceBundleWriter(integrated, manifest("llama.cpp")) as writer:
@@ -3978,10 +4570,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_identically_incomplete_decode_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
-            incomplete = manifest()
-            incomplete["config"]["context"] = 4
-            incomplete["config"]["decode_steps"] = 2
-            incomplete["expected"]["decode_steps"] = 2
+            incomplete = manifest(context=4, decode_steps=2)
             with trace.TraceBundleWriter(root, incomplete) as writer:
                 add_required_events(writer)
             with self.assertRaisesRegex(trace.TraceError, "decode step coverage"):

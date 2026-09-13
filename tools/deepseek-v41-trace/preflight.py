@@ -1339,6 +1339,11 @@ def validate_prompt_provenance(
     corpus_sha256: str,
     model_sha256: str,
     target_tokens: int,
+    context: int,
+    decode_steps: int,
+    builder_approval_id: str,
+    builder_policy: dict[str, object],
+    builder_policy_sha256: str,
     path_resolver: Callable[[Path, str], Path] | None = None,
 ) -> dict[str, object]:
     path = (require_nvme_path if path_resolver is None else path_resolver)(path, "prompt provenance")
@@ -1357,21 +1362,39 @@ def validate_prompt_provenance(
         "version": 1,
         "corpus_name": corpus_name,
         "corpus_sha256": corpus_sha256,
+        "corpus_path": f"{builder_policy['source_root']}/tests/corpus/{corpus_name}",
         "model_sha256": model_sha256,
         "prompt_sha256": sha256_bytes(prompt_bytes),
         "prompt_byte_count": prompt_size,
+        "context": context,
+        "decode_steps": decode_steps,
         "target_tokens": target_tokens,
         "actual_tokens": target_tokens,
+        "builder_approval_id": builder_approval_id,
+        "builder_approval_sha256": builder_policy_sha256,
+        "builder_path": builder_policy["executable_path"],
+        "builder_sha256": builder_policy["executable_sha256"],
+        "builder_revision": builder_policy["revision"],
+        "builder_runtime_profile": builder_policy["runtime_profile"],
     }
     for key, value in expected.items():
         if record.get(key) != value:
             raise PreflightError(f"prompt provenance {key} mismatch")
-    builder_sha256 = record.get("builder_sha256", "")
-    if not isinstance(builder_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", builder_sha256) is None:
-        raise PreflightError("prompt provenance builder SHA-256 is invalid")
-    required_keys = set(expected) | {"builder_sha256"}
-    if set(record) != required_keys:
+    if set(record) != set(expected):
         raise PreflightError("prompt provenance fields are invalid")
+    matches = [
+        prompt_record for prompt_record in builder_policy["prompts"]
+        if prompt_record["corpus_name"] == corpus_name and
+        prompt_record["context"] == context and
+        prompt_record["decode_steps"] == decode_steps
+    ]
+    if len(matches) != 1:
+        raise PreflightError("prompt provenance configuration is not externally approved")
+    for key in (
+            "corpus_name", "corpus_sha256", "context", "decode_steps", "target_tokens",
+            "prompt_sha256", "prompt_byte_count"):
+        if record[key] != matches[0][key]:
+            raise PreflightError(f"prompt provenance {key} differs from external approval")
     return {"path": str(path), "bytes": data, "record": record}
 
 

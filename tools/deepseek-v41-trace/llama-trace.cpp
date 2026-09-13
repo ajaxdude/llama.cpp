@@ -1447,6 +1447,20 @@ int main(int argc, char ** argv) {
                       << " for " << build["target"].get<std::string>() << '\n';
             return 0;
         }
+        if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-build") {
+            if (std::string(argv[2]) != "ROCm0") {
+                throw std::runtime_error("build attestation requires selected execution device ROCm0");
+            }
+            common_init();
+            const fs::path executable = current_executable_path();
+            load_runtime_backends(executable);
+            ggml_backend_dev_t device = ggml_backend_dev_by_name(argv[2]);
+            if (device == nullptr) {
+                throw std::runtime_error("cannot find selected execution device ROCm0");
+            }
+            std::cout << runtime_build_json(executable, device, "ggml-hip", argv).dump() << '\n';
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {
             common_init();
             load_runtime_backends(current_executable_path());

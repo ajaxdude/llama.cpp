@@ -21,6 +21,12 @@ TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 APPROVED_EXPORTERS: dict[str, str] = {}
 APPROVED_TRACE_SIGNERS: dict[str, dict[str, str]] = {}
+APPROVED_EXECUTABLE_APPROVERS: dict[str, str] = {}
+APPROVED_CANDIDATE_EXPORTERS: dict[str, dict[str, Any]] = {}
+APPROVED_PROMPT_BUILDERS: dict[str, dict[str, Any]] = {}
+EXECUTABLE_APPROVAL_FORMAT = "dsv41-executable-approval"
+EXECUTABLE_APPROVAL_VERSION = 1
+EXECUTABLE_APPROVAL_NAMESPACE = "dsv41-executable-approval-v1"
 SEAL_FORMAT = "dsv41-trace-bundle-signature"
 SEAL_VERSION = 1
 SEAL_NAMESPACE = "dsv41-trace-bundle-v1"
@@ -136,6 +142,12 @@ class TraceVerifier:
     expected_challenge: str
     expected_run_id: str
     verification_unix: int
+    candidate_exporter_policies: dict[str, dict[str, Any]]
+    prompt_builder_policies: dict[str, dict[str, Any]]
+    expected_candidate_exporter_policy_id: str | None
+    expected_prompt_builder_policy_id: str
+    expected_approval_policy_sha256: str
+    expected_verifier_revision: str
     seen_run_ids: set[str] | None = None
     test_only: bool = False
 
@@ -147,6 +159,9 @@ class TraceVerifier:
             expected_lane: str,
             expected_challenge: str,
             expected_run_id: str,
+            expected_candidate_exporter_policy_id: str | None,
+            expected_prompt_builder_policy_id: str,
+            approval_policy: "ExecutableApprovalPolicy | None" = None,
             verification_unix: int | None,
             seen_run_ids: set[str] | None = None) -> "TraceVerifier":
         return cls(
@@ -157,6 +172,18 @@ class TraceVerifier:
             expected_challenge=expected_challenge,
             expected_run_id=expected_run_id,
             verification_unix=int(time.time()) if verification_unix is None else verification_unix,
+            candidate_exporter_policies=(
+                approval_policy.candidate_exporters
+                if approval_policy is not None else APPROVED_CANDIDATE_EXPORTERS),
+            prompt_builder_policies=(
+                approval_policy.prompt_builders
+                if approval_policy is not None else APPROVED_PROMPT_BUILDERS),
+            expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
+            expected_approval_policy_sha256=(
+                approval_policy.sha256 if approval_policy is not None else ""),
+            expected_verifier_revision=(
+                approval_policy.verifier_revision if approval_policy is not None else ""),
             seen_run_ids=seen_run_ids,
         )
 
@@ -171,6 +198,12 @@ class TraceVerifier:
             runtime_profile: str,
             expected_challenge: str,
             expected_run_id: str,
+            candidate_exporter_policies: dict[str, dict[str, Any]] | None = None,
+            prompt_builder_policies: dict[str, dict[str, Any]] | None = None,
+            expected_candidate_exporter_policy_id: str | None = None,
+            expected_prompt_builder_policy_id: str = "",
+            expected_approval_policy_sha256: str = "e" * 64,
+            expected_verifier_revision: str = "a" * 40,
             verification_unix: int | None = None,
             ssh_keygen: Path | None = None,
             seen_run_ids: set[str] | None = None) -> "TraceVerifier":
@@ -189,6 +222,12 @@ class TraceVerifier:
             expected_challenge=expected_challenge,
             expected_run_id=expected_run_id,
             verification_unix=verification_unix,
+            candidate_exporter_policies=candidate_exporter_policies or {},
+            prompt_builder_policies=prompt_builder_policies or {},
+            expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
+            expected_approval_policy_sha256=expected_approval_policy_sha256,
+            expected_verifier_revision=expected_verifier_revision,
             seen_run_ids=seen_run_ids,
             test_only=True,
         )
@@ -201,6 +240,26 @@ class BundleFileReceipt:
     byte_count: int
     modified_ns: int
     changed_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ExecutableFileReceipt:
+    path: str
+    device: int
+    inode: int
+    byte_count: int
+    modified_ns: int
+    changed_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ExecutableApprovalPolicy:
+    principal: str
+    verifier_revision: str
+    candidate_exporters: dict[str, dict[str, Any]]
+    prompt_builders: dict[str, dict[str, Any]]
     sha256: str
 
 
@@ -249,6 +308,184 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _approved_file_identity(
+        path: Path,
+        *,
+        expected_path: str,
+        expected_sha256: str,
+        label: str,
+        executable: bool,
+) -> tuple[ExecutableFileReceipt, int]:
+    if not path.is_absolute() or str(path) != expected_path:
+        raise TraceError(f"{label} path differs from external approval")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise TraceError(f"{label} path must not use symlinks")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+    except OSError as error:
+        raise TraceError(f"cannot open {label}: {error}") from error
+    if not stat.S_ISREG(before.st_mode) or (executable and not os.access(path, os.X_OK)):
+        os.close(descriptor)
+        raise TraceError(f"{label} is not an approved regular file")
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        digest_value = digest.hexdigest()
+        after = os.fstat(descriptor)
+        path_after = path.stat(follow_symlinks=False)
+    except OSError as error:
+        os.close(descriptor)
+        raise TraceError(f"cannot recheck {label}: {error}") from error
+    identity = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if identity != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or identity != (
+            path_after.st_dev, path_after.st_ino, path_after.st_size,
+            path_after.st_mtime_ns, path_after.st_ctime_ns):
+        os.close(descriptor)
+        raise TraceError(f"{label} changed while hashing")
+    if digest_value != expected_sha256:
+        os.close(descriptor)
+        raise TraceError(f"{label} SHA-256 differs from external approval")
+    return ExecutableFileReceipt(
+        path=str(path),
+        device=after.st_dev,
+        inode=after.st_ino,
+        byte_count=after.st_size,
+        modified_ns=after.st_mtime_ns,
+        changed_ns=after.st_ctime_ns,
+        sha256=digest_value,
+    ), descriptor
+
+
+def approved_executable_identity(
+        path: Path,
+        *,
+        expected_path: str,
+        expected_sha256: str,
+        label: str,
+) -> ExecutableFileReceipt:
+    identity, descriptor = _approved_file_identity(
+        path,
+        expected_path=expected_path,
+        expected_sha256=expected_sha256,
+        label=label,
+        executable=True,
+    )
+    os.close(descriptor)
+    return identity
+
+
+def verify_approved_executable_identity(
+        path: Path,
+        expected: ExecutableFileReceipt,
+        *,
+        label: str,
+) -> None:
+    observed = approved_executable_identity(
+        path,
+        expected_path=expected.path,
+        expected_sha256=expected.sha256,
+        label=label,
+    )
+    if observed != expected:
+        raise TraceError(f"{label} identity changed after approval")
+
+
+def approved_runtime_file_identities(
+        policy: dict[str, Any],
+        *,
+        label: str,
+) -> list[ExecutableFileReceipt]:
+    install_root = Path(policy["install_root"])
+    identities = []
+    for component in policy["runtime_receipt"]["components"]:
+        path = install_root / "lib" / component["filename"]
+        identity, descriptor = _approved_file_identity(
+            path,
+            expected_path=str(path),
+            expected_sha256=component["sha256"],
+            label=f"{label} runtime component {component['component']}",
+            executable=False,
+        )
+        os.close(descriptor)
+        identities.append(identity)
+    return identities
+
+
+def verify_approved_runtime_file_identities(
+        identities: list[ExecutableFileReceipt],
+        *,
+        label: str,
+) -> None:
+    for identity in identities:
+        observed, descriptor = _approved_file_identity(
+            Path(identity.path),
+            expected_path=identity.path,
+            expected_sha256=identity.sha256,
+            label=f"{label} runtime component",
+            executable=False,
+        )
+        os.close(descriptor)
+        if observed != identity:
+            raise TraceError(f"{label} runtime component identity changed after approval")
+
+
+def run_approved_executable(
+        command: list[str],
+        *,
+        path: Path,
+        expected_path: str,
+        expected_sha256: str,
+        label: str,
+        **kwargs: Any,
+) -> tuple[subprocess.CompletedProcess[Any], ExecutableFileReceipt]:
+    if sys.platform != "linux":
+        raise TraceError(f"{label} descriptor execution requires Linux")
+    identity, descriptor = _approved_file_identity(
+        path,
+        expected_path=expected_path,
+        expected_sha256=expected_sha256,
+        label=label,
+        executable=True,
+    )
+    try:
+        result = subprocess.run(
+            command,
+            executable=f"/proc/self/fd/{descriptor}",
+            pass_fds=(descriptor,),
+            **kwargs,
+        )
+        descriptor_after = os.fstat(descriptor)
+        if (
+                descriptor_after.st_dev,
+                descriptor_after.st_ino,
+                descriptor_after.st_size,
+                descriptor_after.st_mtime_ns,
+                descriptor_after.st_ctime_ns,
+        ) != (
+                identity.device,
+                identity.inode,
+                identity.byte_count,
+                identity.modified_ns,
+                identity.changed_ns,
+        ):
+            raise TraceError(f"{label} descriptor identity changed during execution")
+        verify_approved_executable_identity(path, identity, label=label)
+        return result, identity
+    finally:
+        os.close(descriptor)
 
 
 def reject_loader_overrides(environment: dict[str, str] | None = None) -> None:
@@ -357,6 +594,415 @@ def _normalize_public_key(public_key: str, *, allow_comment: bool = False) -> st
     return " ".join(fields[:2])
 
 
+def _approval_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or (
+            ".." in PurePosixPath(value).parts or str(PurePosixPath(value)) != value):
+        raise TraceError(f"{label} is not an absolute canonical path")
+    return value
+
+
+def _approval_digest(kind: str, approval_id: str, policy: dict[str, Any]) -> str:
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", approval_id) is None:
+        raise TraceError(f"{kind} approval ID is invalid")
+    record = {
+        "format": EXECUTABLE_APPROVAL_FORMAT,
+        "version": EXECUTABLE_APPROVAL_VERSION,
+        "kind": kind,
+        "id": approval_id,
+        "policy": policy,
+    }
+    return sha256_bytes(canonical_json(record).encode("ascii"))
+
+
+def candidate_exporter_approval(
+        approval_id: str,
+        *,
+        policies: dict[str, dict[str, Any]] = APPROVED_CANDIDATE_EXPORTERS,
+) -> tuple[dict[str, Any], str]:
+    policy = policies.get(approval_id)
+    if not isinstance(policy, dict):
+        raise TraceError(f"candidate exporter approval is not trusted: {approval_id}")
+    _require_exact_keys(
+        policy,
+        {
+            "runtime",
+            "repository",
+            "revision",
+            "base_revision",
+            "diff_sha256",
+            "install_root",
+            "executable_path",
+            "executable_sha256",
+            "runtime_profile",
+            "runtime_receipt",
+        },
+        "candidate exporter approval",
+    )
+    if policy["runtime"] != "llama.cpp" or policy["repository"] != REPOSITORY:
+        raise TraceError("candidate exporter approval runtime identity is invalid")
+    for key in ("revision", "base_revision"):
+        if re.fullmatch(r"[0-9a-f]{40}", policy.get(key, "")) is None:
+            raise TraceError(f"candidate exporter approval {key} is invalid")
+    for key in ("diff_sha256", "executable_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", policy.get(key, "")) is None:
+            raise TraceError(f"candidate exporter approval {key} is invalid")
+    install_root = _approval_path(policy["install_root"], "candidate exporter approval install root")
+    executable_path = _approval_path(
+        policy["executable_path"], "candidate exporter approval executable path")
+    if executable_path != f"{install_root}/bin/llama-deepseek-v41-trace":
+        raise TraceError("candidate exporter approval executable path is outside its install policy")
+    profile = policy["runtime_profile"]
+    if not isinstance(profile, dict):
+        raise TraceError("candidate exporter approval runtime profile is invalid")
+    _require_exact_keys(
+        profile, {"name", "components", "selected_backend_component"},
+        "candidate exporter approval runtime profile")
+    if profile["name"] != "sibling-lib" or profile["selected_backend_component"] != "ggml-hip":
+        raise TraceError("candidate exporter approval runtime profile is invalid")
+    components = profile["components"]
+    if not isinstance(components, list) or components != sorted(components) or (
+            len(components) != len(set(components))) or any(
+                not isinstance(component, str) or re.fullmatch(r"[a-z0-9-]+", component) is None
+                for component in components):
+        raise TraceError("candidate exporter approval components are invalid")
+    if not {"llama-common", "llama", "ggml", "ggml-base", "ggml-hip"}.issubset(set(components)):
+        raise TraceError("candidate exporter approval is missing required components")
+    receipt = policy["runtime_receipt"]
+    if not isinstance(receipt, dict):
+        raise TraceError("candidate exporter approval runtime receipt is invalid")
+    _require_exact_keys(
+        receipt, {"format", "version", "revision", "profile", "components"},
+        "candidate exporter approval runtime receipt")
+    if receipt["format"] != "dsv41-runtime-receipt" or receipt["version"] != 1 or (
+            receipt["revision"] != policy["revision"]) or receipt["profile"] != profile["name"]:
+        raise TraceError("candidate exporter approval runtime receipt identity is invalid")
+    receipt_components = receipt["components"]
+    if not isinstance(receipt_components, list) or receipt_components != sorted(
+            receipt_components, key=lambda item: item.get("component", "") if isinstance(item, dict) else ""):
+        raise TraceError("candidate exporter approval runtime receipt components are not canonical")
+    seen_components = set()
+    seen_filenames = set()
+    seen_digests = set()
+    for component in receipt_components:
+        if not isinstance(component, dict):
+            raise TraceError("candidate exporter approval runtime receipt component is invalid")
+        _require_exact_keys(
+            component, {"component", "filename", "sha256", "revision"},
+            "candidate exporter approval runtime receipt component")
+        name = component["component"]
+        filename = component["filename"]
+        digest = component["sha256"]
+        revision = component["revision"]
+        if name not in components or name in seen_components:
+            raise TraceError("candidate exporter approval runtime receipt component name is invalid")
+        if not isinstance(filename, str) or re.fullmatch(r"[A-Za-z0-9._+-]+", filename) is None or (
+                filename in seen_filenames):
+            raise TraceError("candidate exporter approval runtime receipt filename is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None or digest in seen_digests:
+            raise TraceError("candidate exporter approval runtime receipt digest is invalid")
+        revision_bearing = name in {"llama-common", "ggml-base"}
+        if (revision_bearing and revision != policy["revision"]) or (
+                not revision_bearing and revision is not None):
+            raise TraceError("candidate exporter approval runtime receipt revision is invalid")
+        seen_components.add(name)
+        seen_filenames.add(filename)
+        seen_digests.add(digest)
+    if seen_components != set(components):
+        raise TraceError("candidate exporter approval receipt differs from its runtime profile")
+    return policy, _approval_digest("candidate-exporter", approval_id, policy)
+
+
+def prompt_builder_approval(
+        approval_id: str,
+        *,
+        policies: dict[str, dict[str, Any]] = APPROVED_PROMPT_BUILDERS,
+) -> tuple[dict[str, Any], str]:
+    policy = policies.get(approval_id)
+    if not isinstance(policy, dict):
+        raise TraceError(f"prompt builder approval is not trusted: {approval_id}")
+    _require_exact_keys(
+        policy,
+        {
+            "runtime",
+            "runtime_profile",
+            "repository",
+            "revision",
+            "install_root",
+            "executable_path",
+            "executable_sha256",
+            "source_root",
+            "runtime_receipt",
+            "model_sha256",
+            "corpora",
+            "prompts",
+        },
+        "prompt builder approval",
+    )
+    if policy["runtime"] != "llama.cpp" or (
+            policy["repository"] != REPOSITORY) or re.fullmatch(
+                r"[0-9a-f]{40}", policy.get("revision", "")) is None:
+        raise TraceError("prompt builder approval runtime identity is invalid")
+    if policy["model_sha256"] != MODEL_SHA256 or re.fullmatch(
+            r"[0-9a-f]{64}", policy.get("executable_sha256", "")) is None:
+        raise TraceError("prompt builder approval executable or model identity is invalid")
+    install_root = _approval_path(policy["install_root"], "prompt builder approval install root")
+    executable_path = _approval_path(
+        policy["executable_path"], "prompt builder approval executable path")
+    source_root = _approval_path(policy["source_root"], "prompt builder approval source root")
+    if executable_path != f"{install_root}/bin/llama-deepseek-v41-prompt-builder":
+        raise TraceError("prompt builder approval executable path is outside its install policy")
+    profile = policy["runtime_profile"]
+    if not isinstance(profile, dict):
+        raise TraceError("prompt builder approval runtime profile is invalid")
+    _require_exact_keys(
+        profile, {"name", "components", "selected_backend_component"},
+        "prompt builder approval runtime profile")
+    if profile["name"] != "sibling-lib" or not isinstance(profile["components"], list) or (
+            profile["components"] != sorted(profile["components"])) or len(
+                profile["components"]) != len(set(profile["components"])) or not {
+                    "llama-common", "llama", "ggml", "ggml-base"
+                }.issubset(set(profile["components"])) or (
+                profile["selected_backend_component"] != "ggml-hip") or (
+                profile["selected_backend_component"] not in profile["components"]):
+        raise TraceError("prompt builder approval runtime profile is invalid")
+    receipt = policy["runtime_receipt"]
+    if not isinstance(receipt, dict):
+        raise TraceError("prompt builder approval runtime receipt is invalid")
+    _require_exact_keys(
+        receipt, {"format", "version", "revision", "profile", "components"},
+        "prompt builder approval runtime receipt")
+    if receipt["format"] != "dsv41-runtime-receipt" or receipt["version"] != 1 or (
+            receipt["revision"] != policy["revision"]) or receipt["profile"] != profile["name"]:
+        raise TraceError("prompt builder approval runtime receipt identity is invalid")
+    receipt_components = receipt["components"]
+    if not isinstance(receipt_components, list) or receipt_components != sorted(
+            receipt_components, key=lambda item: item.get("component", "") if isinstance(item, dict) else ""):
+        raise TraceError("prompt builder approval runtime receipt components are not canonical")
+    seen_components = set()
+    seen_filenames = set()
+    seen_digests = set()
+    for component in receipt_components:
+        if not isinstance(component, dict):
+            raise TraceError("prompt builder approval runtime receipt component is invalid")
+        _require_exact_keys(
+            component, {"component", "filename", "sha256", "revision"},
+            "prompt builder approval runtime receipt component")
+        name = component["component"]
+        filename = component["filename"]
+        digest = component["sha256"]
+        revision = component["revision"]
+        if name not in profile["components"] or name in seen_components:
+            raise TraceError("prompt builder approval runtime receipt component name is invalid")
+        if not isinstance(filename, str) or re.fullmatch(r"[A-Za-z0-9._+-]+", filename) is None or (
+                filename in seen_filenames):
+            raise TraceError("prompt builder approval runtime receipt filename is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None or digest in seen_digests:
+            raise TraceError("prompt builder approval runtime receipt digest is invalid")
+        revision_bearing = name in {"llama-common", "ggml-base"}
+        if (revision_bearing and revision != policy["revision"]) or (
+                not revision_bearing and revision is not None):
+            raise TraceError("prompt builder approval runtime receipt revision is invalid")
+        seen_components.add(name)
+        seen_filenames.add(filename)
+        seen_digests.add(digest)
+    if seen_components != set(profile["components"]):
+        raise TraceError("prompt builder approval receipt differs from its runtime profile")
+    if policy["corpora"] != CORPUS_SHA256:
+        raise TraceError("prompt builder approval corpus policy is invalid")
+    prompts = policy["prompts"]
+    if not isinstance(prompts, list) or not prompts:
+        raise TraceError("prompt builder approval prompt policy is empty")
+    previous_key = None
+    seen_keys = set()
+    for prompt in prompts:
+        if not isinstance(prompt, dict):
+            raise TraceError("prompt builder approval prompt record is invalid")
+        _require_exact_keys(
+            prompt,
+            {
+                "corpus_name", "corpus_sha256", "context", "decode_steps", "target_tokens",
+                "prompt_sha256", "prompt_byte_count", "add_bos",
+            },
+            "prompt builder approval prompt record",
+        )
+        corpus_name = prompt["corpus_name"]
+        if corpus_name not in CORPUS_SHA256 or prompt["corpus_sha256"] != CORPUS_SHA256[corpus_name]:
+            raise TraceError("prompt builder approval prompt corpus identity is invalid")
+        context = prompt["context"]
+        decode_steps = prompt["decode_steps"]
+        target_tokens = prompt["target_tokens"]
+        if type(context) is not int or context < 2 or type(decode_steps) is not int or decode_steps < 1 or (
+                target_tokens != context - decode_steps):
+            raise TraceError("prompt builder approval prompt configuration is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", prompt.get("prompt_sha256", "")) is None or (
+                type(prompt.get("prompt_byte_count")) is not int or prompt["prompt_byte_count"] <= 0) or (
+                type(prompt.get("add_bos")) is not bool):
+            raise TraceError("prompt builder approval prompt output identity is invalid")
+        key = (corpus_name, context, decode_steps)
+        if key in seen_keys or (previous_key is not None and key <= previous_key):
+            raise TraceError("prompt builder approval prompt records are duplicated or unsorted")
+        seen_keys.add(key)
+        previous_key = key
+    return policy, _approval_digest("prompt-builder", approval_id, policy)
+
+
+def approved_prompt_record(
+        policy: dict[str, Any],
+        *,
+        corpus_name: str,
+        context: int,
+        decode_steps: int,
+) -> dict[str, Any]:
+    matches = [
+        prompt for prompt in policy["prompts"]
+        if prompt["corpus_name"] == corpus_name and
+        prompt["context"] == context and
+        prompt["decode_steps"] == decode_steps
+    ]
+    if len(matches) != 1:
+        raise TraceError("prompt builder approval does not contain the requested prompt configuration")
+    return matches[0]
+
+
+def _read_external_regular_file(path: Path, label: str) -> bytes:
+    if not path.is_absolute() or str(path.resolve()) != str(path):
+        raise TraceError(f"{label} path must be absolute, canonical, and non-symlinked")
+    try:
+        before = path.stat(follow_symlinks=False)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise TraceError(f"cannot inspect {label}: {error}") from error
+    identity = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if identity != (
+            opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) or (
+            not stat.S_ISREG(opened.st_mode)) or opened.st_nlink != 1:
+        os.close(descriptor)
+        raise TraceError(f"{label} must be a regular file with one link")
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            data = stream.read()
+        after = os.fstat(descriptor)
+        path_after = path.stat(follow_symlinks=False)
+    except OSError as error:
+        os.close(descriptor)
+        raise TraceError(f"cannot read {label}: {error}") from error
+    if identity != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) or (
+            identity != (
+                path_after.st_dev, path_after.st_ino, path_after.st_size,
+                path_after.st_mtime_ns, path_after.st_ctime_ns)) or len(data) != before.st_size:
+        os.close(descriptor)
+        raise TraceError(f"{label} changed while reading")
+    os.close(descriptor)
+    return data
+
+
+def load_executable_approval_policy(
+        policy_path: Path,
+        signature_path: Path,
+        *,
+        expected_principal: str,
+        trusted_approvers: dict[str, str] = APPROVED_EXECUTABLE_APPROVERS,
+        ssh_keygen: Path | None = None,
+        forbidden_roots: Iterable[Path] = (),
+) -> ExecutableApprovalPolicy:
+    _validate_principal(expected_principal)
+    resolved_policy = policy_path.resolve()
+    resolved_signature = signature_path.resolve()
+    for forbidden_root in forbidden_roots:
+        root = forbidden_root.resolve()
+        if resolved_policy == root or root in resolved_policy.parents or (
+                resolved_signature == root) or root in resolved_signature.parents:
+            raise TraceError("executable approval policy and signature must be outside protected output roots")
+    public_key = trusted_approvers.get(expected_principal)
+    if not isinstance(public_key, str):
+        raise TraceError(f"executable approval principal is not trusted: {expected_principal}")
+    approved_key = _normalize_public_key(public_key)
+    policy_bytes = _read_external_regular_file(policy_path, "executable approval policy")
+    signature_bytes = _read_external_regular_file(signature_path, "executable approval signature")
+    try:
+        policy = strict_json_loads(policy_bytes.decode("ascii"))
+        signature = signature_bytes.decode("ascii")
+    except UnicodeError as error:
+        raise TraceError("executable approval policy and signature must be ASCII") from error
+    if policy_bytes != _canonical_json_bytes(policy):
+        raise TraceError("executable approval policy is not canonical")
+    if not isinstance(policy, dict):
+        raise TraceError("executable approval policy must be a JSON object")
+    _require_exact_keys(
+        policy,
+        {
+            "format", "version", "principal", "verifier_repository", "verifier_revision",
+            "candidate_exporters", "prompt_builders",
+        },
+        "executable approval policy",
+    )
+    if policy["format"] != EXECUTABLE_APPROVAL_FORMAT or (
+            policy["version"] != EXECUTABLE_APPROVAL_VERSION) or (
+            policy["principal"] != expected_principal) or (
+            policy["verifier_repository"] != REPOSITORY) or re.fullmatch(
+                r"[0-9a-f]{40}", policy.get("verifier_revision", "")) is None:
+        raise TraceError("executable approval policy identity is invalid")
+    candidate_exporters = policy["candidate_exporters"]
+    prompt_builders = policy["prompt_builders"]
+    if not isinstance(candidate_exporters, dict) or not isinstance(prompt_builders, dict):
+        raise TraceError("executable approval policy maps are invalid")
+    for approval_id in sorted(candidate_exporters):
+        candidate_exporter_approval(approval_id, policies=candidate_exporters)
+    for approval_id in sorted(prompt_builders):
+        prompt_builder_approval(approval_id, policies=prompt_builders)
+    if not signature.startswith("-----BEGIN SSH SIGNATURE-----\n") or not signature.endswith(
+            "-----END SSH SIGNATURE-----\n"):
+        raise TraceError("executable approval signature is invalid")
+    executable = _validate_ssh_keygen(ssh_keygen or trusted_ssh_keygen_path())
+    with tempfile.TemporaryDirectory(prefix="dsv41-approval-verify-") as temp:
+        temporary = Path(temp)
+        allowed_signers = temporary / "allowed_signers"
+        signature_file = temporary / "signature"
+        allowed_signers.write_text(f"{expected_principal} {approved_key}\n", encoding="ascii")
+        signature_file.write_text(signature, encoding="ascii")
+        try:
+            result = subprocess.run(
+                [
+                    str(executable),
+                    "-Y", "verify",
+                    "-f", str(allowed_signers),
+                    "-I", expected_principal,
+                    "-n", EXECUTABLE_APPROVAL_NAMESPACE,
+                    "-s", str(signature_file),
+                ],
+                input=policy_bytes,
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=_ssh_environment(),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise TraceError(f"cannot verify executable approval signature: {error}") from error
+    if result.returncode != 0:
+        raise TraceError("executable approval signature verification failed")
+    return ExecutableApprovalPolicy(
+        principal=expected_principal,
+        verifier_revision=policy["verifier_revision"],
+        candidate_exporters=candidate_exporters,
+        prompt_builders=prompt_builders,
+        sha256=sha256_bytes(policy_bytes),
+    )
+
+
+def approval_binding(kind: str, approval_id: str, digest: str) -> dict[str, str]:
+    if kind not in {"candidate_exporter", "prompt_builder"} or re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", approval_id) is None or re.fullmatch(
+                r"[0-9a-f]{64}", digest) is None:
+        raise TraceError("execution approval binding is invalid")
+    return {"id": approval_id, "sha256": digest}
+
+
 def validate_execution_authorization(
         manifest: dict[str, Any],
         *,
@@ -365,6 +1011,12 @@ def validate_execution_authorization(
         expected_challenge: str,
         expected_run_id: str,
         verification_unix: int,
+        candidate_exporter_policies: dict[str, dict[str, Any]],
+        prompt_builder_policies: dict[str, dict[str, Any]],
+        expected_candidate_exporter_policy_id: str | None,
+        expected_prompt_builder_policy_id: str,
+        expected_approval_policy_sha256: str,
+        expected_verifier_revision: str,
         seen_run_ids: set[str] | None = None) -> None:
     if expected_lane not in {CANDIDATE_LANE, ORACLE_LANE}:
         raise TraceError("externally expected execution lane is invalid")
@@ -380,7 +1032,10 @@ def validate_execution_authorization(
         raise TraceError("manifest execution authorization is missing")
     _require_exact_keys(
         authorization,
-        {"format", "version", "lane", "challenge", "run_id", "issued_unix", "expires_unix"},
+        {
+            "format", "version", "lane", "challenge", "run_id", "issued_unix",
+            "expires_unix", "approval_policy_sha256", "verifier_revision", "approvals",
+        },
         "manifest execution authorization",
     )
     if authorization.get("format") != AUTHORIZATION_FORMAT or (
@@ -392,6 +1047,12 @@ def validate_execution_authorization(
         raise TraceError("manifest execution challenge differs from the external challenge")
     if authorization.get("run_id") != expected_run_id:
         raise TraceError("manifest lane run ID differs from the external run ID")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_approval_policy_sha256) is None or (
+            authorization.get("approval_policy_sha256") != expected_approval_policy_sha256):
+        raise TraceError("manifest executable approval policy differs from the external policy")
+    if re.fullmatch(r"[0-9a-f]{40}", expected_verifier_revision) is None or (
+            authorization.get("verifier_revision") != expected_verifier_revision):
+        raise TraceError("manifest verifier revision differs from the external approval policy")
     issued_unix = authorization.get("issued_unix")
     expires_unix = authorization.get("expires_unix")
     if type(issued_unix) is not int or type(expires_unix) is not int or (
@@ -410,6 +1071,29 @@ def validate_execution_authorization(
     )
     if runtime_profile != policy["runtime_profile"]:
         raise TraceError("trace signer runtime profile does not match the signed manifest")
+    _prompt_policy, prompt_digest = prompt_builder_approval(
+        expected_prompt_builder_policy_id, policies=prompt_builder_policies)
+    approvals = authorization["approvals"]
+    required_approvals = {"prompt_builder"}
+    if expected_lane == CANDIDATE_LANE:
+        required_approvals.add("candidate_exporter")
+    if not isinstance(approvals, dict):
+        raise TraceError("manifest execution approval bindings are invalid")
+    _require_exact_keys(approvals, required_approvals, "manifest execution approval bindings")
+    prompt_binding = approvals["prompt_builder"]
+    if prompt_binding != approval_binding(
+            "prompt_builder", expected_prompt_builder_policy_id, prompt_digest):
+        raise TraceError("manifest prompt builder approval differs from external policy")
+    if expected_lane == CANDIDATE_LANE:
+        if expected_candidate_exporter_policy_id is None:
+            raise TraceError("external candidate exporter approval ID is required")
+        _candidate_policy, candidate_digest = candidate_exporter_approval(
+            expected_candidate_exporter_policy_id, policies=candidate_exporter_policies)
+        if approvals["candidate_exporter"] != approval_binding(
+                "candidate_exporter", expected_candidate_exporter_policy_id, candidate_digest):
+            raise TraceError("manifest candidate exporter approval differs from external policy")
+    elif expected_candidate_exporter_policy_id is not None:
+        raise TraceError("oracle verification must not specify a candidate exporter approval")
     if seen_run_ids is not None:
         if expected_run_id in seen_run_ids:
             raise TraceError("trace lane run ID was reused")
@@ -422,17 +1106,35 @@ def execution_authorization(
         challenge: str,
         run_id: str,
         issued_unix: int,
-        expires_unix: int) -> dict[str, Any]:
-    runtime, profile = {
-        CANDIDATE_LANE: ("llama.cpp", "sibling-lib"),
-        ORACLE_LANE: ("ds4", "apple-metal"),
-    }.get(lane, (None, None))
-    policy = {
-        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "lane": lane,
-        "runtime": runtime,
-        "runtime_profile": profile,
-    }
+        expires_unix: int,
+        approval_policy_sha256: str,
+        verifier_revision: str,
+        approvals: dict[str, dict[str, str]]) -> dict[str, Any]:
+    if lane not in {CANDIDATE_LANE, ORACLE_LANE}:
+        raise TraceError("execution authorization lane is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", challenge) is None:
+        raise TraceError("execution authorization challenge is invalid")
+    run_prefix = "strix-llama-" if lane == CANDIDATE_LANE else "apple-ds4-"
+    if re.fullmatch(re.escape(run_prefix) + r"[A-Za-z0-9._-]{1,96}", run_id) is None:
+        raise TraceError("execution authorization run ID is invalid")
+    if type(issued_unix) is not int or type(expires_unix) is not int or (
+            issued_unix <= 0 or expires_unix <= issued_unix or
+            expires_unix - issued_unix > MAX_AUTHORIZATION_LIFETIME_SECONDS):
+        raise TraceError("execution authorization validity window is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", approval_policy_sha256) is None or re.fullmatch(
+            r"[0-9a-f]{40}", verifier_revision) is None:
+        raise TraceError("execution authorization approval policy identity is invalid")
+    required_approvals = {"prompt_builder"}
+    if lane == CANDIDATE_LANE:
+        required_approvals.add("candidate_exporter")
+    if not isinstance(approvals, dict):
+        raise TraceError("execution authorization approvals are invalid")
+    _require_exact_keys(approvals, required_approvals, "execution authorization approvals")
+    for kind, binding in approvals.items():
+        if not isinstance(binding, dict):
+            raise TraceError("execution authorization approval binding is invalid")
+        if binding != approval_binding(kind, binding.get("id", ""), binding.get("sha256", "")):
+            raise TraceError("execution authorization approval binding is invalid")
     authorization = {
         "format": AUTHORIZATION_FORMAT,
         "version": AUTHORIZATION_VERSION,
@@ -441,21 +1143,10 @@ def execution_authorization(
         "run_id": run_id,
         "issued_unix": issued_unix,
         "expires_unix": expires_unix,
+        "approval_policy_sha256": approval_policy_sha256,
+        "verifier_revision": verifier_revision,
+        "approvals": approvals,
     }
-    manifest = {
-        "runtime": runtime,
-        "authorization": authorization,
-        "build": {"runtime_profile": {"name": profile}},
-        "accelerator": {"runtime_kind": profile},
-    }
-    validate_execution_authorization(
-        manifest,
-        policy=policy,
-        expected_lane=lane,
-        expected_challenge=challenge,
-        expected_run_id=run_id,
-        verification_unix=int(time.time()),
-    )
     return authorization
 
 
@@ -799,6 +1490,12 @@ def seal_bundle(
         expected_lane: str,
         expected_challenge: str,
         expected_run_id: str,
+        candidate_exporter_policies: dict[str, dict[str, Any]] = APPROVED_CANDIDATE_EXPORTERS,
+        prompt_builder_policies: dict[str, dict[str, Any]] = APPROVED_PROMPT_BUILDERS,
+        expected_candidate_exporter_policy_id: str | None = None,
+        expected_prompt_builder_policy_id: str = "",
+        expected_approval_policy_sha256: str = "",
+        expected_verifier_revision: str = "",
         verification_unix: int | None = None,
         trusted_signers: dict[str, dict[str, str]] = APPROVED_TRACE_SIGNERS,
         ssh_keygen: Path | None = None) -> str:
@@ -822,6 +1519,12 @@ def seal_bundle(
         expected_challenge=expected_challenge,
         expected_run_id=expected_run_id,
         verification_unix=int(time.time()) if verification_unix is None else verification_unix,
+        candidate_exporter_policies=candidate_exporter_policies,
+        prompt_builder_policies=prompt_builder_policies,
+        expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+        expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
+        expected_approval_policy_sha256=expected_approval_policy_sha256,
+        expected_verifier_revision=expected_verifier_revision,
     )
     try:
         with tempfile.TemporaryDirectory(prefix="dsv41-trace-sign-") as signing_temp:
@@ -938,6 +1641,12 @@ def verify_bundle_seal(
         expected_challenge=verifier.expected_challenge,
         expected_run_id=verifier.expected_run_id,
         verification_unix=verifier.verification_unix,
+        candidate_exporter_policies=verifier.candidate_exporter_policies,
+        prompt_builder_policies=verifier.prompt_builder_policies,
+        expected_candidate_exporter_policy_id=verifier.expected_candidate_exporter_policy_id,
+        expected_prompt_builder_policy_id=verifier.expected_prompt_builder_policy_id,
+        expected_approval_policy_sha256=verifier.expected_approval_policy_sha256,
+        expected_verifier_revision=verifier.expected_verifier_revision,
         seen_run_ids=verifier.seen_run_ids,
     )
     domain_sha256 = sha256_bytes(domain)
@@ -1556,28 +2265,38 @@ class TraceBundle:
             expected_lane: str | None = None,
             expected_challenge: str | None = None,
             expected_run_id: str | None = None,
+            expected_candidate_exporter_policy_id: str | None = None,
+            expected_prompt_builder_policy_id: str | None = None,
             verification_unix: int | None = None,
             seen_run_ids: set[str] | None = None):
         if root.is_symlink():
             raise TraceError("trace root must not be a symlink")
         self.root = root.resolve()
         if verifier is None:
-            if None in (signer_principal, expected_lane, expected_challenge, expected_run_id):
+            if None in (
+                    signer_principal, expected_lane, expected_challenge, expected_run_id,
+                    expected_prompt_builder_policy_id):
                 raise TraceError(
-                    "external signer, lane, challenge, and run ID expectations are required")
+                    "external signer, lane, challenge, run ID, and prompt builder approval are required")
+            if expected_lane == CANDIDATE_LANE and expected_candidate_exporter_policy_id is None:
+                raise TraceError("external candidate exporter approval is required")
             verifier = TraceVerifier.production(
                 signer_principal,
                 expected_lane=expected_lane,
                 expected_challenge=expected_challenge,
                 expected_run_id=expected_run_id,
+                expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
                 verification_unix=verification_unix,
                 seen_run_ids=seen_run_ids,
             )
         elif any(value is not None for value in (
                 signer_principal, expected_lane, expected_challenge, expected_run_id,
+                expected_candidate_exporter_policy_id, expected_prompt_builder_policy_id,
                 verification_unix, seen_run_ids)):
             raise TraceError("trace verifier cannot be combined with separate verification inputs")
         self.signer_principal = verifier.principal
+        self.verifier = verifier
         (
             self.manifest,
             sealed_events,
@@ -1907,25 +2626,51 @@ class TraceBundle:
         if sha256_bytes(provenance_bytes) != provenance_sha256:
             raise TraceError("prompt provenance SHA-256 mismatch")
         expected_target = context - decode_steps
+        prompt_policy, prompt_policy_sha256 = prompt_builder_approval(
+            self.verifier.expected_prompt_builder_policy_id,
+            policies=self.verifier.prompt_builder_policies,
+        )
         provenance_checks = {
             "format": "dsv41-prompt-provenance",
             "version": 1,
             "corpus_name": corpus_name,
             "corpus_sha256": self.manifest["prompt"]["corpus_sha256"],
+            "corpus_path": f"{prompt_policy['source_root']}/tests/corpus/{corpus_name}",
             "model_sha256": self.manifest["model"]["sha256"],
             "prompt_sha256": self.manifest["prompt"]["sha256"],
             "prompt_byte_count": self.manifest["prompt"]["byte_count"],
+            "context": context,
+            "decode_steps": decode_steps,
             "target_tokens": expected_target,
             "actual_tokens": expected_target,
         }
         for key, value in provenance_checks.items():
             if provenance_record.get(key) != value:
                 raise TraceError(f"prompt provenance {key} mismatch")
-        if re.fullmatch(r"[0-9a-f]{64}", provenance_record.get("builder_sha256", "")) is None:
-            raise TraceError("prompt provenance builder SHA-256 is invalid")
+        expected_prompt = approved_prompt_record(
+            prompt_policy,
+            corpus_name=corpus_name,
+            context=context,
+            decode_steps=decode_steps,
+        )
+        builder_checks = {
+            "builder_approval_id": self.verifier.expected_prompt_builder_policy_id,
+            "builder_approval_sha256": prompt_policy_sha256,
+            "builder_path": prompt_policy["executable_path"],
+            "builder_sha256": prompt_policy["executable_sha256"],
+            "builder_revision": prompt_policy["revision"],
+            "builder_runtime_profile": prompt_policy["runtime_profile"],
+        }
+        for key, value in builder_checks.items():
+            if provenance_record.get(key) != value:
+                raise TraceError(f"prompt provenance {key} differs from external approval")
+        for key in ("corpus_name", "corpus_sha256", "context", "decode_steps", "target_tokens",
+                    "prompt_sha256", "prompt_byte_count"):
+            if provenance_record[key] != expected_prompt[key]:
+                raise TraceError(f"prompt provenance {key} differs from approved prompt output")
         _require_exact_keys(
             provenance_record,
-            set(provenance_checks) | {"builder_sha256"},
+            set(provenance_checks) | set(builder_checks),
             "prompt provenance",
         )
         if self.manifest["prompt"].get("target_tokens") != expected_target:
@@ -1945,6 +2690,8 @@ class TraceBundle:
                     "executable_sha256",
                     "runtime_libraries_sha256",
                     "runtime_receipt_sha256",
+                    "exporter_approval_id",
+                    "exporter_approval_sha256",
                 },
                 "llama.cpp candidate attestation",
             )
@@ -1956,11 +2703,15 @@ class TraceBundle:
                     "diff_sha256",
                     "executable_sha256",
                     "runtime_libraries_sha256",
-                    "runtime_receipt_sha256"):
+                    "runtime_receipt_sha256",
+                    "exporter_approval_sha256"):
                 value = candidate.get(key, "")
                 if not isinstance(value, str) or re.fullmatch(
                         r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}", value) is None:
                     raise TraceError(f"candidate {key} is invalid")
+            if re.fullmatch(
+                    r"[A-Za-z0-9._-]{1,128}", candidate.get("exporter_approval_id", "")) is None:
+                raise TraceError("candidate exporter approval ID is invalid")
             executable_path = candidate.get("executable_path")
             if not isinstance(executable_path, str) or not executable_path.startswith("/") or (
                     ".." in PurePosixPath(executable_path).parts or
@@ -1981,6 +2732,26 @@ class TraceBundle:
                 raise TraceError("candidate runtime library identities do not match the trace build")
             if candidate["runtime_receipt_sha256"] != self.manifest["build"]["runtime_receipt_sha256"]:
                 raise TraceError("candidate runtime receipt does not match the trace build")
+            candidate_policy, candidate_policy_sha256 = candidate_exporter_approval(
+                self.verifier.expected_candidate_exporter_policy_id or "",
+                policies=self.verifier.candidate_exporter_policies,
+            )
+            if candidate["exporter_approval_id"] != self.verifier.expected_candidate_exporter_policy_id or (
+                    candidate["exporter_approval_sha256"] != candidate_policy_sha256):
+                raise TraceError("candidate exporter approval differs from external policy")
+            policy_checks = {
+                "repository": candidate["repository"],
+                "revision": candidate["revision"],
+                "base_revision": candidate["base_revision"],
+                "diff_sha256": candidate["diff_sha256"],
+                "executable_path": candidate["executable_path"],
+                "executable_sha256": candidate["executable_sha256"],
+                "runtime_profile": self.manifest["build"]["runtime_profile"],
+                "runtime_receipt": receipt,
+            }
+            for key, value in policy_checks.items():
+                if candidate_policy[key] != value:
+                    raise TraceError(f"candidate {key} differs from external exporter approval")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
@@ -2799,13 +3570,28 @@ def report(
 
 
 def command_validate(args: argparse.Namespace) -> int:
-    bundle = TraceBundle(
-        args.bundle,
-        signer_principal=getattr(args, "signer_principal", None),
-        expected_lane=getattr(args, "lane", None),
-        expected_challenge=getattr(args, "execution_challenge", None),
-        expected_run_id=getattr(args, "run_id", None),
-    )
+    if hasattr(args, "approval_policy"):
+        approval_policy = load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(args.bundle,),
+        )
+        bundle = TraceBundle(
+            args.bundle,
+            verifier=TraceVerifier.production(
+                args.signer_principal,
+                expected_lane=args.lane,
+                expected_challenge=args.execution_challenge,
+                expected_run_id=args.run_id,
+                expected_candidate_exporter_policy_id=args.candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
+            ),
+        )
+    else:
+        bundle = TraceBundle(args.bundle)
     print(canonical_json({
         "status": "valid",
         "runtime": bundle.manifest.get("runtime"),
@@ -2820,24 +3606,70 @@ def command_compare(args: argparse.Namespace) -> int:
     challenge = getattr(args, "execution_challenge", None)
     left_run_id = getattr(args, "left_run_id", None)
     right_run_id = getattr(args, "right_run_id", None)
+    approval_policy = (
+        load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(args.left, args.right),
+        )
+        if hasattr(args, "approval_policy") else None
+    )
     seen_run_ids: set[str] = set()
-    result = report(
-        TraceBundle(
+    if approval_policy is None:
+        left_bundle = TraceBundle(
             args.left,
             signer_principal=left_principal,
             expected_lane=ORACLE_LANE,
             expected_challenge=challenge,
             expected_run_id=left_run_id,
+            expected_candidate_exporter_policy_id=None,
+            expected_prompt_builder_policy_id=getattr(args, "prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
-        ),
-        TraceBundle(
+        )
+        right_bundle = TraceBundle(
             args.right,
             signer_principal=right_principal,
             expected_lane=CANDIDATE_LANE,
             expected_challenge=challenge,
             expected_run_id=right_run_id,
+            expected_candidate_exporter_policy_id=getattr(
+                args, "right_candidate_exporter_policy_id", None),
+            expected_prompt_builder_policy_id=getattr(args, "prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
-        ),
+        )
+    else:
+        left_bundle = TraceBundle(
+            args.left,
+            verifier=TraceVerifier.production(
+                left_principal,
+                expected_lane=ORACLE_LANE,
+                expected_challenge=challenge,
+                expected_run_id=left_run_id,
+                expected_candidate_exporter_policy_id=None,
+                expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
+                seen_run_ids=seen_run_ids,
+            ),
+        )
+        right_bundle = TraceBundle(
+            args.right,
+            verifier=TraceVerifier.production(
+                right_principal,
+                expected_lane=CANDIDATE_LANE,
+                expected_challenge=challenge,
+                expected_run_id=right_run_id,
+                expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
+                seen_run_ids=seen_run_ids,
+            ),
+        )
+    result = report(
+        left_bundle,
+        right_bundle,
     )
     text = canonical_json(result) + "\n"
     if args.report:
@@ -2898,24 +3730,73 @@ def command_compare_local(args: argparse.Namespace) -> int:
     challenge = getattr(args, "execution_challenge", None)
     left_run_id = getattr(args, "left_run_id", None)
     right_run_id = getattr(args, "right_run_id", None)
+    approval_policy = (
+        load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(args.left, args.right),
+        )
+        if hasattr(args, "approval_policy") else None
+    )
     seen_run_ids: set[str] = set()
-    result = local_report(
-        TraceBundle(
+    if approval_policy is None:
+        left_bundle = TraceBundle(
             args.left,
             signer_principal=left_principal,
             expected_lane=CANDIDATE_LANE,
             expected_challenge=challenge,
             expected_run_id=left_run_id,
+            expected_candidate_exporter_policy_id=getattr(
+                args, "left_candidate_exporter_policy_id", None),
+            expected_prompt_builder_policy_id=getattr(
+                args, "left_prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
-        ),
-        TraceBundle(
+        )
+        right_bundle = TraceBundle(
             args.right,
             signer_principal=right_principal,
             expected_lane=CANDIDATE_LANE,
             expected_challenge=challenge,
             expected_run_id=right_run_id,
+            expected_candidate_exporter_policy_id=getattr(
+                args, "right_candidate_exporter_policy_id", None),
+            expected_prompt_builder_policy_id=getattr(
+                args, "right_prompt_builder_policy_id", None),
             seen_run_ids=seen_run_ids,
-        ),
+        )
+    else:
+        left_bundle = TraceBundle(
+            args.left,
+            verifier=TraceVerifier.production(
+                left_principal,
+                expected_lane=CANDIDATE_LANE,
+                expected_challenge=challenge,
+                expected_run_id=left_run_id,
+                expected_candidate_exporter_policy_id=args.left_candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=args.left_prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
+                seen_run_ids=seen_run_ids,
+            ),
+        )
+        right_bundle = TraceBundle(
+            args.right,
+            verifier=TraceVerifier.production(
+                right_principal,
+                expected_lane=CANDIDATE_LANE,
+                expected_challenge=challenge,
+                expected_run_id=right_run_id,
+                expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=args.right_prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
+                seen_run_ids=seen_run_ids,
+            ),
+        )
+    result = local_report(
+        left_bundle,
+        right_bundle,
         args.mode,
     )
     text = canonical_json(result) + "\n"
@@ -2923,6 +3804,12 @@ def command_compare_local(args: argparse.Namespace) -> int:
         args.report.write_text(text, encoding="ascii")
     sys.stdout.write(text)
     return 0 if result["status"] == "BRINGUP PASS" else 1
+
+
+def add_executable_approval_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--approval-policy", type=Path, required=True)
+    parser.add_argument("--approval-signature", type=Path, required=True)
+    parser.add_argument("--approval-principal", required=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2934,6 +3821,9 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--lane", choices=(CANDIDATE_LANE, ORACLE_LANE), required=True)
     validate_parser.add_argument("--execution-challenge", required=True)
     validate_parser.add_argument("--run-id", required=True)
+    validate_parser.add_argument("--candidate-exporter-policy-id")
+    validate_parser.add_argument("--prompt-builder-policy-id", required=True)
+    add_executable_approval_arguments(validate_parser)
     validate_parser.set_defaults(func=command_validate)
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("left", type=Path)
@@ -2943,6 +3833,9 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--execution-challenge", required=True)
     compare_parser.add_argument("--left-run-id", required=True)
     compare_parser.add_argument("--right-run-id", required=True)
+    compare_parser.add_argument("--right-candidate-exporter-policy-id", required=True)
+    compare_parser.add_argument("--prompt-builder-policy-id", required=True)
+    add_executable_approval_arguments(compare_parser)
     compare_parser.add_argument("--report", type=Path)
     compare_parser.set_defaults(func=command_compare)
     local_parser = subparsers.add_parser("compare-local")
@@ -2954,6 +3847,11 @@ def build_parser() -> argparse.ArgumentParser:
     local_parser.add_argument("--execution-challenge", required=True)
     local_parser.add_argument("--left-run-id", required=True)
     local_parser.add_argument("--right-run-id", required=True)
+    local_parser.add_argument("--left-candidate-exporter-policy-id", required=True)
+    local_parser.add_argument("--right-candidate-exporter-policy-id", required=True)
+    local_parser.add_argument("--left-prompt-builder-policy-id", required=True)
+    local_parser.add_argument("--right-prompt-builder-policy-id", required=True)
+    add_executable_approval_arguments(local_parser)
     local_parser.add_argument("--report", type=Path)
     local_parser.set_defaults(func=command_compare_local)
     return parser

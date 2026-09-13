@@ -23,6 +23,7 @@ from preflight import (
 from trace_format import (
     ADMITTED_UBATCH,
     APPROVED_EXPORTERS,
+    APPROVED_PROMPT_BUILDERS,
     APPROVED_TRACE_SIGNERS,
     CORPUS_SHA256,
     DS4_REVISION,
@@ -32,9 +33,12 @@ from trace_format import (
     TraceBundle,
     TraceError,
     TraceVerifier,
+    approval_binding,
     bind_execution_authorization,
     canonical_json,
     execution_authorization,
+    load_executable_approval_policy,
+    prompt_builder_approval,
     reject_loader_overrides,
     seal_bundle,
     sha256_bytes,
@@ -285,6 +289,10 @@ def main() -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--authorization-issued-unix", type=int, required=True)
     parser.add_argument("--authorization-expires-unix", type=int, required=True)
+    parser.add_argument("--prompt-builder-policy-id", required=True)
+    parser.add_argument("--approval-policy", type=Path, required=True)
+    parser.add_argument("--approval-signature", type=Path, required=True)
+    parser.add_argument("--approval-principal", required=True)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
@@ -294,14 +302,40 @@ def main() -> int:
                 f"DeepSeek V4.1 correctness runs require admitted prefill chunk {ADMITTED_UBATCH}, "
                 f"found {args.prefill_chunk}")
         reject_loader_overrides()
+        output = resolved(args.output)
+        approval_policy = load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(output,),
+        )
+        prompt_policy, prompt_policy_sha256 = prompt_builder_approval(
+            args.prompt_builder_policy_id,
+            policies=approval_policy.prompt_builders,
+        )
         authorization = execution_authorization(
             lane=ORACLE_LANE,
             challenge=args.execution_challenge,
             run_id=args.run_id,
             issued_unix=args.authorization_issued_unix,
             expires_unix=args.authorization_expires_unix,
+            approval_policy_sha256=approval_policy.sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            approvals={
+                "prompt_builder": approval_binding(
+                    "prompt_builder",
+                    args.prompt_builder_policy_id,
+                    prompt_policy_sha256,
+                ),
+            },
         )
-        output = resolved(args.output)
+        harness_repo = resolved(args.repo)
+        harness_revision = subprocess.check_output(
+            ["git", "-C", str(harness_repo), "rev-parse", "HEAD"],
+            stderr=subprocess.STDOUT,
+        ).decode("ascii").strip()
+        if harness_revision != approval_policy.verifier_revision:
+            raise PreflightError("ds4 verifier checkout differs from the external approval policy")
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         exporter = resolved(args.exporter)
@@ -350,6 +384,11 @@ def main() -> int:
             corpus_sha256=args.corpus_sha256,
             model_sha256=model_sha256,
             target_tokens=args.context - args.decode_steps,
+            context=args.context,
+            decode_steps=args.decode_steps,
+            builder_approval_id=args.prompt_builder_policy_id,
+            builder_policy=prompt_policy,
+            builder_policy_sha256=prompt_policy_sha256,
             path_resolver=lambda path, label: Path(
                 str(darwin_storage_attestation(path, label)["resolved_path"])),
         )
@@ -382,6 +421,12 @@ def main() -> int:
             expected_lane=ORACLE_LANE,
             expected_challenge=args.execution_challenge,
             expected_run_id=args.run_id,
+            candidate_exporter_policies={},
+            prompt_builder_policies=approval_policy.prompt_builders,
+            expected_candidate_exporter_policy_id=None,
+            expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+            expected_approval_policy_sha256=approval_policy.sha256,
+            expected_verifier_revision=approval_policy.verifier_revision,
             trusted_signers=APPROVED_TRACE_SIGNERS,
         )
         bundle = TraceBundle(
@@ -391,6 +436,10 @@ def main() -> int:
                 expected_lane=ORACLE_LANE,
                 expected_challenge=args.execution_challenge,
                 expected_run_id=args.run_id,
+                expected_candidate_exporter_policy_id=None,
+                expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
             ),
         )
         if bundle.manifest.get("runtime") != "ds4":

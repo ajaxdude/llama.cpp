@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -25,6 +26,8 @@ from preflight import (
 from trace_format import (
     ADMITTED_BATCH,
     ADMITTED_UBATCH,
+    APPROVED_CANDIDATE_EXPORTERS,
+    APPROVED_PROMPT_BUILDERS,
     APPROVED_TRACE_SIGNERS,
     CANDIDATE_LANE,
     CORPUS_SHA256,
@@ -36,15 +39,24 @@ from trace_format import (
     TraceBundle,
     TraceError,
     TraceVerifier,
+    approval_binding,
+    approved_executable_identity,
+    approved_runtime_file_identities,
     bind_execution_authorization,
+    candidate_exporter_approval,
     canonical_json,
     execution_authorization,
+    load_executable_approval_policy,
     reject_loader_overrides,
+    run_approved_executable,
     seal_bundle,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    prompt_builder_approval,
     validate_signing_identity,
+    verify_approved_executable_identity,
+    verify_approved_runtime_file_identities,
 )
 
 
@@ -58,11 +70,19 @@ def git_output(repo: Path, *args: str) -> bytes:
 def candidate_attestation(
         args: argparse.Namespace,
         exporter: Path,
-        exporter_sha256: str) -> dict[str, str]:
+        exporter_sha256: str,
+        approval_id: str,
+        approval_sha256: str,
+        approval: dict[str, object],
+        verifier_revision: str) -> dict[str, str]:
     repo = resolved(args.repo)
     exporter = resolved(exporter)
-    revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
+    observed_verifier_revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
+    revision = git_output(repo, "rev-parse", args.candidate_revision).decode("ascii").strip()
     base_revision = git_output(repo, "rev-parse", args.base_revision).decode("ascii").strip()
+    if observed_verifier_revision != verifier_revision:
+        raise PreflightError(
+            f"verifier revision mismatch: expected {verifier_revision}, found {observed_verifier_revision}")
     if revision != args.candidate_revision:
         raise PreflightError(
             f"candidate revision mismatch: expected {args.candidate_revision}, found {revision}")
@@ -98,13 +118,21 @@ def candidate_attestation(
     if diff_sha256 != args.candidate_diff_sha256:
         raise PreflightError(
             f"candidate diff SHA-256 mismatch: expected {args.candidate_diff_sha256}, found {diff_sha256}")
-    return {
+    expected = {
         "repository": REPOSITORY,
         "revision": revision,
         "base_revision": base_revision,
         "diff_sha256": diff_sha256,
         "executable_path": str(exporter),
         "executable_sha256": exporter_sha256,
+    }
+    for key, value in expected.items():
+        if approval.get(key) != value:
+            raise PreflightError(f"candidate {key} differs from external exporter approval")
+    return {
+        **expected,
+        "exporter_approval_id": approval_id,
+        "exporter_approval_sha256": approval_sha256,
     }
 
 
@@ -113,7 +141,8 @@ def validate_runtime_build(
         *,
         exporter: Path,
         exporter_sha256: str,
-        candidate_revision: str) -> tuple[str, str]:
+        candidate_revision: str,
+        approval: dict[str, object]) -> tuple[str, str]:
     build = manifest.get("build")
     if not isinstance(build, dict):
         raise PreflightError("llama trace build identity is missing")
@@ -227,8 +256,54 @@ def validate_runtime_build(
     receipt_sha256 = sha256_bytes(canonical_json(receipt).encode("ascii"))
     if build.get("runtime_receipt_sha256") != receipt_sha256:
         raise PreflightError("llama trace runtime receipt SHA-256 mismatch")
+    if approval.get("runtime_profile") != profile or approval.get("runtime_receipt") != receipt:
+        raise PreflightError("llama trace runtime receipt differs from external exporter approval")
     closure = {"pre": libraries, "post": post_libraries}
     return sha256_bytes(canonical_json(closure).encode("ascii")), receipt_sha256
+
+
+def query_runtime_build_attestation(
+        exporter: Path,
+        device: str,
+        *,
+        exporter_sha256: str,
+        candidate_revision: str,
+        approval: dict[str, object]) -> dict[str, object]:
+    result, _identity = run_approved_executable(
+        [str(exporter), "--dsv41-attest-build", device],
+        path=exporter,
+        expected_path=approval["executable_path"],
+        expected_sha256=approval["executable_sha256"],
+        label="candidate exporter",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise PreflightError(f"candidate exporter build attestation failed: {result.stderr.strip()}")
+    try:
+        build = strict_json_loads(result.stdout)
+    except TraceError as error:
+        raise PreflightError(f"candidate exporter build attestation is invalid: {error}") from error
+    if not isinstance(build, dict):
+        raise PreflightError("candidate exporter build attestation is not an object")
+    manifest = {"revision": candidate_revision, "build": copy.deepcopy(build)}
+    libraries = manifest["build"].get("runtime_libraries")
+    if not isinstance(libraries, list):
+        raise PreflightError("candidate exporter build attestation has no runtime libraries")
+    manifest["build"]["runtime_libraries_post"] = copy.deepcopy(libraries)
+    monitor = manifest["build"].get("runtime_module_monitor")
+    if not isinstance(monitor, dict):
+        raise PreflightError("candidate exporter build attestation has no runtime monitor")
+    monitor["checked_after_trace"] = True
+    validate_runtime_build(
+        manifest,
+        exporter=exporter,
+        exporter_sha256=exporter_sha256,
+        candidate_revision=candidate_revision,
+        approval=approval,
+    )
+    return build
 
 
 def bind_candidate_attestation(
@@ -236,7 +311,8 @@ def bind_candidate_attestation(
         attestation: dict[str, str],
         accelerator: dict[str, object],
         exporter: Path,
-        exporter_sha256: str) -> None:
+        exporter_sha256: str,
+        approval: dict[str, object]) -> None:
     manifest_path = safe_trace_path(output, "manifest.json")
     try:
         manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
@@ -250,6 +326,7 @@ def bind_candidate_attestation(
         exporter=exporter,
         exporter_sha256=exporter_sha256,
         candidate_revision=attestation["revision"],
+        approval=approval,
     )
     bound_attestation["runtime_libraries_sha256"] = libraries_sha256
     bound_attestation["runtime_receipt_sha256"] = receipt_sha256
@@ -309,14 +386,29 @@ def validate_accelerator_attestation(
     return dict(record)
 
 
-def query_accelerator_attestation(exporter: Path, device: str) -> dict[str, object]:
+def query_accelerator_attestation(
+        exporter: Path,
+        device: str,
+        approval: dict[str, object] | None = None) -> dict[str, object]:
     try:
-        result = subprocess.run(
-            [str(exporter), "--dsv41-attest-device", device],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        if approval is None:
+            result = subprocess.run(
+                [str(exporter), "--dsv41-attest-device", device],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            result, _identity = run_approved_executable(
+                [str(exporter), "--dsv41-attest-device", device],
+                path=exporter,
+                expected_path=approval["executable_path"],
+                expected_sha256=approval["executable_sha256"],
+                label="candidate exporter",
+                check=False,
+                capture_output=True,
+                text=True,
+            )
     except OSError as error:
         raise PreflightError(f"cannot query selected accelerator: {error}") from error
     if result.returncode != 0:
@@ -378,6 +470,11 @@ def main() -> int:
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--base-revision", required=True)
     parser.add_argument("--candidate-diff-sha256", required=True)
+    parser.add_argument("--candidate-exporter-policy-id", required=True)
+    parser.add_argument("--prompt-builder-policy-id", required=True)
+    parser.add_argument("--approval-policy", type=Path, required=True)
+    parser.add_argument("--approval-signature", type=Path, required=True)
+    parser.add_argument("--approval-principal", required=True)
     parser.add_argument("--corpus-name", choices=sorted(CORPUS_SHA256), required=True)
     parser.add_argument("--corpus-sha256", required=True)
     parser.add_argument("--prompt-provenance", type=Path, required=True)
@@ -405,14 +502,42 @@ def main() -> int:
     try:
         validate_runtime_config(args)
         reject_loader_overrides()
+        output = resolved(args.output)
+        approval_policy = load_executable_approval_policy(
+            args.approval_policy,
+            args.approval_signature,
+            expected_principal=args.approval_principal,
+            forbidden_roots=(output,),
+        )
+        candidate_policy, candidate_policy_sha256 = candidate_exporter_approval(
+            args.candidate_exporter_policy_id,
+            policies=approval_policy.candidate_exporters,
+        )
+        prompt_policy, prompt_policy_sha256 = prompt_builder_approval(
+            args.prompt_builder_policy_id,
+            policies=approval_policy.prompt_builders,
+        )
         authorization = execution_authorization(
             lane=CANDIDATE_LANE,
             challenge=args.execution_challenge,
             run_id=args.run_id,
             issued_unix=args.authorization_issued_unix,
             expires_unix=args.authorization_expires_unix,
+            approval_policy_sha256=approval_policy.sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            approvals={
+                "candidate_exporter": approval_binding(
+                    "candidate_exporter",
+                    args.candidate_exporter_policy_id,
+                    candidate_policy_sha256,
+                ),
+                "prompt_builder": approval_binding(
+                    "prompt_builder",
+                    args.prompt_builder_policy_id,
+                    prompt_policy_sha256,
+                ),
+            },
         )
-        output = resolved(args.output)
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         validate_signing_identity(
@@ -421,10 +546,42 @@ def main() -> int:
             trusted_signers=APPROVED_TRACE_SIGNERS,
             forbidden_root=output,
         )
-        exporter = resolved(args.exporter)
-        if not exporter.is_file() or not os.access(exporter, os.X_OK):
-            raise PreflightError(f"trace exporter is not executable: {exporter}")
-        accelerator = query_accelerator_attestation(exporter, args.device)
+        exporter = args.exporter
+        exporter_identity = approved_executable_identity(
+            exporter,
+            expected_path=candidate_policy["executable_path"],
+            expected_sha256=candidate_policy["executable_sha256"],
+            label="candidate exporter",
+        )
+        runtime_identities = approved_runtime_file_identities(
+            candidate_policy, label="candidate exporter")
+        exporter_sha256 = exporter_identity.sha256
+        if args.candidate_revision != candidate_policy["revision"] or (
+                args.base_revision != candidate_policy["base_revision"]) or (
+                args.candidate_diff_sha256 != candidate_policy["diff_sha256"]):
+            raise PreflightError("candidate arguments differ from external exporter approval")
+        repo = resolved(args.repo)
+        if git_output(repo, "rev-parse", "HEAD").decode("ascii").strip() != (
+                approval_policy.verifier_revision):
+            raise PreflightError("candidate verifier checkout differs from the external approval policy")
+        if str(repo) != prompt_policy["source_root"] or candidate_policy["revision"] != prompt_policy["revision"]:
+            raise PreflightError("candidate repository or revision differs from prompt builder approval")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
+        pre_runtime_build = query_runtime_build_attestation(
+            exporter,
+            args.device,
+            exporter_sha256=exporter_sha256,
+            candidate_revision=args.candidate_revision,
+            approval=candidate_policy,
+        )
+        verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
+        accelerator = query_accelerator_attestation(exporter, args.device, candidate_policy)
+        verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
         if args.preflight_only:
             audit = run_strix_preflight(
                 model=args.model,
@@ -437,7 +594,6 @@ def main() -> int:
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
-        exporter_sha256 = sha256_file(exporter)
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
@@ -448,8 +604,21 @@ def main() -> int:
             corpus_sha256=args.corpus_sha256,
             model_sha256=model_sha256,
             target_tokens=args.context - args.decode_steps,
+            context=args.context,
+            decode_steps=args.decode_steps,
+            builder_approval_id=args.prompt_builder_policy_id,
+            builder_policy=prompt_policy,
+            builder_policy_sha256=prompt_policy_sha256,
         )
-        attestation = candidate_attestation(args, exporter, exporter_sha256)
+        attestation = candidate_attestation(
+            args,
+            exporter,
+            exporter_sha256,
+            args.candidate_exporter_policy_id,
+            candidate_policy_sha256,
+            candidate_policy,
+            approval_policy.verifier_revision,
+        )
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
         preflight_audit = run_strix_preflight(
@@ -481,9 +650,37 @@ def main() -> int:
         environment["DSV41_TRACE_WATCHDOG_AUDIT"] = pre_audits["watchdog"]
         command = build_command(args, exporter, output)
         print("exec:", shlex.join(command), file=sys.stderr)
-        result = subprocess.run(command, env=environment, check=False)
+        verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
+        result, executed_identity = run_approved_executable(
+            command,
+            path=exporter,
+            expected_path=candidate_policy["executable_path"],
+            expected_sha256=candidate_policy["executable_sha256"],
+            label="candidate exporter",
+            env=environment,
+            check=False,
+        )
+        if executed_identity != exporter_identity:
+            raise PreflightError("candidate exporter execution identity differs from external approval")
         if result.returncode != 0:
             return result.returncode
+        verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
+        post_runtime_build = query_runtime_build_attestation(
+            exporter,
+            args.device,
+            exporter_sha256=exporter_sha256,
+            candidate_revision=args.candidate_revision,
+            approval=candidate_policy,
+        )
+        if post_runtime_build != pre_runtime_build:
+            raise PreflightError("candidate exporter build identity changed during trace execution")
+        verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
         verify_sealed_audits(pre_audits, pre_audit_digests)
         postflight_audit = run_strix_preflight(
             model=args.model,
@@ -492,15 +689,21 @@ def main() -> int:
             repo=args.repo,
             busy_patterns=args.busy_pattern,
         )
-        post_accelerator = query_accelerator_attestation(exporter, args.device)
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
+        post_accelerator = query_accelerator_attestation(
+            exporter, args.device, candidate_policy)
         if post_accelerator != accelerator:
             raise PreflightError("selected accelerator identity changed during trace execution")
+        verify_approved_runtime_file_identities(
+            runtime_identities, label="candidate exporter")
         postflight_audit["runtime"] = "llama.cpp"
         postflight_audit["accelerator"] = post_accelerator
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
-        bind_candidate_attestation(output, attestation, accelerator, exporter, exporter_sha256)
+        bind_candidate_attestation(
+            output, attestation, accelerator, exporter, exporter_sha256, candidate_policy)
         bind_execution_authorization(output, authorization)
         seal_bundle(
             output,
@@ -509,6 +712,12 @@ def main() -> int:
             expected_lane=CANDIDATE_LANE,
             expected_challenge=args.execution_challenge,
             expected_run_id=args.run_id,
+            candidate_exporter_policies=approval_policy.candidate_exporters,
+            prompt_builder_policies=approval_policy.prompt_builders,
+            expected_candidate_exporter_policy_id=args.candidate_exporter_policy_id,
+            expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+            expected_approval_policy_sha256=approval_policy.sha256,
+            expected_verifier_revision=approval_policy.verifier_revision,
             trusted_signers=APPROVED_TRACE_SIGNERS,
         )
         bundle = TraceBundle(
@@ -518,6 +727,10 @@ def main() -> int:
                 expected_lane=CANDIDATE_LANE,
                 expected_challenge=args.execution_challenge,
                 expected_run_id=args.run_id,
+                expected_candidate_exporter_policy_id=args.candidate_exporter_policy_id,
+                expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
+                approval_policy=approval_policy,
+                verification_unix=None,
             ),
         )
         if bundle.manifest.get("runtime") != "llama.cpp":

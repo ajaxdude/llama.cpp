@@ -15,6 +15,10 @@ Seal v1 signs `dsv41-trace-bundle-v1\n` followed by canonical JSON records for `
 
 Signer trust is external to the bundle. `APPROVED_TRACE_SIGNERS` maps one restricted ASCII principal to one exact OpenSSH Ed25519 public key, runtime lane, and runtime profile, and is intentionally empty until a separately authorized run. Candidate and oracle signers are not interchangeable. Every signed manifest also binds an externally supplied 256-bit challenge, lane-specific run ID, and bounded validity window. Validation requires those expected values from outside the bundle and rejects missing, mismatched, reused within a comparison, cross-lane, not-yet-valid, or expired authorization. The bundle cannot provide a public key, authoritative principal, verifier path, or allowed-signers file. Validation uses only `/usr/bin/ssh-keygen` on macOS and Linux or `C:\Windows\System32\OpenSSH\ssh-keygen.exe` on Windows, rejects symlinks and unsupported `-Y` implementations, clears SSH-agent influence, and never searches `PATH`. The private signing key must be an owned restrictive regular file outside the bundle and is never copied or logged. Tests use explicit test-only verifiers with ephemeral lane-specific keys; production validation does not trust those keys.
 
+Executable trust is also external to the bundle and to the reviewed source revision. `APPROVED_EXECUTABLE_APPROVERS`, `APPROVED_CANDIDATE_EXPORTERS`, and `APPROVED_PROMPT_BUILDERS` are intentionally empty in production source. An authorized run must receive a canonical detached approval policy plus its OpenSSH signature and an externally expected approver principal. Both files must be absolute canonical non-symlinked regular files outside every protected output root. The approver public key comes only from `APPROVED_EXECUTABLE_APPROVERS`; the fixed `ssh-keygen` verifies namespace `dsv41-executable-approval-v1` before either executable can run. This avoids an impossible same-revision self-reference: the policy records the artifact producer revision and exact executable hashes, while a separate `verifier_revision` records the harness revision that consumes the policy.
+
+The candidate exporter approval binds the exact producer revision, base revision, binary diff SHA-256, canonical install root and exporter path, exporter SHA-256, runtime profile, and complete embedded runtime receipt. The prompt-builder approval binds its producer revision, canonical install/source roots and executable path, executable SHA-256, exact runtime profile and receipt, model and corpus identities, and exact prompt hash, byte count, BOS behavior, context, and decode configuration for every authorized case. Every receipt library is hashed before the corresponding executable can run and rechecked afterward. On the Linux candidate host, both the exporter and prompt builder are opened without following the final symlink and executed through the retained `/proc/self/fd` descriptor, so pathname replacement cannot select a different executable object. The signed execution authorization records the complete approval-policy SHA-256, verifier revision, and both selected approval record IDs and hashes. Candidate-derived attestations and prompt provenance are evidence only and must exactly equal those external records.
+
 Every manifest and memory audit declares that the expert cache and KV cache are memory-resident and that there are no external cache or state paths. Missing, substituted, or additional file-backed cache/state declarations fail closed.
 
 The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected. Any graph tensor in the reserved `dsv41.trace.*` namespace with an unknown component, malformed suffix, or unexpected layer fails the exporter.
@@ -28,11 +32,21 @@ Validate or compare bundles:
 ```sh
 python3 tools/deepseek-v41-trace/trace_format.py validate TRACE \
   --signer-principal PRINCIPAL --lane strix-llama-candidate-v1 \
-  --execution-challenge "$CHALLENGE" --run-id "$RUN_ID"
+  --execution-challenge "$CHALLENGE" --run-id "$RUN_ID" \
+  --candidate-exporter-policy-id "$CANDIDATE_EXPORTER_POLICY_ID" \
+  --prompt-builder-policy-id "$PROMPT_BUILDER_POLICY_ID" \
+  --approval-policy "$APPROVAL_POLICY" \
+  --approval-signature "$APPROVAL_SIGNATURE" \
+  --approval-principal "$APPROVAL_PRINCIPAL"
 python3 tools/deepseek-v41-trace/trace_format.py compare DS4_TRACE LLAMA_TRACE \
   --left-signer-principal DS4_PRINCIPAL --right-signer-principal LLAMA_PRINCIPAL \
   --execution-challenge "$CHALLENGE" \
   --left-run-id "$DS4_RUN_ID" --right-run-id "$LLAMA_RUN_ID" \
+  --right-candidate-exporter-policy-id "$CANDIDATE_EXPORTER_POLICY_ID" \
+  --prompt-builder-policy-id "$PROMPT_BUILDER_POLICY_ID" \
+  --approval-policy "$APPROVAL_POLICY" \
+  --approval-signature "$APPROVAL_SIGNATURE" \
+  --approval-principal "$APPROVAL_PRINCIPAL" \
   --report report.json
 ```
 
@@ -142,13 +156,13 @@ The exporter is intentionally external to the canonical ds4 checkout. It must be
 
 The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the normal model, context, batch, ubatch, KV, Flash Attention, offload, and expert-cache arguments. `-bf` supplies the exact prompt bytes, `-n` is the number of greedy decode steps, and `-o` is the trace directory. It also requires `DSV41_TRACE_MEMORY_AUDIT`, `DSV41_TRACE_SWAP_AUDIT`, and `DSV41_TRACE_WATCHDOG_AUDIT` so every run points to its safety evidence. The content-addressed memory audit binds the preflight accelerator and storage attestations; the manifest binds the independently repeated native accelerator attestation.
 
-Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, repository path, externally approved signer principal, and matching private signing key. The private key is never copied or logged. Its public half is derived with the fixed trusted `ssh-keygen` executable and must exactly match the source-controlled signer map before model execution.
+Use `run_llama.py` on the validation host instead of calling the exporter directly. It verifies the detached executable approval policy before invoking the exporter, then applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact producer revision, immutable base revision, expected base-to-producer binary diff SHA-256, verifier repository path and revision, external executable approval, externally approved signer principal, and matching private signing key. The private key is never copied or logged. Its public half is derived with the fixed trusted `ssh-keygen` executable and must exactly match the source-controlled signer map before model execution.
 
-The native exporter embeds the full 40-character candidate revision independently of dynamically loaded build-info, resolves its actual executable path, and validates every loaded `llama`, `ggml`, and enabled backend project library against the build-generated component receipt and selected runtime profile. Component name, filename, canonical path, SHA-256, role, and exact revision-bearing identity must match, and the measured loaded set must equal the predeclared profile set both immediately before protected trace generation and after it completes. Both snapshots and the completed loader-monitor receipt are signed. macOS also monitors loader additions during the protected interval. Missing, duplicated, unclassified, outside-root, renamed inside-root injected, catalogued-but-not-profile, changed, or late-loaded project libraries fail closed. Linux enumerates loaded ELF objects rather than arbitrary memory mappings and accepts non-project ROCm dependencies only from a root-owned, non-writable `/opt/rocm` installation. Production launchers and the native exporter reject dynamic-loader and `GGML_BACKEND_PATH` overrides. The executable hash is bound separately by the signed manifest to avoid link-time hash circularity.
+The launcher checks the approved candidate exporter path, hash, device/inode, size, modification time, and change time before any exporter invocation and after each protected operation. The read-only `--dsv41-attest-build ROCm0` command loads the selected backend and emits the embedded runtime profile and receipt before model execution; the launcher requires exact equality with the external approval and repeats the attestation after trace completion. The native exporter embeds the full 40-character producer revision independently of dynamically loaded build-info, resolves its actual executable path, and validates every loaded `llama`, `ggml`, and enabled backend project library against the build-generated component receipt and selected runtime profile. Component name, filename, canonical path, SHA-256, role, and exact revision-bearing identity must match, and the measured loaded set must equal the predeclared profile set both immediately before protected trace generation and after it completes. Both snapshots and the completed loader-monitor receipt are signed. macOS also monitors loader additions during the protected interval. Missing, duplicated, unclassified, outside-root, renamed inside-root injected, catalogued-but-not-profile, changed, or late-loaded project libraries fail closed. Linux enumerates loaded ELF objects rather than arbitrary memory mappings and accepts non-project ROCm dependencies only from a root-owned, non-writable `/opt/rocm` installation. Production launchers and the native exporter reject dynamic-loader and `GGML_BACKEND_PATH` overrides.
 
 Production installs no manifest-writing or runtime-path probe option. With `LLAMA_BUILD_TESTS`, CMake builds the non-installed `test-deepseek41-trace-manifest` harness from the same native writer implementation. Its input accepts only model, prompt, audit, expected-coverage, and event-count data. Runtime, accelerator, path, configuration, build, and environment evidence comes from measured local state, and CPU or Darwin output is explicitly test-only and cannot satisfy production candidate or signer requirements. The trace install component places the exact receipt libraries beside the tools and sets `@loader_path/../lib` on macOS or `$ORIGIN/../lib` on ELF so installed `--version` needs no loader override. The install test also hashes every installed component and requires exact equality with the receipt embedded after the original library link; install-time rewriting or re-signing fails.
 
-`run_matrix.py --llama-only` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, and captures the llama.cpp side. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the final integration revision, immutable oracle revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass later contexts only after the 32K target passes. The Apple oracle is captured separately with `run_ds4.py`; compare completed per-case bundles with `trace_format.py compare`.
+`run_matrix.py --llama-only` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, and verifies the approved builder path/hash and both original and copied corpus identities before prompt construction. It rechecks the builder and corpus identities after execution and requires the generated prompt hash, byte count, BOS behavior, context, and decode configuration to equal the signed external approval before writing provenance. Pass the detached approval policy and signature, selected candidate and prompt approval IDs, both executables, the producer revision/base/diff identity, and the verifier checkout. Its default context matrix is 32768. Pass later contexts only after the 32K target passes. The Apple oracle is captured separately with `run_ds4.py`; compare completed per-case bundles with `trace_format.py compare`.
 
 ## Apple Metal oracle execution gate
 
@@ -179,6 +193,11 @@ DIFF_SHA256="$(git -C "$REPO" diff --binary --no-ext-diff "$BASE_REV" "$CANDIDAT
 CHALLENGE=<64-lowercase-hex-execution-challenge>
 AUTH_ISSUED=<unix-seconds>
 AUTH_EXPIRES=<unix-seconds-no-more-than-24h-after-issued>
+APPROVAL_POLICY=<absolute-canonical-signed-policy-path>
+APPROVAL_SIGNATURE=<absolute-canonical-detached-signature-path>
+APPROVAL_PRINCIPAL=<source-approved-executable-approver>
+CANDIDATE_EXPORTER_POLICY_ID=<approved-candidate-record-id>
+PROMPT_BUILDER_POLICY_ID=<approved-prompt-builder-record-id>
 
 mkdir -p "$CASE_ROOT/watchdog"
 cd "$REPO"
@@ -203,6 +222,11 @@ HIP_LAUNCH_BLOCKING=1 python3 scripts/strix_memory_watchdog.py \
     --candidate-revision "$CANDIDATE_REV" \
     --base-revision "$BASE_REV" \
     --candidate-diff-sha256 "$DIFF_SHA256" \
+    --candidate-exporter-policy-id "$CANDIDATE_EXPORTER_POLICY_ID" \
+    --prompt-builder-policy-id "$PROMPT_BUILDER_POLICY_ID" \
+    --approval-policy "$APPROVAL_POLICY" \
+    --approval-signature "$APPROVAL_SIGNATURE" \
+    --approval-principal "$APPROVAL_PRINCIPAL" \
     --signer-principal "$LLAMA_SIGNER_PRINCIPAL" \
     --signing-key "$LLAMA_SIGNING_KEY" \
     --execution-challenge "$CHALLENGE" \
@@ -239,6 +263,10 @@ python3 tools/deepseek-v41-trace/run_ds4.py \
   --prompt /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt \
   --prompt-provenance /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt.provenance.json \
   --output /Users/oracle/dsv41/traces/correctness-prose-c32768-ub32 \
+  --approval-policy "$APPROVAL_POLICY" \
+  --approval-policy-signature "$APPROVAL_POLICY_SIGNATURE" \
+  --approval-approver-principal "$APPROVAL_APPROVER_PRINCIPAL" \
+  --prompt-builder-approval-id "$PROMPT_BUILDER_APPROVAL_ID" \
   --corpus-name correctness-prose.txt \
   --corpus-sha256 2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2 \
   --context 32768 \
