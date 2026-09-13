@@ -1492,6 +1492,7 @@ def _emit_final(
     process_group_status: str = "not_created",
     error: str | None = None,
     preserve_primary_on_artifact_error: bool = False,
+    secondary_errors: Sequence[dict[str, str]] | None = None,
 ) -> int:
     fields = _state_fields(
         snapshot,
@@ -1504,6 +1505,8 @@ def _emit_final(
     fields.update(classification=classification, exit_code=exit_code)
     if error:
         fields["error"] = error
+    if secondary_errors:
+        fields["secondary_errors"] = list(secondary_errors)
 
     def record_artifact_error(exc: ArtifactError) -> None:
         nonlocal exit_code
@@ -1867,6 +1870,19 @@ def _graceful_cleanup(
         error,
         preserve_primary_on_artifact_error=(
             guardian_control_error is not None
+        ),
+        secondary_errors=(
+            [
+                {
+                    "component": artifact_error.component,
+                    "detail": str(artifact_error),
+                }
+            ]
+            if (
+                guardian_control_error is not None
+                and artifact_error is not None
+            )
+            else None
         ),
     )
 

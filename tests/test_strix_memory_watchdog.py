@@ -571,14 +571,15 @@ class TestWatchdogBehavior(unittest.TestCase):
         self,
     ) -> None:
         class FailingFinalAudit:
-            def __init__(self, stream: Any):
+            def __init__(self, stream: Any, fail_at: int):
                 self.stream = stream
                 self.write_count = 0
+                self.fail_at = fail_at
 
             def write(self, value: str) -> int:
                 self.write_count += 1
-                if self.write_count == 3:
-                    raise OSError("final audit write failed")
+                if self.write_count == self.fail_at:
+                    raise OSError("audit write failed")
                 return self.stream.write(value)
 
             def flush(self) -> None:
@@ -608,7 +609,12 @@ class TestWatchdogBehavior(unittest.TestCase):
             " time.sleep(30)\n"
         )
         for mode in ("closed", "blocked"):
-            for artifact_failure in ("audit", "lease"):
+            for artifact_failure in (
+                "term_audit",
+                "kill_audit",
+                "final_audit",
+                "lease",
+            ):
                 with self.subTest(
                     mode=mode,
                     artifact_failure=artifact_failure,
@@ -658,13 +664,18 @@ class TestWatchdogBehavior(unittest.TestCase):
             )
             stream = io.StringIO()
             audit = watchdog.AuditLogger(stream)
-            if artifact_failure == "audit":
+            if artifact_failure.endswith("_audit"):
                 persistent_path = Path(temp_dir) / "persistent.jsonl"
                 persistent_stream = persistent_path.open(
                     "w", encoding="utf-8"
                 )
                 audit.persistent_stream = failing_final_audit(
-                    persistent_stream
+                    persistent_stream,
+                    {
+                        "term_audit": 1,
+                        "kill_audit": 2,
+                        "final_audit": 3,
+                    }[artifact_failure],
                 )
             else:
                 audit.lease_manager = failing_final_lease()
@@ -728,7 +739,19 @@ class TestWatchdogBehavior(unittest.TestCase):
             )
             self.assertEqual(
                 records[-1]["secondary_errors"][0]["component"],
-                artifact_failure,
+                (
+                    "audit"
+                    if artifact_failure.endswith("_audit")
+                    else "lease"
+                ),
+            )
+            self.assertIn(
+                (
+                    "audit write failed"
+                    if artifact_failure.endswith("_audit")
+                    else "final lease write failed"
+                ),
+                records[-1]["secondary_errors"][0]["detail"],
             )
             self.assertEqual(
                 records[-1]["child_returncode"],
