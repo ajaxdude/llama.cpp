@@ -21,12 +21,12 @@ TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 APPROVED_EXPORTERS: dict[str, str] = {}
 APPROVED_TRACE_SIGNERS: dict[str, dict[str, str]] = {}
-APPROVED_EXECUTABLE_APPROVERS: dict[str, str] = {}
+APPROVED_EXECUTABLE_APPROVERS: dict[str, dict[str, Any]] = {}
 APPROVED_CANDIDATE_EXPORTERS: dict[str, dict[str, Any]] = {}
 APPROVED_PROMPT_BUILDERS: dict[str, dict[str, Any]] = {}
 EXECUTABLE_APPROVAL_FORMAT = "dsv41-executable-approval"
-EXECUTABLE_APPROVAL_VERSION = 1
-EXECUTABLE_APPROVAL_NAMESPACE = "dsv41-executable-approval-v1"
+EXECUTABLE_APPROVAL_VERSION = 2
+EXECUTABLE_APPROVAL_NAMESPACE = "dsv41-executable-approval-v2"
 SEAL_FORMAT = "dsv41-trace-bundle-signature"
 SEAL_VERSION = 1
 SEAL_NAMESPACE = "dsv41-trace-bundle-v1"
@@ -246,12 +246,17 @@ class BundleFileReceipt:
 @dataclass(frozen=True)
 class ExecutableFileReceipt:
     path: str
+    install_root: str
     device: int
     inode: int
+    owner_uid: int
+    mode: int
+    link_count: int
     byte_count: int
     modified_ns: int
     changed_ns: int
     sha256: str
+    path_chain: tuple[tuple[str, int, int, int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -310,21 +315,138 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _execution_uid() -> int:
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        raise TraceError("immutable install paths require a POSIX execution identity")
+    return os.geteuid()
+
+
+def _path_is_writable_by_execution_identity(path: Path) -> bool:
+    if _execution_uid() == 0:
+        raise TraceError("immutable install paths require an unprivileged POSIX execution identity")
+    try:
+        return os.access(path, os.W_OK, effective_ids=True)
+    except (OSError, TypeError, NotImplementedError) as error:
+        raise TraceError(f"cannot verify effective write access for {path}: {error}") from error
+
+
+def _require_distinct_trusted_owner(expected_owner_uid: int) -> None:
+    execution_uid = _execution_uid()
+    if execution_uid == 0 or expected_owner_uid == execution_uid:
+        raise TraceError("approved install tree owner must be distinct from the unprivileged execution identity")
+
+
+def _has_access_control_entries(path: Path) -> bool:
+    if sys.platform.startswith("linux"):
+        try:
+            attributes = os.listxattr(path, follow_symlinks=False)
+        except OSError as error:
+            raise TraceError(f"cannot inspect access controls for {path}: {error}") from error
+        return any(name in {"system.posix_acl_access", "system.posix_acl_default"} for name in attributes)
+    if sys.platform == "darwin":
+        tool = Path("/bin/ls")
+        try:
+            tool_stat = tool.stat(follow_symlinks=False)
+        except OSError as error:
+            raise TraceError(f"cannot inspect the fixed macOS ACL verifier: {error}") from error
+        if not stat.S_ISREG(tool_stat.st_mode) or tool_stat.st_uid != 0 or (
+                stat.S_IMODE(tool_stat.st_mode) & 0o022):
+            raise TraceError("the fixed macOS ACL verifier is not trusted")
+        try:
+            result = subprocess.run(
+                [str(tool), "-lde", str(path)],
+                stdin=subprocess.DEVNULL,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise TraceError(f"cannot inspect access controls for {path}: {error}") from error
+        if result.returncode != 0:
+            raise TraceError(f"cannot inspect access controls for {path}")
+        first_line = result.stdout.splitlines()[0] if result.stdout else ""
+        fields = first_line.split()
+        if not fields or len(fields[0]) < 10:
+            raise TraceError(f"access control output for {path} is invalid")
+        return "+" in fields[0]
+    raise TraceError("immutable install path access-control verification is unsupported on this platform")
+
+
+def _immutable_path_chain(
+        path: Path,
+        *,
+        install_root: Path,
+        expected_owner_uid: int,
+        label: str,
+) -> tuple[tuple[str, int, int, int, int], ...]:
+    if not path.is_absolute() or not install_root.is_absolute() or (
+            path != install_root and install_root not in path.parents):
+        raise TraceError(f"{label} path is outside its approved install root")
+    try:
+        if str(path.resolve(strict=True)) != str(path) or str(install_root.resolve(strict=True)) != str(install_root):
+            raise TraceError(f"{label} path must be canonical and must not use aliases")
+    except OSError as error:
+        raise TraceError(f"cannot resolve {label} path: {error}") from error
+    if type(expected_owner_uid) is not int or expected_owner_uid < 0:
+        raise TraceError(f"{label} install owner is invalid")
+    _require_distinct_trusted_owner(expected_owner_uid)
+    result = []
+    current = Path(path.anchor)
+    candidates = [current]
+    for part in path.parent.parts[1:]:
+        current /= part
+        candidates.append(current)
+    install_seen = Path(path.anchor) == install_root
+    for current in candidates:
+        try:
+            current_stat = current.stat(follow_symlinks=False)
+        except OSError as error:
+            raise TraceError(f"cannot inspect {label} path: {error}") from error
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise TraceError(f"{label} path must not use symlinks")
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise TraceError(f"{label} parent path is not a directory")
+        if current == install_root:
+            install_seen = True
+        if current_stat.st_uid not in {0, expected_owner_uid}:
+            raise TraceError(f"{label} path is not trusted-owned")
+        if install_seen and current_stat.st_uid != expected_owner_uid:
+            raise TraceError(f"{label} install tree owner differs from external approval")
+        if stat.S_IMODE(current_stat.st_mode) & 0o022 or (
+                _path_is_writable_by_execution_identity(current)) or _has_access_control_entries(current):
+            raise TraceError(f"{label} path is mutable by the execution identity or an untrusted group")
+        result.append((
+            str(current),
+            current_stat.st_dev,
+            current_stat.st_ino,
+            current_stat.st_uid,
+            stat.S_IMODE(current_stat.st_mode),
+        ))
+    if not install_seen:
+        raise TraceError(f"{label} path does not traverse its approved install root")
+    return tuple(result)
+
+
 def _approved_file_identity(
         path: Path,
         *,
+        install_root: Path,
+        expected_owner_uid: int,
         expected_path: str,
         expected_sha256: str,
         label: str,
         executable: bool,
 ) -> tuple[ExecutableFileReceipt, int]:
-    if not path.is_absolute() or str(path) != expected_path:
+    if not path.is_absolute() or str(path) != expected_path or not install_root.is_absolute():
         raise TraceError(f"{label} path differs from external approval")
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            raise TraceError(f"{label} path must not use symlinks")
+    path_chain = _immutable_path_chain(
+        path,
+        install_root=install_root,
+        expected_owner_uid=expected_owner_uid,
+        label=label,
+    )
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -333,9 +455,12 @@ def _approved_file_identity(
         before = os.fstat(descriptor)
     except OSError as error:
         raise TraceError(f"cannot open {label}: {error}") from error
-    if not stat.S_ISREG(before.st_mode) or (executable and not os.access(path, os.X_OK)):
+    if not stat.S_ISREG(before.st_mode) or before.st_uid != expected_owner_uid or before.st_nlink != 1 or (
+            stat.S_IMODE(before.st_mode) & 0o222) or (
+            _path_is_writable_by_execution_identity(path)) or _has_access_control_entries(path) or (
+            executable and not (stat.S_IMODE(before.st_mode) & 0o111)):
         os.close(descriptor)
-        raise TraceError(f"{label} is not an approved regular file")
+        raise TraceError(f"{label} is not an immutable trusted-owned one-link regular file")
     try:
         digest = hashlib.sha256()
         with os.fdopen(os.dup(descriptor), "rb") as stream:
@@ -360,24 +485,33 @@ def _approved_file_identity(
         raise TraceError(f"{label} SHA-256 differs from external approval")
     return ExecutableFileReceipt(
         path=str(path),
+        install_root=str(install_root),
         device=after.st_dev,
         inode=after.st_ino,
+        owner_uid=after.st_uid,
+        mode=stat.S_IMODE(after.st_mode),
+        link_count=after.st_nlink,
         byte_count=after.st_size,
         modified_ns=after.st_mtime_ns,
         changed_ns=after.st_ctime_ns,
         sha256=digest_value,
+        path_chain=path_chain,
     ), descriptor
 
 
 def approved_executable_identity(
         path: Path,
         *,
+        install_root: str,
+        expected_owner_uid: int,
         expected_path: str,
         expected_sha256: str,
         label: str,
 ) -> ExecutableFileReceipt:
     identity, descriptor = _approved_file_identity(
         path,
+        install_root=Path(install_root),
+        expected_owner_uid=expected_owner_uid,
         expected_path=expected_path,
         expected_sha256=expected_sha256,
         label=label,
@@ -395,6 +529,8 @@ def verify_approved_executable_identity(
 ) -> None:
     observed = approved_executable_identity(
         path,
+        install_root=expected.install_root,
+        expected_owner_uid=expected.owner_uid,
         expected_path=expected.path,
         expected_sha256=expected.sha256,
         label=label,
@@ -414,6 +550,8 @@ def approved_runtime_file_identities(
         path = install_root / "lib" / component["filename"]
         identity, descriptor = _approved_file_identity(
             path,
+            install_root=install_root,
+            expected_owner_uid=policy["install_owner_uid"],
             expected_path=str(path),
             expected_sha256=component["sha256"],
             label=f"{label} runtime component {component['component']}",
@@ -432,6 +570,8 @@ def verify_approved_runtime_file_identities(
     for identity in identities:
         observed, descriptor = _approved_file_identity(
             Path(identity.path),
+            install_root=Path(identity.path).parent.parent,
+            expected_owner_uid=identity.owner_uid,
             expected_path=identity.path,
             expected_sha256=identity.sha256,
             label=f"{label} runtime component",
@@ -446,6 +586,7 @@ def run_approved_executable(
         command: list[str],
         *,
         path: Path,
+        runtime_policy: dict[str, Any],
         expected_path: str,
         expected_sha256: str,
         label: str,
@@ -455,16 +596,38 @@ def run_approved_executable(
         raise TraceError(f"{label} descriptor execution requires Linux")
     identity, descriptor = _approved_file_identity(
         path,
+        install_root=Path(runtime_policy["install_root"]),
+        expected_owner_uid=runtime_policy["install_owner_uid"],
         expected_path=expected_path,
         expected_sha256=expected_sha256,
         label=label,
         executable=True,
     )
+    runtime_files: list[tuple[ExecutableFileReceipt, int]] = []
     try:
+        for component in runtime_policy["runtime_receipt"]["components"]:
+            runtime_path = Path(runtime_policy["install_root"]) / "lib" / component["filename"]
+            runtime_files.append(_approved_file_identity(
+                runtime_path,
+                install_root=Path(runtime_policy["install_root"]),
+                expected_owner_uid=runtime_policy["install_owner_uid"],
+                expected_path=str(runtime_path),
+                expected_sha256=component["sha256"],
+                label=f"{label} runtime component {component['component']}",
+                executable=False,
+            ))
+        verify_approved_executable_identity(path, identity, label=label)
+        for runtime_identity, _runtime_descriptor in runtime_files:
+            verify_approved_executable_identity(
+                Path(runtime_identity.path),
+                runtime_identity,
+                label=f"{label} runtime component",
+            )
+        retained_descriptors = (descriptor, *(item[1] for item in runtime_files))
         result = subprocess.run(
             command,
             executable=f"/proc/self/fd/{descriptor}",
-            pass_fds=(descriptor,),
+            pass_fds=retained_descriptors,
             **kwargs,
         )
         descriptor_after = os.fstat(descriptor)
@@ -483,9 +646,258 @@ def run_approved_executable(
         ):
             raise TraceError(f"{label} descriptor identity changed during execution")
         verify_approved_executable_identity(path, identity, label=label)
+        for runtime_identity, runtime_descriptor in runtime_files:
+            runtime_after = os.fstat(runtime_descriptor)
+            if (
+                    runtime_after.st_dev,
+                    runtime_after.st_ino,
+                    runtime_after.st_uid,
+                    stat.S_IMODE(runtime_after.st_mode),
+                    runtime_after.st_nlink,
+                    runtime_after.st_size,
+                    runtime_after.st_mtime_ns,
+                    runtime_after.st_ctime_ns,
+            ) != (
+                    runtime_identity.device,
+                    runtime_identity.inode,
+                    runtime_identity.owner_uid,
+                    runtime_identity.mode,
+                    runtime_identity.link_count,
+                    runtime_identity.byte_count,
+                    runtime_identity.modified_ns,
+                    runtime_identity.changed_ns,
+            ):
+                raise TraceError(f"{label} runtime component descriptor changed during execution")
+            verify_approved_executable_identity(
+                Path(runtime_identity.path),
+                runtime_identity,
+                label=f"{label} runtime component",
+            )
         return result, identity
     finally:
+        for _runtime_identity, runtime_descriptor in runtime_files:
+            os.close(runtime_descriptor)
         os.close(descriptor)
+
+
+def install_trust_evidence(
+        executable: ExecutableFileReceipt,
+        runtime_files: list[ExecutableFileReceipt],
+) -> dict[str, Any]:
+    files = [executable, *runtime_files]
+    if any(item.install_root != executable.install_root or item.owner_uid != executable.owner_uid for item in files):
+        raise TraceError("approved install trust evidence spans multiple roots or owners")
+    directories: dict[str, tuple[str, int, int, int, int]] = {}
+    for item in files:
+        for directory in item.path_chain:
+            existing = directories.get(directory[0])
+            if existing is not None and existing != directory:
+                raise TraceError("approved install directory identity is inconsistent")
+            directories[directory[0]] = directory
+    return {
+        "format": "dsv41-install-trust",
+        "version": 1,
+        "install_root": executable.install_root,
+        "owner_uid": executable.owner_uid,
+        "execution_uid": _execution_uid(),
+        "directories": [
+            {
+                "path": item[0],
+                "device": item[1],
+                "inode": item[2],
+                "owner_uid": item[3],
+                "mode": item[4],
+                "effective_write_access": False,
+                "acl_entries": False,
+            }
+            for item in sorted(directories.values())
+        ],
+        "files": [
+            {
+                "path": item.path,
+                "device": item.device,
+                "inode": item.inode,
+                "owner_uid": item.owner_uid,
+                "mode": item.mode,
+                "link_count": item.link_count,
+                "byte_count": item.byte_count,
+                "modified_ns": item.modified_ns,
+                "changed_ns": item.changed_ns,
+                "sha256": item.sha256,
+                "effective_write_access": False,
+                "acl_entries": False,
+            }
+            for item in sorted(files, key=lambda value: value.path)
+        ],
+    }
+
+
+def install_trust_sha256(record: dict[str, Any]) -> str:
+    validate_install_trust_evidence(record)
+    return sha256_bytes(canonical_json(record).encode("ascii"))
+
+
+def validate_install_trust_evidence(
+        record: object,
+        policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise TraceError("install trust evidence is invalid")
+    _require_exact_keys(
+        record,
+        {"format", "version", "install_root", "owner_uid", "execution_uid", "directories", "files"},
+        "install trust evidence",
+    )
+    if record["format"] != "dsv41-install-trust" or record["version"] != 1:
+        raise TraceError("install trust evidence version is invalid")
+    install_root = _approval_path(record["install_root"], "install trust root")
+    owner_uid = record["owner_uid"]
+    execution_uid = record["execution_uid"]
+    if type(owner_uid) is not int or owner_uid < 0 or type(execution_uid) is not int or (
+            execution_uid <= 0) or execution_uid == owner_uid:
+        raise TraceError("install trust owner or execution identity is invalid")
+    directories = record["directories"]
+    files = record["files"]
+    if not isinstance(directories, list) or not directories or not isinstance(files, list) or not files:
+        raise TraceError("install trust evidence is incomplete")
+    previous_path = None
+    directory_paths = set()
+    for directory in directories:
+        if not isinstance(directory, dict):
+            raise TraceError("install trust directory evidence is invalid")
+        _require_exact_keys(
+            directory,
+            {
+                "path", "device", "inode", "owner_uid", "mode",
+                "effective_write_access", "acl_entries",
+            },
+            "install trust directory evidence",
+        )
+        path = _approval_path(directory["path"], "install trust directory")
+        if path in directory_paths or (previous_path is not None and path <= previous_path):
+            raise TraceError("install trust directories are duplicated or unsorted")
+        directory_paths.add(path)
+        previous_path = path
+        if any(type(directory[key]) is not int or directory[key] < 0 for key in (
+                "device", "inode", "owner_uid", "mode")) or (
+                directory["mode"] & 0o022) or directory["effective_write_access"] is not False or (
+                directory["acl_entries"] is not False):
+            raise TraceError("install trust directory is mutable or malformed")
+        if directory["owner_uid"] not in {0, owner_uid}:
+            raise TraceError("install trust directory owner is not trusted")
+        if (path == install_root or PurePosixPath(install_root) in PurePosixPath(path).parents) and (
+                directory["owner_uid"] != owner_uid):
+            raise TraceError("install trust tree owner differs from approval")
+    previous_path = None
+    file_paths = set()
+    for file_record in files:
+        if not isinstance(file_record, dict):
+            raise TraceError("install trust file evidence is invalid")
+        _require_exact_keys(
+            file_record,
+            {
+                "path", "device", "inode", "owner_uid", "mode", "link_count", "byte_count",
+                "modified_ns", "changed_ns", "sha256", "effective_write_access", "acl_entries",
+            },
+            "install trust file evidence",
+        )
+        path = _approval_path(file_record["path"], "install trust file")
+        if path in file_paths or (previous_path is not None and path <= previous_path):
+            raise TraceError("install trust files are duplicated or unsorted")
+        file_paths.add(path)
+        previous_path = path
+        if any(type(file_record[key]) is not int or file_record[key] < 0 for key in (
+                "device", "inode", "owner_uid", "mode", "link_count", "byte_count",
+                "modified_ns", "changed_ns")) or file_record["owner_uid"] != owner_uid or (
+                file_record["mode"] & 0o222) or file_record["link_count"] != 1 or (
+                file_record["effective_write_access"] is not False) or file_record["acl_entries"] is not False or (
+                re.fullmatch(r"[0-9a-f]{64}", file_record.get("sha256", "")) is None):
+            raise TraceError("install trust file is mutable or malformed")
+    if policy is not None:
+        if install_root != policy["install_root"] or owner_uid != policy["install_owner_uid"]:
+            raise TraceError("install trust root differs from external approval")
+        expected_files = {
+            policy["executable_path"]: policy["executable_sha256"],
+            **{
+                f"{install_root}/lib/{component['filename']}": component["sha256"]
+                for component in policy["runtime_receipt"]["components"]
+            },
+        }
+        observed_files = {item["path"]: item["sha256"] for item in files}
+        if observed_files != expected_files:
+            raise TraceError("install trust files differ from external approval")
+        expected_directories = set()
+        for path in expected_files:
+            current = PurePosixPath(path).parent
+            while True:
+                expected_directories.add(str(current))
+                if str(current) == "/":
+                    break
+                current = current.parent
+        if directory_paths != expected_directories:
+            raise TraceError("install trust directory coverage is incomplete")
+    return record
+
+
+def validate_runtime_build_evidence(
+        record: object,
+        policy: dict[str, Any],
+        *,
+        label: str,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise TraceError(f"{label} runtime build evidence is invalid")
+    _require_exact_keys(
+        record,
+        {
+            "revision",
+            "path",
+            "sha256",
+            "runtime_profile",
+            "runtime_receipt_sha256",
+            "runtime_libraries",
+            "runtime_libraries_post",
+        },
+        f"{label} runtime build evidence",
+    )
+    receipt_sha256 = sha256_bytes(canonical_json(policy["runtime_receipt"]).encode("ascii"))
+    expected = {
+        "revision": policy["revision"],
+        "path": policy["executable_path"],
+        "sha256": policy["executable_sha256"],
+        "runtime_profile": policy["runtime_profile"],
+        "runtime_receipt_sha256": receipt_sha256,
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise TraceError(f"{label} runtime build {key} differs from external approval")
+    libraries = record["runtime_libraries"]
+    if libraries != record["runtime_libraries_post"] or not isinstance(libraries, list):
+        raise TraceError(f"{label} loaded runtime closure changed during execution")
+    expected_libraries = []
+    for component in policy["runtime_receipt"]["components"]:
+        name = component["component"]
+        expected_libraries.append({
+            "component": name,
+            "filename": component["filename"],
+            "path": f"{policy['install_root']}/lib/{component['filename']}",
+            "sha256": component["sha256"],
+            "role": {
+                "llama-common": "build-info",
+                "llama": "llama",
+                "ggml-base": "ggml",
+            }.get(name, f"runtime:{name}"),
+            "revision": component["revision"],
+        })
+    expected_libraries.sort(key=lambda item: item["path"])
+    if libraries != expected_libraries:
+        raise TraceError(f"{label} loaded runtime libraries differ from external approval")
+    return record
+
+
+def runtime_build_evidence_sha256(record: object, policy: dict[str, Any], *, label: str) -> str:
+    validated = validate_runtime_build_evidence(record, policy, label=label)
+    return sha256_bytes(canonical_json(validated).encode("ascii"))
 
 
 def reject_loader_overrides(environment: dict[str, str] | None = None) -> None:
@@ -533,10 +945,18 @@ def _validate_ssh_keygen(path: Path) -> Path:
     if not path.is_absolute() or path.is_symlink():
         raise TraceError("trusted ssh-keygen path must be an absolute non-symlink")
     try:
-        mode = path.stat().st_mode
+        record = path.stat(follow_symlinks=False)
     except OSError as error:
         raise TraceError(f"cannot inspect trusted ssh-keygen: {error}") from error
-    if not stat.S_ISREG(mode) or not os.access(path, os.X_OK):
+    _immutable_path_chain(
+        path,
+        install_root=path.parent.parent,
+        expected_owner_uid=0,
+        label="trusted ssh-keygen",
+    )
+    if not stat.S_ISREG(record.st_mode) or record.st_uid != 0 or record.st_nlink != 1 or (
+            stat.S_IMODE(record.st_mode) & 0o022) or _path_is_writable_by_execution_identity(path) or (
+            _has_access_control_entries(path)) or not (stat.S_IMODE(record.st_mode) & 0o111):
         raise TraceError("trusted ssh-keygen is not an executable regular file")
     try:
         result = subprocess.run(
@@ -595,7 +1015,7 @@ def _normalize_public_key(public_key: str, *, allow_comment: bool = False) -> st
 
 
 def _approval_path(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.startswith("/") or (
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//") or (
             ".." in PurePosixPath(value).parts or str(PurePosixPath(value)) != value):
         raise TraceError(f"{label} is not an absolute canonical path")
     return value
@@ -631,6 +1051,7 @@ def candidate_exporter_approval(
             "base_revision",
             "diff_sha256",
             "install_root",
+            "install_owner_uid",
             "executable_path",
             "executable_sha256",
             "runtime_profile",
@@ -647,6 +1068,8 @@ def candidate_exporter_approval(
         if re.fullmatch(r"[0-9a-f]{64}", policy.get(key, "")) is None:
             raise TraceError(f"candidate exporter approval {key} is invalid")
     install_root = _approval_path(policy["install_root"], "candidate exporter approval install root")
+    if type(policy["install_owner_uid"]) is not int or policy["install_owner_uid"] < 0:
+        raise TraceError("candidate exporter approval install owner is invalid")
     executable_path = _approval_path(
         policy["executable_path"], "candidate exporter approval executable path")
     if executable_path != f"{install_root}/bin/llama-deepseek-v41-trace":
@@ -712,6 +1135,33 @@ def candidate_exporter_approval(
     return policy, _approval_digest("candidate-exporter", approval_id, policy)
 
 
+def validate_tokenizer_policy(record: object) -> dict[str, bool]:
+    if not isinstance(record, dict):
+        raise TraceError("tokenizer policy is missing")
+    _require_exact_keys(
+        record,
+        {
+            "add_bos",
+            "parse_special",
+            "detokenize_special",
+            "remove_leading_bos_before_detokenize",
+            "require_round_trip",
+        },
+        "tokenizer policy",
+    )
+    if any(type(value) is not bool for value in record.values()):
+        raise TraceError("tokenizer policy values must be explicit booleans")
+    if record["parse_special"] is not True or record["detokenize_special"] is not True or (
+            record["require_round_trip"] is not True) or (
+            record["remove_leading_bos_before_detokenize"] != record["add_bos"]):
+        raise TraceError("tokenizer policy is not the exact prompt construction policy")
+    return dict(record)
+
+
+def tokenizer_policy_sha256(record: object) -> str:
+    return sha256_bytes(canonical_json(validate_tokenizer_policy(record)).encode("ascii"))
+
+
 def prompt_builder_approval(
         approval_id: str,
         *,
@@ -728,12 +1178,14 @@ def prompt_builder_approval(
             "repository",
             "revision",
             "install_root",
+            "install_owner_uid",
             "executable_path",
             "executable_sha256",
             "source_root",
             "runtime_receipt",
             "model_sha256",
             "corpora",
+            "tokenizer",
             "prompts",
         },
         "prompt builder approval",
@@ -746,6 +1198,8 @@ def prompt_builder_approval(
             r"[0-9a-f]{64}", policy.get("executable_sha256", "")) is None:
         raise TraceError("prompt builder approval executable or model identity is invalid")
     install_root = _approval_path(policy["install_root"], "prompt builder approval install root")
+    if type(policy["install_owner_uid"]) is not int or policy["install_owner_uid"] < 0:
+        raise TraceError("prompt builder approval install owner is invalid")
     executable_path = _approval_path(
         policy["executable_path"], "prompt builder approval executable path")
     source_root = _approval_path(policy["source_root"], "prompt builder approval source root")
@@ -809,6 +1263,7 @@ def prompt_builder_approval(
         raise TraceError("prompt builder approval receipt differs from its runtime profile")
     if policy["corpora"] != CORPUS_SHA256:
         raise TraceError("prompt builder approval corpus policy is invalid")
+    validate_tokenizer_policy(policy["tokenizer"])
     prompts = policy["prompts"]
     if not isinstance(prompts, list) or not prompts:
         raise TraceError("prompt builder approval prompt policy is empty")
@@ -821,7 +1276,7 @@ def prompt_builder_approval(
             prompt,
             {
                 "corpus_name", "corpus_sha256", "context", "decode_steps", "target_tokens",
-                "prompt_sha256", "prompt_byte_count", "add_bos",
+                "prompt_sha256", "prompt_byte_count",
             },
             "prompt builder approval prompt record",
         )
@@ -835,8 +1290,7 @@ def prompt_builder_approval(
                 target_tokens != context - decode_steps):
             raise TraceError("prompt builder approval prompt configuration is invalid")
         if re.fullmatch(r"[0-9a-f]{64}", prompt.get("prompt_sha256", "")) is None or (
-                type(prompt.get("prompt_byte_count")) is not int or prompt["prompt_byte_count"] <= 0) or (
-                type(prompt.get("add_bos")) is not bool):
+                type(prompt.get("prompt_byte_count")) is not int or prompt["prompt_byte_count"] <= 0):
             raise TraceError("prompt builder approval prompt output identity is invalid")
         key = (corpus_name, context, decode_steps)
         if key in seen_keys or (previous_key is not None and key <= previous_key):
@@ -864,9 +1318,25 @@ def approved_prompt_record(
     return matches[0]
 
 
-def _read_external_regular_file(path: Path, label: str) -> bytes:
+def _read_external_regular_file(
+        path: Path,
+        label: str,
+        *,
+        trusted_root: Path,
+        expected_owner_uid: int,
+        test_only_trust: bool = False,
+) -> bytes:
     if not path.is_absolute() or str(path.resolve()) != str(path):
         raise TraceError(f"{label} path must be absolute, canonical, and non-symlinked")
+    if path != trusted_root and trusted_root not in path.parents:
+        raise TraceError(f"{label} is outside its trusted root")
+    if not test_only_trust:
+        _immutable_path_chain(
+            path,
+            install_root=trusted_root,
+            expected_owner_uid=expected_owner_uid,
+            label=label,
+        )
     try:
         before = path.stat(follow_symlinks=False)
         descriptor = os.open(
@@ -880,9 +1350,12 @@ def _read_external_regular_file(path: Path, label: str) -> bytes:
         before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
     if identity != (
             opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) or (
-            not stat.S_ISREG(opened.st_mode)) or opened.st_nlink != 1:
+            not stat.S_ISREG(opened.st_mode)) or opened.st_nlink != 1 or (
+            not test_only_trust and (
+                opened.st_uid != expected_owner_uid or stat.S_IMODE(opened.st_mode) & 0o222 or
+                _path_is_writable_by_execution_identity(path) or _has_access_control_entries(path))):
         os.close(descriptor)
-        raise TraceError(f"{label} must be a regular file with one link")
+        raise TraceError(f"{label} must be an immutable trusted-owned one-link regular file")
     try:
         with os.fdopen(os.dup(descriptor), "rb") as stream:
             data = stream.read()
@@ -907,9 +1380,10 @@ def load_executable_approval_policy(
         signature_path: Path,
         *,
         expected_principal: str,
-        trusted_approvers: dict[str, str] = APPROVED_EXECUTABLE_APPROVERS,
+        trusted_approvers: dict[str, dict[str, Any]] = APPROVED_EXECUTABLE_APPROVERS,
         ssh_keygen: Path | None = None,
         forbidden_roots: Iterable[Path] = (),
+        test_only_trust: bool = False,
 ) -> ExecutableApprovalPolicy:
     _validate_principal(expected_principal)
     resolved_policy = policy_path.resolve()
@@ -919,12 +1393,29 @@ def load_executable_approval_policy(
         if resolved_policy == root or root in resolved_policy.parents or (
                 resolved_signature == root) or root in resolved_signature.parents:
             raise TraceError("executable approval policy and signature must be outside protected output roots")
-    public_key = trusted_approvers.get(expected_principal)
-    if not isinstance(public_key, str):
+    approver = trusted_approvers.get(expected_principal)
+    if not isinstance(approver, dict) or set(approver) != {
+            "public_key", "policy_root", "owner_uid"}:
         raise TraceError(f"executable approval principal is not trusted: {expected_principal}")
-    approved_key = _normalize_public_key(public_key)
-    policy_bytes = _read_external_regular_file(policy_path, "executable approval policy")
-    signature_bytes = _read_external_regular_file(signature_path, "executable approval signature")
+    policy_root = Path(_approval_path(approver["policy_root"], "executable approval trusted root"))
+    owner_uid = approver["owner_uid"]
+    if type(owner_uid) is not int or owner_uid < 0:
+        raise TraceError("executable approval trusted owner is invalid")
+    approved_key = _normalize_public_key(approver["public_key"])
+    policy_bytes = _read_external_regular_file(
+        policy_path,
+        "executable approval policy",
+        trusted_root=policy_root,
+        expected_owner_uid=owner_uid,
+        test_only_trust=test_only_trust,
+    )
+    signature_bytes = _read_external_regular_file(
+        signature_path,
+        "executable approval signature",
+        trusted_root=policy_root,
+        expected_owner_uid=owner_uid,
+        test_only_trust=test_only_trust,
+    )
     try:
         policy = strict_json_loads(policy_bytes.decode("ascii"))
         signature = signature_bytes.decode("ascii")
@@ -995,12 +1486,18 @@ def load_executable_approval_policy(
     )
 
 
-def approval_binding(kind: str, approval_id: str, digest: str) -> dict[str, str]:
+def approval_binding(
+        kind: str,
+        approval_id: str,
+        digest: str,
+        trust_sha256: str,
+) -> dict[str, str]:
     if kind not in {"candidate_exporter", "prompt_builder"} or re.fullmatch(
             r"[A-Za-z0-9._-]{1,128}", approval_id) is None or re.fullmatch(
-                r"[0-9a-f]{64}", digest) is None:
+                r"[0-9a-f]{64}", digest) is None or re.fullmatch(
+                r"[0-9a-f]{64}", trust_sha256) is None:
         raise TraceError("execution approval binding is invalid")
-    return {"id": approval_id, "sha256": digest}
+    return {"id": approval_id, "sha256": digest, "install_trust_sha256": trust_sha256}
 
 
 def validate_execution_authorization(
@@ -1034,7 +1531,8 @@ def validate_execution_authorization(
         authorization,
         {
             "format", "version", "lane", "challenge", "run_id", "issued_unix",
-            "expires_unix", "approval_policy_sha256", "verifier_revision", "approvals",
+            "expires_unix", "approval_policy_sha256", "verifier_revision",
+            "tokenizer_policy_sha256", "approvals",
         },
         "manifest execution authorization",
     )
@@ -1073,6 +1571,8 @@ def validate_execution_authorization(
         raise TraceError("trace signer runtime profile does not match the signed manifest")
     _prompt_policy, prompt_digest = prompt_builder_approval(
         expected_prompt_builder_policy_id, policies=prompt_builder_policies)
+    if authorization.get("tokenizer_policy_sha256") != tokenizer_policy_sha256(_prompt_policy["tokenizer"]):
+        raise TraceError("manifest tokenizer policy differs from external prompt approval")
     approvals = authorization["approvals"]
     required_approvals = {"prompt_builder"}
     if expected_lane == CANDIDATE_LANE:
@@ -1081,16 +1581,22 @@ def validate_execution_authorization(
         raise TraceError("manifest execution approval bindings are invalid")
     _require_exact_keys(approvals, required_approvals, "manifest execution approval bindings")
     prompt_binding = approvals["prompt_builder"]
-    if prompt_binding != approval_binding(
-            "prompt_builder", expected_prompt_builder_policy_id, prompt_digest):
+    if not isinstance(prompt_binding, dict) or set(prompt_binding) != {
+            "id", "sha256", "install_trust_sha256"} or prompt_binding.get("id") != (
+            expected_prompt_builder_policy_id) or prompt_binding.get("sha256") != prompt_digest or re.fullmatch(
+            r"[0-9a-f]{64}", prompt_binding.get("install_trust_sha256", "")) is None:
         raise TraceError("manifest prompt builder approval differs from external policy")
     if expected_lane == CANDIDATE_LANE:
         if expected_candidate_exporter_policy_id is None:
             raise TraceError("external candidate exporter approval ID is required")
         _candidate_policy, candidate_digest = candidate_exporter_approval(
             expected_candidate_exporter_policy_id, policies=candidate_exporter_policies)
-        if approvals["candidate_exporter"] != approval_binding(
-                "candidate_exporter", expected_candidate_exporter_policy_id, candidate_digest):
+        candidate_binding = approvals["candidate_exporter"]
+        if not isinstance(candidate_binding, dict) or set(candidate_binding) != {
+                "id", "sha256", "install_trust_sha256"} or candidate_binding.get("id") != (
+                expected_candidate_exporter_policy_id) or candidate_binding.get("sha256") != (
+                candidate_digest) or re.fullmatch(
+                r"[0-9a-f]{64}", candidate_binding.get("install_trust_sha256", "")) is None:
             raise TraceError("manifest candidate exporter approval differs from external policy")
     elif expected_candidate_exporter_policy_id is not None:
         raise TraceError("oracle verification must not specify a candidate exporter approval")
@@ -1109,6 +1615,7 @@ def execution_authorization(
         expires_unix: int,
         approval_policy_sha256: str,
         verifier_revision: str,
+        tokenizer_policy_sha256_value: str,
         approvals: dict[str, dict[str, str]]) -> dict[str, Any]:
     if lane not in {CANDIDATE_LANE, ORACLE_LANE}:
         raise TraceError("execution authorization lane is invalid")
@@ -1124,6 +1631,8 @@ def execution_authorization(
     if re.fullmatch(r"[0-9a-f]{64}", approval_policy_sha256) is None or re.fullmatch(
             r"[0-9a-f]{40}", verifier_revision) is None:
         raise TraceError("execution authorization approval policy identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", tokenizer_policy_sha256_value) is None:
+        raise TraceError("execution authorization tokenizer policy identity is invalid")
     required_approvals = {"prompt_builder"}
     if lane == CANDIDATE_LANE:
         required_approvals.add("candidate_exporter")
@@ -1133,7 +1642,12 @@ def execution_authorization(
     for kind, binding in approvals.items():
         if not isinstance(binding, dict):
             raise TraceError("execution authorization approval binding is invalid")
-        if binding != approval_binding(kind, binding.get("id", ""), binding.get("sha256", "")):
+        if binding != approval_binding(
+                kind,
+                binding.get("id", ""),
+                binding.get("sha256", ""),
+                binding.get("install_trust_sha256", ""),
+        ):
             raise TraceError("execution authorization approval binding is invalid")
     authorization = {
         "format": AUTHORIZATION_FORMAT,
@@ -1145,6 +1659,7 @@ def execution_authorization(
         "expires_unix": expires_unix,
         "approval_policy_sha256": approval_policy_sha256,
         "verifier_revision": verifier_revision,
+        "tokenizer_policy_sha256": tokenizer_policy_sha256_value,
         "approvals": approvals,
     }
     return authorization
@@ -1482,6 +1997,27 @@ def _bundle_domain(
     return domain, manifest, events, receipts, contents
 
 
+def _validate_unsealed_bundle(
+        root: Path,
+        manifest: dict[str, Any],
+        events: list[dict[str, Any]],
+        receipts: dict[str, BundleFileReceipt],
+        contents: dict[str, bytes],
+        verifier: TraceVerifier) -> None:
+    bundle = object.__new__(_TRACE_BUNDLE_TYPE)
+    bundle.root = root
+    bundle.signer_principal = verifier.principal
+    bundle.verifier = verifier
+    bundle.manifest = manifest
+    bundle._file_receipts = receipts
+    bundle._retained_files = contents
+    bundle._validate_manifest()
+    bundle.events = bundle._validate_sealed_events(events, True)
+    if bundle.manifest.get("event_count") != len(bundle.events):
+        raise TraceError("manifest event_count mismatch")
+    bundle._validate_coverage()
+
+
 def seal_bundle(
         root: Path,
         *,
@@ -1511,20 +2047,44 @@ def seal_bundle(
     signature_path = root / SIGNATURE_NAME
     if signature_path.exists() or signature_path.is_symlink():
         raise TraceError("trace signature envelope already exists")
-    domain, manifest, _events, _receipts, _contents = _bundle_domain(root)
+    domain, manifest, events, receipts, contents = _bundle_domain(root)
+    verification_time = int(time.time()) if verification_unix is None else verification_unix
+    policy = _signer_policy(trusted_signers, principal)
     validate_execution_authorization(
         manifest,
-        policy=_signer_policy(trusted_signers, principal),
+        policy=policy,
         expected_lane=expected_lane,
         expected_challenge=expected_challenge,
         expected_run_id=expected_run_id,
-        verification_unix=int(time.time()) if verification_unix is None else verification_unix,
+        verification_unix=verification_time,
         candidate_exporter_policies=candidate_exporter_policies,
         prompt_builder_policies=prompt_builder_policies,
         expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
         expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
         expected_approval_policy_sha256=expected_approval_policy_sha256,
         expected_verifier_revision=expected_verifier_revision,
+    )
+    _validate_unsealed_bundle(
+        root,
+        manifest,
+        events,
+        receipts,
+        contents,
+        TraceVerifier(
+            principal=principal,
+            trusted_signers=trusted_signers,
+            ssh_keygen=executable,
+            expected_lane=expected_lane,
+            expected_challenge=expected_challenge,
+            expected_run_id=expected_run_id,
+            verification_unix=verification_time,
+            candidate_exporter_policies=candidate_exporter_policies,
+            prompt_builder_policies=prompt_builder_policies,
+            expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
+            expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
+            expected_approval_policy_sha256=expected_approval_policy_sha256,
+            expected_verifier_revision=expected_verifier_revision,
+        ),
     )
     try:
         with tempfile.TemporaryDirectory(prefix="dsv41-trace-sign-") as signing_temp:
@@ -2660,17 +3220,40 @@ class TraceBundle:
             "builder_sha256": prompt_policy["executable_sha256"],
             "builder_revision": prompt_policy["revision"],
             "builder_runtime_profile": prompt_policy["runtime_profile"],
+            "tokenizer": prompt_policy["tokenizer"],
         }
         for key, value in builder_checks.items():
             if provenance_record.get(key) != value:
                 raise TraceError(f"prompt provenance {key} differs from external approval")
+        builder_runtime_build = validate_runtime_build_evidence(
+            provenance_record.get("builder_runtime_build"),
+            prompt_policy,
+            label="prompt builder",
+        )
+        builder_runtime_build_sha256 = runtime_build_evidence_sha256(
+            builder_runtime_build,
+            prompt_policy,
+            label="prompt builder",
+        )
+        if provenance_record.get("builder_runtime_build_sha256") != builder_runtime_build_sha256:
+            raise TraceError("prompt provenance runtime build SHA-256 mismatch")
+        builder_trust = validate_install_trust_evidence(
+            provenance_record.get("builder_install_trust"), prompt_policy)
+        builder_trust_sha256 = install_trust_sha256(builder_trust)
+        if provenance_record.get("builder_install_trust_sha256") != builder_trust_sha256:
+            raise TraceError("prompt provenance install trust SHA-256 mismatch")
+        if self.manifest["authorization"]["approvals"]["prompt_builder"][
+                "install_trust_sha256"] != builder_trust_sha256:
+            raise TraceError("manifest prompt builder trust differs from signed provenance")
         for key in ("corpus_name", "corpus_sha256", "context", "decode_steps", "target_tokens",
                     "prompt_sha256", "prompt_byte_count"):
             if provenance_record[key] != expected_prompt[key]:
                 raise TraceError(f"prompt provenance {key} differs from approved prompt output")
         _require_exact_keys(
             provenance_record,
-            set(provenance_checks) | set(builder_checks),
+            set(provenance_checks) | set(builder_checks) | {
+                "builder_runtime_build", "builder_runtime_build_sha256",
+                "builder_install_trust", "builder_install_trust_sha256"},
             "prompt provenance",
         )
         if self.manifest["prompt"].get("target_tokens") != expected_target:
@@ -2692,6 +3275,8 @@ class TraceBundle:
                     "runtime_receipt_sha256",
                     "exporter_approval_id",
                     "exporter_approval_sha256",
+                    "install_trust",
+                    "install_trust_sha256",
                 },
                 "llama.cpp candidate attestation",
             )
@@ -2752,6 +3337,13 @@ class TraceBundle:
             for key, value in policy_checks.items():
                 if candidate_policy[key] != value:
                     raise TraceError(f"candidate {key} differs from external exporter approval")
+            candidate_trust = validate_install_trust_evidence(
+                candidate["install_trust"], candidate_policy)
+            candidate_trust_sha256 = install_trust_sha256(candidate_trust)
+            if candidate["install_trust_sha256"] != candidate_trust_sha256 or (
+                    self.manifest["authorization"]["approvals"]["candidate_exporter"][
+                        "install_trust_sha256"] != candidate_trust_sha256):
+                raise TraceError("candidate install trust evidence is not bound to authorization")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
@@ -2798,8 +3390,7 @@ class TraceBundle:
                     "load_mode",
                     "expert_cache_slots",
                     "expert_cache_bytes",
-                    "tokenizer_add_bos",
-                    "tokenizer_parse_special",
+                    "tokenizer",
                     "deepseek41",
                 },
                 "llama.cpp config",
@@ -2819,6 +3410,8 @@ class TraceBundle:
             if config.get("kv_type_k") != "f16" or config.get("kv_type_v") != "f16" or (
                     config.get("flash_attention") is not True) or config.get("load_mode") != 0:
                 raise TraceError("llama.cpp trace inference configuration is invalid")
+            if validate_tokenizer_policy(config.get("tokenizer")) != prompt_policy["tokenizer"]:
+                raise TraceError("llama.cpp tokenizer policy differs from external prompt approval")
         if self.manifest["runtime"] == "ds4":
             _require_exact_keys(
                 config,
@@ -3353,6 +3946,9 @@ class TraceBundle:
             values = struct.iter_unpack("<i", self.read_blob(event))
             if any(value < 0 or value >= config.get("expert_count", 0) for value, in values):
                 raise TraceError("expert.ids contains an out-of-range original expert ID")
+
+
+_TRACE_BUNDLE_TYPE = TraceBundle
 
 
 def first_byte_difference(left: bytes, right: bytes) -> int | None:

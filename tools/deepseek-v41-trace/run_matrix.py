@@ -27,13 +27,19 @@ from trace_format import (
     approved_runtime_file_identities,
     candidate_exporter_approval,
     execution_authorization,
+    install_trust_evidence,
+    install_trust_sha256,
     load_executable_approval_policy,
     prompt_builder_approval,
     reject_loader_overrides,
+    runtime_build_evidence_sha256,
     run_approved_executable,
     sha256_file,
     strict_json_loads,
+    tokenizer_policy_sha256,
     validate_signing_identity,
+    validate_runtime_build_evidence,
+    validate_tokenizer_policy,
     verify_approved_executable_identity,
     verify_approved_runtime_file_identities,
 )
@@ -44,6 +50,29 @@ CORPORA = (
     "correctness-structured.txt",
     "correctness-numeric.txt",
 )
+
+
+def query_prompt_builder_runtime_build(
+        builder: Path,
+        builder_policy: dict[str, object]) -> dict[str, object]:
+    result, _identity = run_approved_executable(
+        [str(builder), "--dsv41-attest-build"],
+        path=builder,
+        runtime_policy=builder_policy,
+        expected_path=builder_policy["executable_path"],
+        expected_sha256=builder_policy["executable_sha256"],
+        label="prompt builder",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"prompt builder build attestation failed: {result.stderr.strip()}")
+    try:
+        record = strict_json_loads(result.stdout)
+        return validate_runtime_build_evidence(record, builder_policy, label="prompt builder")
+    except TraceError as error:
+        raise RuntimeError(f"prompt builder build attestation is invalid: {error}") from error
 
 
 def run(command: list[str]) -> None:
@@ -93,6 +122,8 @@ def prepare_prompt(
     )
     builder_identity = approved_executable_identity(
         builder,
+        install_root=builder_policy["install_root"],
+        expected_owner_uid=builder_policy["install_owner_uid"],
         expected_path=builder_policy["executable_path"],
         expected_sha256=builder_policy["executable_sha256"],
         label="prompt builder",
@@ -106,17 +137,26 @@ def prepare_prompt(
     source_identity = file_identity(source_corpus)
     corpus_identity = file_identity(corpus)
     verify_approved_runtime_file_identities(runtime_identities, label="prompt builder")
+    tokenizer = validate_tokenizer_policy(builder_policy["tokenizer"])
+    pre_runtime_build = query_prompt_builder_runtime_build(builder, builder_policy)
     command = [
         str(builder),
         "--model", str(model),
         "--corpus", str(corpus),
         "--output", str(output),
         "--tokens", str(target_tokens),
+        "--tokenizer-add-bos", str(tokenizer["add_bos"]).lower(),
+        "--tokenizer-parse-special", str(tokenizer["parse_special"]).lower(),
+        "--tokenizer-detokenize-special", str(tokenizer["detokenize_special"]).lower(),
+        "--tokenizer-remove-leading-bos", str(
+            tokenizer["remove_leading_bos_before_detokenize"]).lower(),
+        "--tokenizer-require-round-trip", str(tokenizer["require_round_trip"]).lower(),
     ]
     print("exec:", " ".join(command), file=sys.stderr)
     result, executed_identity = run_approved_executable(
         command,
         path=builder,
+        runtime_policy=builder_policy,
         expected_path=builder_policy["executable_path"],
         expected_sha256=builder_policy["executable_sha256"],
         label="prompt builder",
@@ -138,14 +178,19 @@ def prepare_prompt(
     except TraceError as error:
         raise RuntimeError(f"prompt builder returned invalid JSON: {error}") from error
     if not isinstance(native_record, dict) or set(native_record) != {
-            "target_tokens", "actual_tokens", "byte_count", "add_bos", "temporary_directory"}:
+            "target_tokens", "actual_tokens", "byte_count", "tokenizer",
+            "runtime_build", "temporary_directory"}:
         raise RuntimeError("prompt builder returned an invalid result schema")
     if native_record.get("target_tokens") != target_tokens or native_record.get("actual_tokens") != target_tokens:
         raise RuntimeError("prompt builder did not produce the requested token count")
     if type(native_record.get("byte_count")) is not int or native_record["byte_count"] != output.stat().st_size:
         raise RuntimeError("prompt builder byte count does not match its output")
-    if type(native_record.get("add_bos")) is not bool:
-        raise RuntimeError("prompt builder add_bos result is invalid")
+    if validate_tokenizer_policy(native_record.get("tokenizer")) != tokenizer:
+        raise RuntimeError("prompt builder tokenizer policy differs from external approval")
+    runtime_build = validate_runtime_build_evidence(
+        native_record.get("runtime_build"), builder_policy, label="prompt builder")
+    if runtime_build != pre_runtime_build:
+        raise RuntimeError("prompt builder runtime build changed during prompt construction")
     temporary_directory = native_record["temporary_directory"]
     expected_temporary_directory = os.environ.get("TMPDIR")
     if not expected_temporary_directory or temporary_directory != str(resolved(Path(expected_temporary_directory))):
@@ -153,9 +198,9 @@ def prepare_prompt(
     prompt_sha256 = sha256_file(output)
     prompt_byte_count = output.stat().st_size
     if prompt_sha256 != expected_prompt["prompt_sha256"] or (
-            prompt_byte_count != expected_prompt["prompt_byte_count"]) or (
-            native_record["add_bos"] != expected_prompt["add_bos"]):
+            prompt_byte_count != expected_prompt["prompt_byte_count"]):
         raise RuntimeError("prompt builder output differs from external approval")
+    trust_evidence = install_trust_evidence(builder_identity, runtime_identities)
     record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
@@ -173,6 +218,12 @@ def prepare_prompt(
         "builder_sha256": builder_identity.sha256,
         "builder_revision": builder_policy["revision"],
         "builder_runtime_profile": builder_policy["runtime_profile"],
+        "tokenizer": tokenizer,
+        "builder_runtime_build": runtime_build,
+        "builder_runtime_build_sha256": runtime_build_evidence_sha256(
+            runtime_build, builder_policy, label="prompt builder"),
+        "builder_install_trust": trust_evidence,
+        "builder_install_trust_sha256": install_trust_sha256(trust_evidence),
         "target_tokens": target_tokens,
         "actual_tokens": target_tokens,
     }
@@ -252,12 +303,30 @@ def main() -> int:
             args.prompt_builder_policy_id,
             policies=approval_policy.prompt_builders,
         )
-        approved_executable_identity(
+        candidate_identity = approved_executable_identity(
             args.llama_exporter,
+            install_root=candidate_policy["install_root"],
+            expected_owner_uid=candidate_policy["install_owner_uid"],
             expected_path=candidate_policy["executable_path"],
             expected_sha256=candidate_policy["executable_sha256"],
             label="candidate exporter",
         )
+        candidate_runtime_identities = approved_runtime_file_identities(
+            candidate_policy, label="candidate exporter")
+        candidate_trust = install_trust_evidence(
+            candidate_identity, candidate_runtime_identities)
+        prompt_builder = args.llama_prompt_builder
+        prompt_identity = approved_executable_identity(
+            prompt_builder,
+            install_root=prompt_policy["install_root"],
+            expected_owner_uid=prompt_policy["install_owner_uid"],
+            expected_path=prompt_policy["executable_path"],
+            expected_sha256=prompt_policy["executable_sha256"],
+            label="prompt builder",
+        )
+        prompt_runtime_identities = approved_runtime_file_identities(
+            prompt_policy, label="prompt builder")
+        prompt_trust = install_trust_evidence(prompt_identity, prompt_runtime_identities)
         if args.candidate_revision != candidate_policy["revision"] or (
                 args.base_revision != candidate_policy["base_revision"]) or (
                 args.candidate_diff_sha256 != candidate_policy["diff_sha256"]):
@@ -270,16 +339,19 @@ def main() -> int:
             expires_unix=args.authorization_expires_unix,
             approval_policy_sha256=approval_policy.sha256,
             verifier_revision=approval_policy.verifier_revision,
+            tokenizer_policy_sha256_value=tokenizer_policy_sha256(prompt_policy["tokenizer"]),
             approvals={
                 "candidate_exporter": approval_binding(
                     "candidate_exporter",
                     args.candidate_exporter_policy_id,
                     candidate_policy_sha256,
+                    install_trust_sha256(candidate_trust),
                 ),
                 "prompt_builder": approval_binding(
                     "prompt_builder",
                     args.prompt_builder_policy_id,
                     prompt_policy_sha256,
+                    install_trust_sha256(prompt_trust),
                 ),
             },
         )
@@ -317,13 +389,6 @@ def main() -> int:
             output=output,
             repo=repo,
             busy_patterns=args.busy_pattern,
-        )
-        prompt_builder = args.llama_prompt_builder
-        approved_executable_identity(
-            prompt_builder,
-            expected_path=prompt_policy["executable_path"],
-            expected_sha256=prompt_policy["executable_sha256"],
-            label="prompt builder",
         )
         if str(repo) != prompt_policy["source_root"] or args.candidate_revision != prompt_policy["revision"]:
             raise PreflightError("matrix repository or revision differs from prompt builder approval")

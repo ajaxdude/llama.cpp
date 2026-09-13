@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import copy
 import importlib.util
 import io
@@ -391,6 +392,7 @@ def fixture_prompt_builder_policy(
         "repository": trace.REPOSITORY,
         "revision": "a" * 40,
         "install_root": str(Path(builder_path).parent.parent),
+        "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
         "executable_path": builder_path,
         "executable_sha256": builder_sha256,
         "source_root": source_root,
@@ -411,6 +413,13 @@ def fixture_prompt_builder_policy(
         },
         "model_sha256": trace.MODEL_SHA256,
         "corpora": dict(trace.CORPUS_SHA256),
+        "tokenizer": {
+            "add_bos": True,
+            "parse_special": True,
+            "detokenize_special": True,
+            "remove_leading_bos_before_detokenize": True,
+            "require_round_trip": True,
+        },
         "prompts": [{
             "corpus_name": "correctness-prose.txt",
             "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
@@ -419,7 +428,6 @@ def fixture_prompt_builder_policy(
             "target_tokens": context - decode_steps,
             "prompt_sha256": trace.sha256_bytes(prompt),
             "prompt_byte_count": len(prompt),
-            "add_bos": True,
         }],
     }
 
@@ -431,6 +439,116 @@ def materialize_policy_runtime(policy: dict[str, object]) -> None:
         path = library_root / component["filename"]
         path.write_bytes(component["component"].encode("ascii"))
         component["sha256"] = trace.sha256_file(path)
+        path.chmod(0o555)
+    executable = Path(policy["executable_path"])
+    if executable.exists():
+        executable.chmod(0o555)
+    library_root.chmod(0o555)
+    executable.parent.chmod(0o555)
+    Path(policy["install_root"]).chmod(0o555)
+
+
+def fixture_install_trust(policy: dict[str, object]) -> dict[str, object]:
+    install_root = Path(policy["install_root"])
+    paths = {
+        policy["executable_path"]: policy["executable_sha256"],
+        **{
+            str(install_root / "lib" / component["filename"]): component["sha256"]
+            for component in policy["runtime_receipt"]["components"]
+        },
+    }
+    directory_paths = set()
+    for path in paths:
+        current = Path(path).parent
+        while True:
+            directory_paths.add(str(current))
+            if current == Path(current.anchor):
+                break
+            current = current.parent
+    owner_uid = policy["install_owner_uid"]
+    directories = []
+    for index, path in enumerate(sorted(directory_paths), 1):
+        in_install = path == str(install_root) or install_root in Path(path).parents
+        directories.append({
+            "path": path,
+            "device": 1,
+            "inode": index,
+            "owner_uid": owner_uid if in_install else 0,
+            "mode": 0o555,
+            "effective_write_access": False,
+            "acl_entries": False,
+        })
+    files = []
+    for index, (path, digest) in enumerate(sorted(paths.items()), 100):
+        files.append({
+            "path": path,
+            "device": 1,
+            "inode": index,
+            "owner_uid": owner_uid,
+            "mode": 0o555,
+            "link_count": 1,
+            "byte_count": index,
+            "modified_ns": index,
+            "changed_ns": index,
+            "sha256": digest,
+            "effective_write_access": False,
+            "acl_entries": False,
+        })
+    return {
+        "format": "dsv41-install-trust",
+        "version": 1,
+        "install_root": str(install_root),
+        "owner_uid": owner_uid,
+        "execution_uid": owner_uid + 1 if owner_uid != 0 else 1,
+        "directories": directories,
+        "files": files,
+    }
+
+
+def fixture_runtime_build(policy: dict[str, object]) -> dict[str, object]:
+    libraries = []
+    for component in policy["runtime_receipt"]["components"]:
+        name = component["component"]
+        libraries.append({
+            "component": name,
+            "filename": component["filename"],
+            "path": f"{policy['install_root']}/lib/{component['filename']}",
+            "sha256": component["sha256"],
+            "role": {
+                "llama-common": "build-info",
+                "llama": "llama",
+                "ggml-base": "ggml",
+            }.get(name, f"runtime:{name}"),
+            "revision": component["revision"],
+        })
+    libraries.sort(key=lambda item: item["path"])
+    return {
+        "revision": policy["revision"],
+        "path": policy["executable_path"],
+        "sha256": policy["executable_sha256"],
+        "runtime_profile": policy["runtime_profile"],
+        "runtime_receipt_sha256": trace.sha256_bytes(
+            trace.canonical_json(policy["runtime_receipt"]).encode("ascii")),
+        "runtime_libraries": libraries,
+        "runtime_libraries_post": copy.deepcopy(libraries),
+    }
+
+
+@contextlib.contextmanager
+def isolated_test_install_trust():
+    modules = (trace, sys.modules["trace_format"])
+    with contextlib.ExitStack() as stack:
+        for module in modules:
+            stack.enter_context(mock.patch.object(
+                module,
+                "_execution_uid",
+                return_value=(os.geteuid() if hasattr(os, "geteuid") else 0) + 1,
+            ))
+            stack.enter_context(mock.patch.object(
+                module, "_path_is_writable_by_execution_identity", return_value=False))
+            stack.enter_context(mock.patch.object(
+                module, "_has_access_control_entries", return_value=False))
+        yield
 
 
 def provenance_bytes(
@@ -443,6 +561,8 @@ def provenance_bytes(
         TEST_PROMPT_BUILDER_POLICY_ID,
         policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
     )
+    trust = fixture_install_trust(policy)
+    runtime_build = fixture_runtime_build(policy)
     record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
@@ -462,6 +582,12 @@ def provenance_bytes(
         "builder_sha256": "8" * 64,
         "builder_revision": "a" * 40,
         "builder_runtime_profile": policy["runtime_profile"],
+        "tokenizer": policy["tokenizer"],
+        "builder_runtime_build": runtime_build,
+        "builder_runtime_build_sha256": trace.runtime_build_evidence_sha256(
+            runtime_build, policy, label="prompt builder"),
+        "builder_install_trust": trust,
+        "builder_install_trust_sha256": trace.install_trust_sha256(trust),
     }
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
@@ -643,8 +769,13 @@ def manifest(
             "device_pci_id": "0000:c1:00.0",
             "gpu_layers": 99,
             "load_mode": 0,
-            "tokenizer_add_bos": True,
-            "tokenizer_parse_special": True,
+            "tokenizer": {
+                "add_bos": True,
+                "parse_special": True,
+                "detokenize_special": True,
+                "remove_leading_bos_before_detokenize": True,
+                "require_round_trip": True,
+            },
         })
         result["candidate"] = {
             "repository": trace.REPOSITORY,
@@ -671,9 +802,14 @@ def manifest(
         TEST_PROMPT_BUILDER_POLICY_ID,
         policies={TEST_PROMPT_BUILDER_POLICY_ID: prompt_policy},
     )
+    prompt_trust = fixture_install_trust(prompt_policy)
     approvals = {
         "prompt_builder": trace.approval_binding(
-            "prompt_builder", TEST_PROMPT_BUILDER_POLICY_ID, prompt_policy_sha256),
+            "prompt_builder",
+            TEST_PROMPT_BUILDER_POLICY_ID,
+            prompt_policy_sha256,
+            trace.install_trust_sha256(prompt_trust),
+        ),
     }
     if not is_ds4:
         candidate_policy = {
@@ -683,6 +819,7 @@ def manifest(
             "base_revision": result["candidate"]["base_revision"],
             "diff_sha256": result["candidate"]["diff_sha256"],
             "install_root": "/home/repo/build",
+            "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
             "executable_path": result["candidate"]["executable_path"],
             "executable_sha256": result["candidate"]["executable_sha256"],
             "runtime_profile": copy.deepcopy(result["build"]["runtime_profile"]),
@@ -694,8 +831,15 @@ def manifest(
         )
         result["candidate"]["exporter_approval_id"] = TEST_CANDIDATE_EXPORTER_POLICY_ID
         result["candidate"]["exporter_approval_sha256"] = candidate_policy_sha256
+        candidate_trust = fixture_install_trust(candidate_policy)
+        result["candidate"]["install_trust"] = candidate_trust
+        result["candidate"]["install_trust_sha256"] = trace.install_trust_sha256(candidate_trust)
         approvals["candidate_exporter"] = trace.approval_binding(
-            "candidate_exporter", TEST_CANDIDATE_EXPORTER_POLICY_ID, candidate_policy_sha256)
+            "candidate_exporter",
+            TEST_CANDIDATE_EXPORTER_POLICY_ID,
+            candidate_policy_sha256,
+            trace.install_trust_sha256(candidate_trust),
+        )
     result["authorization"] = trace.execution_authorization(
         lane=trace.ORACLE_LANE if is_ds4 else trace.CANDIDATE_LANE,
         challenge=TEST_CHALLENGE,
@@ -704,6 +848,7 @@ def manifest(
         expires_unix=TEST_AUTH_EXPIRES,
         approval_policy_sha256="e" * 64,
         verifier_revision="a" * 40,
+        tokenizer_policy_sha256_value=trace.tokenizer_policy_sha256(prompt_policy["tokenizer"]),
         approvals=approvals,
     )
     return result
@@ -1065,6 +1210,7 @@ class TraceFormatTests(unittest.TestCase):
                 "base_revision": manifest_record["candidate"]["base_revision"],
                 "diff_sha256": manifest_record["candidate"]["diff_sha256"],
                 "install_root": "/home/repo/build",
+                "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
                 "executable_path": manifest_record["candidate"]["executable_path"],
                 "executable_sha256": manifest_record["candidate"]["executable_sha256"],
                 "runtime_profile": copy.deepcopy(manifest_record["build"]["runtime_profile"]),
@@ -1352,12 +1498,20 @@ class TraceFormatTests(unittest.TestCase):
                 capture_output=True,
             )
             signature_path = policy_path.with_suffix(".json.sig")
+            approvers = {
+                principal: {
+                    "public_key": public_key,
+                    "policy_root": str(root),
+                    "owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                },
+            }
             loaded = trace.load_executable_approval_policy(
                 policy_path,
                 signature_path,
                 expected_principal=principal,
-                trusted_approvers={principal: public_key},
+                trusted_approvers=approvers,
                 ssh_keygen=self.ssh_keygen,
+                test_only_trust=True,
             )
             self.assertEqual(loaded.verifier_revision, "a" * 40)
             self.assertEqual(loaded.sha256, trace.sha256_file(policy_path))
@@ -1370,9 +1524,10 @@ class TraceFormatTests(unittest.TestCase):
                     policy_path,
                     signature_path,
                     expected_principal=principal,
-                    trusted_approvers={principal: public_key},
+                    trusted_approvers=approvers,
                     ssh_keygen=self.ssh_keygen,
                     forbidden_roots=(root,),
+                    test_only_trust=True,
                 )
             tampered = copy.deepcopy(policy)
             tampered["verifier_revision"] = "b" * 40
@@ -1382,8 +1537,9 @@ class TraceFormatTests(unittest.TestCase):
                     policy_path,
                     signature_path,
                     expected_principal=principal,
-                    trusted_approvers={principal: public_key},
+                    trusted_approvers=approvers,
                     ssh_keygen=self.ssh_keygen,
+                    test_only_trust=True,
                 )
             with self.assertRaisesRegex(trace.TraceError, "principal is not trusted"):
                 trace.load_executable_approval_policy(
@@ -1392,7 +1548,72 @@ class TraceFormatTests(unittest.TestCase):
                     expected_principal=principal,
                     trusted_approvers={},
                     ssh_keygen=self.ssh_keygen,
+                    test_only_trust=True,
                 )
+
+    def test_external_approval_rejects_mutable_root_and_hardlinks(self) -> None:
+        verifier = self._verifier_for_runtime("llama.cpp")
+        principal = "dsv41-test-executable-approver"
+        policy = {
+            "format": trace.EXECUTABLE_APPROVAL_FORMAT,
+            "version": trace.EXECUTABLE_APPROVAL_VERSION,
+            "principal": principal,
+            "verifier_repository": trace.REPOSITORY,
+            "verifier_revision": "a" * 40,
+            "candidate_exporters": verifier.candidate_exporter_policies,
+            "prompt_builders": verifier.prompt_builder_policies,
+        }
+        for mutation, message in (
+                ("mutable-root", "path is mutable"),
+                ("hard-linked-policy", "one-link regular file"),
+                ("hard-linked-signature", "one-link regular file"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                policy_path = root / "approval.json"
+                policy_path.write_text(trace.canonical_json(policy) + "\n", encoding="ascii")
+                subprocess.run(
+                    [
+                        str(self.ssh_keygen),
+                        "-Y", "sign",
+                        "-f", str(self.signing_key),
+                        "-n", trace.EXECUTABLE_APPROVAL_NAMESPACE,
+                        str(policy_path),
+                    ],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                )
+                signature_path = policy_path.with_suffix(".json.sig")
+                policy_path.chmod(0o444)
+                signature_path.chmod(0o444)
+                root.chmod(0o555)
+                if mutation == "mutable-root":
+                    root.chmod(0o777)
+                elif mutation == "hard-linked-policy":
+                    os.link(policy_path, Path(temp).parent / f"{root.name}-policy-alias")
+                else:
+                    os.link(signature_path, Path(temp).parent / f"{root.name}-signature-alias")
+                approvers = {
+                    principal: {
+                        "public_key": self.test_signers[self.signer_principal]["public_key"],
+                        "policy_root": str(root),
+                        "owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                    },
+                }
+                try:
+                    with isolated_test_install_trust(), self.assertRaisesRegex(trace.TraceError, message):
+                        trace.load_executable_approval_policy(
+                            policy_path,
+                            signature_path,
+                            expected_principal=principal,
+                            trusted_approvers=approvers,
+                            ssh_keygen=self.ssh_keygen,
+                        )
+                finally:
+                    root.chmod(0o755)
+                    for alias in Path(temp).parent.glob(f"{root.name}-*-alias"):
+                        alias.unlink()
 
     def test_candidate_runner_rejects_unapproved_exporter_before_execution(self) -> None:
         argv = [
@@ -1468,15 +1689,34 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_approved_executable_uses_linux_descriptor_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            executable = Path(temp).resolve() / "approved"
+            install = Path(temp).resolve() / "install"
+            executable = install / "bin" / "approved"
+            library = install / "lib" / "libapproved.so"
+            executable.parent.mkdir(parents=True)
+            library.parent.mkdir()
             executable.write_bytes(b"approved")
-            executable.chmod(0o755)
+            library.write_bytes(b"approved library")
+            executable.chmod(0o555)
+            library.chmod(0o555)
+            policy = {
+                "install_root": str(install),
+                "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "runtime_receipt": {
+                    "components": [{
+                        "component": "approved",
+                        "filename": library.name,
+                        "sha256": trace.sha256_file(library),
+                    }],
+                },
+            }
             completed = subprocess.CompletedProcess([str(executable)], 0, "", "")
-            with mock.patch.object(trace.sys, "platform", "linux"), mock.patch.object(
+            with isolated_test_install_trust(), mock.patch.object(
+                    trace.sys, "platform", "linux"), mock.patch.object(
                     trace.subprocess, "run", return_value=completed) as execute:
                 result, identity = trace.run_approved_executable(
                     [str(executable), "--version"],
                     path=executable,
+                    runtime_policy=policy,
                     expected_path=str(executable),
                     expected_sha256=trace.sha256_file(executable),
                     label="approved executable",
@@ -1488,7 +1728,112 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(identity.path, str(executable))
             kwargs = execute.call_args.kwargs
             self.assertRegex(kwargs["executable"], r"^/proc/self/fd/[0-9]+$")
-            self.assertEqual(len(kwargs["pass_fds"]), 1)
+            self.assertEqual(execute.call_args.args[0][0], str(executable))
+            self.assertEqual(len(kwargs["pass_fds"]), 2)
+
+    def test_approved_install_rejects_mutable_alias_and_hardlink_paths(self) -> None:
+        for mutation, message in (
+                ("writable-root", "path is mutable"),
+                ("writable-ancestor", "path is mutable"),
+                ("writable-executable", "immutable trusted-owned"),
+                ("hard-linked-library", "immutable trusted-owned"),
+                ("symlinked-executable", "canonical|aliases"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                install = root / "install"
+                executable = install / "bin" / "approved"
+                library = install / "lib" / "libapproved.so"
+                executable.parent.mkdir(parents=True)
+                library.parent.mkdir()
+                executable.write_bytes(b"approved executable")
+                library.write_bytes(b"approved library")
+                alias = install / "bin" / "alias"
+                if mutation == "symlinked-executable":
+                    alias.symlink_to(executable)
+                executable.chmod(0o555)
+                library.chmod(0o555)
+                executable.parent.chmod(0o555)
+                library.parent.chmod(0o555)
+                install.chmod(0o555)
+                policy = {
+                    "install_root": str(install),
+                    "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                    "runtime_receipt": {
+                        "components": [{
+                            "component": "approved",
+                            "filename": library.name,
+                            "sha256": trace.sha256_file(library),
+                        }],
+                    },
+                }
+                path = executable
+                if mutation == "writable-root":
+                    install.chmod(0o777)
+                elif mutation == "writable-ancestor":
+                    root.chmod(0o777)
+                elif mutation == "writable-executable":
+                    executable.chmod(0o755)
+                elif mutation == "hard-linked-library":
+                    os.link(library, root / "library-alias")
+                else:
+                    path = alias
+                with isolated_test_install_trust(), self.assertRaisesRegex(trace.TraceError, message):
+                    if mutation == "hard-linked-library":
+                        trace.approved_runtime_file_identities(policy, label="approved")
+                    else:
+                        trace.approved_executable_identity(
+                            path,
+                            install_root=str(install),
+                            expected_owner_uid=policy["install_owner_uid"],
+                            expected_path=str(path),
+                            expected_sha256=trace.sha256_file(executable),
+                            label="approved executable",
+                        )
+
+    def test_writable_install_root_blocks_replace_restore_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            install = Path(temp).resolve() / "install"
+            executable = install / "bin" / "approved"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"approved executable")
+            executable.chmod(0o555)
+            install.chmod(0o777)
+            policy = {
+                "install_root": str(install),
+                "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "runtime_receipt": {"components": []},
+            }
+            with isolated_test_install_trust(), mock.patch.object(
+                    trace.sys, "platform", "linux"), mock.patch.object(
+                    trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                    trace.TraceError, "path is mutable"):
+                trace.run_approved_executable(
+                    [str(executable)],
+                    path=executable,
+                    runtime_policy=policy,
+                    expected_path=str(executable),
+                    expected_sha256=trace.sha256_file(executable),
+                    label="approved executable",
+                )
+            execute.assert_not_called()
+
+    def test_install_trust_evidence_rejects_mutability_claims(self) -> None:
+        policy = fixture_prompt_builder_policy(b"prompt")
+        mutations = {
+            "same-owner": lambda value: value.update({"execution_uid": value["owner_uid"]}),
+            "writable-directory": lambda value: value["directories"][-1].update({"mode": 0o777}),
+            "directory-acl": lambda value: value["directories"][-1].update({"acl_entries": True}),
+            "writable-file": lambda value: value["files"][0].update({"mode": 0o755}),
+            "hard-linked-file": lambda value: value["files"][0].update({"link_count": 2}),
+            "file-acl": lambda value: value["files"][0].update({"acl_entries": True}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                trust = fixture_install_trust(policy)
+                mutate(trust)
+                with self.assertRaisesRegex(trace.TraceError, "install trust"):
+                    trace.validate_install_trust_evidence(trust, policy)
 
     def test_prompt_builder_rejects_runtime_receipt_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1509,10 +1854,12 @@ class TraceFormatTests(unittest.TestCase):
                 policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
             )
             runtime_component = policy["runtime_receipt"]["components"][0]
-            (Path(policy["install_root"]) / "lib" / runtime_component["filename"]).write_bytes(
-                b"changed")
-            with mock.patch.object(run_matrix, "run_approved_executable") as execute, self.assertRaisesRegex(
-                    run_matrix.TraceError, "runtime component .* SHA-256 differs from external approval"):
+            runtime_path = Path(policy["install_root"]) / "lib" / runtime_component["filename"]
+            runtime_path.chmod(0o644)
+            runtime_path.write_bytes(b"changed")
+            with isolated_test_install_trust(), mock.patch.object(
+                    run_matrix, "run_approved_executable") as execute, self.assertRaisesRegex(
+                    run_matrix.TraceError, "runtime component .* (immutable|SHA-256)"):
                 run_matrix.prepare_prompt(
                     builder=builder,
                     builder_approval_id=TEST_PROMPT_BUILDER_POLICY_ID,
@@ -1532,9 +1879,11 @@ class TraceFormatTests(unittest.TestCase):
     def test_prompt_builder_rejects_output_binary_and_corpus_mutation(self) -> None:
         for mutation, message in (
                 ("output", "output differs from external approval"),
-                ("builder", "SHA-256 differs from external approval"),
+                ("builder", "immutable|SHA-256 differs from external approval"),
                 ("corpus", "corpus changed during execution"),
-                ("runtime", "runtime component SHA-256 differs from external approval"),
+                ("runtime", "runtime component .*immutable|runtime component SHA-256 differs"),
+                ("runtime-load", "loaded runtime libraries differ from external approval"),
+                ("tokenizer", "tokenizer policy"),
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp).resolve()
@@ -1563,23 +1912,45 @@ class TraceFormatTests(unittest.TestCase):
                     TEST_PROMPT_BUILDER_POLICY_ID,
                     policies={TEST_PROMPT_BUILDER_POLICY_ID: policy},
                 )
-                initial_identity = run_matrix.approved_executable_identity(
-                    builder,
-                    expected_path=policy["executable_path"],
-                    expected_sha256=policy["executable_sha256"],
-                    label="prompt builder",
-                )
+                with isolated_test_install_trust():
+                    initial_identity = run_matrix.approved_executable_identity(
+                        builder,
+                        install_root=policy["install_root"],
+                        expected_owner_uid=policy["install_owner_uid"],
+                        expected_path=policy["executable_path"],
+                        expected_sha256=policy["executable_sha256"],
+                        label="prompt builder",
+                    )
 
                 def run_builder(command, **_kwargs):
+                    if "--dsv41-attest-build" in command:
+                        return (
+                            subprocess.CompletedProcess(
+                                command,
+                                0,
+                                json.dumps(fixture_runtime_build(policy)),
+                                "",
+                            ),
+                            initial_identity,
+                        )
                     output.write_bytes(b"prompt")
                     if mutation == "builder":
+                        builder.chmod(0o755)
                         builder.write_bytes(b"changed")
                     if mutation == "corpus":
                         corpus.write_bytes(b"changed")
                     if mutation == "runtime":
                         runtime_component = policy["runtime_receipt"]["components"][0]
-                        (Path(policy["install_root"]) / "lib" / runtime_component["filename"]).write_bytes(
-                            b"changed")
+                        runtime_path = Path(policy["install_root"]) / "lib" / runtime_component["filename"]
+                        runtime_path.chmod(0o644)
+                        runtime_path.write_bytes(b"changed")
+                    runtime_build = fixture_runtime_build(policy)
+                    tokenizer = copy.deepcopy(policy["tokenizer"])
+                    if mutation == "runtime-load":
+                        runtime_build["runtime_libraries"][0]["path"] = "/tmp/unapproved.so"
+                        runtime_build["runtime_libraries_post"][0]["path"] = "/tmp/unapproved.so"
+                    if mutation == "tokenizer":
+                        tokenizer["parse_special"] = False
                     return (
                         subprocess.CompletedProcess(
                             command,
@@ -1588,7 +1959,8 @@ class TraceFormatTests(unittest.TestCase):
                                 "target_tokens": 2,
                                 "actual_tokens": 2,
                                 "byte_count": 6,
-                                "add_bos": True,
+                                "tokenizer": tokenizer,
+                                "runtime_build": runtime_build,
                                 "temporary_directory": str(tmpdir),
                             }),
                             "",
@@ -1596,7 +1968,8 @@ class TraceFormatTests(unittest.TestCase):
                         initial_identity,
                     )
 
-                with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
+                with isolated_test_install_trust(), mock.patch.dict(
+                        os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
                         run_matrix, "run_approved_executable", side_effect=run_builder), self.assertRaisesRegex(
                         (RuntimeError, run_matrix.TraceError), message):
                     run_matrix.prepare_prompt(
@@ -1627,6 +2000,133 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(
                     trace.TraceError, "candidate exporter approval differs from external policy"):
                 self._seal_test_bundle(root)
+
+    def test_tokenizer_policy_contradictions_are_rejected_before_signing(self) -> None:
+        mutations = {
+            "add-bos-and-parse-special": {
+                "add_bos": False,
+                "parse_special": False,
+                "detokenize_special": True,
+                "remove_leading_bos_before_detokenize": False,
+                "require_round_trip": True,
+            },
+            "add-bos": {
+                "add_bos": False,
+                "parse_special": True,
+                "detokenize_special": True,
+                "remove_leading_bos_before_detokenize": False,
+                "require_round_trip": True,
+            },
+            "detokenize-special": {
+                "add_bos": True,
+                "parse_special": True,
+                "detokenize_special": False,
+                "remove_leading_bos_before_detokenize": True,
+                "require_round_trip": True,
+            },
+            "bos-removal": {
+                "add_bos": True,
+                "parse_special": True,
+                "detokenize_special": True,
+                "remove_leading_bos_before_detokenize": False,
+                "require_round_trip": True,
+            },
+            "round-trip": {
+                "add_bos": True,
+                "parse_special": True,
+                "detokenize_special": True,
+                "remove_leading_bos_before_detokenize": True,
+                "require_round_trip": False,
+            },
+        }
+        for name, tokenizer in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest()) as writer:
+                    add_required_events(writer)
+                record = trace.strict_json_loads(
+                    (root / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+                record["config"]["tokenizer"] = tokenizer
+                (root / trace.MANIFEST_NAME).write_text(
+                    trace.canonical_json(record) + "\n", encoding="ascii")
+                with self.assertRaisesRegex(trace.TraceError, "tokenizer"):
+                    self._seal_test_bundle(root)
+                self.assertFalse((root / trace.SIGNATURE_NAME).exists())
+
+        valid = fixture_prompt_builder_policy(b"prompt")["tokenizer"]
+        malformed = {
+            "missing": {key: value for key, value in valid.items() if key != "parse_special"},
+            "extra": {**valid, "unknown": False},
+            "non-boolean": {**valid, "add_bos": 1},
+        }
+        for name, tokenizer in malformed.items():
+            with self.subTest(name=name), self.assertRaisesRegex(trace.TraceError, "tokenizer policy"):
+                trace.validate_tokenizer_policy(tokenizer)
+
+    def test_prompt_provenance_tokenizer_mutation_is_rejected_before_signing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            manifest_path = root / trace.MANIFEST_NAME
+            record = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            old_path = root / record["prompt"]["provenance"]["path"]
+            provenance = trace.strict_json_loads(old_path.read_text(encoding="ascii"))
+            provenance["tokenizer"]["add_bos"] = False
+            provenance["tokenizer"]["remove_leading_bos_before_detokenize"] = False
+            data = (trace.canonical_json(provenance) + "\n").encode("ascii")
+            digest = trace.sha256_bytes(data)
+            new_path = root / "provenance" / f"{digest}.json"
+            new_path.write_bytes(data)
+            old_path.unlink()
+            record["prompt"]["provenance"] = {
+                "path": f"provenance/{digest}.json",
+                "sha256": digest,
+            }
+            manifest_path.write_text(trace.canonical_json(record) + "\n", encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "prompt provenance tokenizer"):
+                self._seal_test_bundle(root)
+            self.assertFalse((root / trace.SIGNATURE_NAME).exists())
+
+    def test_prompt_provenance_runtime_closure_mutation_is_rejected_before_signing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            manifest_path = root / trace.MANIFEST_NAME
+            record = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            old_path = root / record["prompt"]["provenance"]["path"]
+            provenance = trace.strict_json_loads(old_path.read_text(encoding="ascii"))
+            provenance["builder_runtime_build"]["runtime_libraries"][0]["path"] = "/tmp/unapproved.so"
+            provenance["builder_runtime_build"]["runtime_libraries_post"][0]["path"] = "/tmp/unapproved.so"
+            provenance["builder_runtime_build_sha256"] = trace.sha256_bytes(
+                trace.canonical_json(provenance["builder_runtime_build"]).encode("ascii"))
+            data = (trace.canonical_json(provenance) + "\n").encode("ascii")
+            digest = trace.sha256_bytes(data)
+            new_path = root / "provenance" / f"{digest}.json"
+            new_path.write_bytes(data)
+            old_path.unlink()
+            record["prompt"]["provenance"] = {
+                "path": f"provenance/{digest}.json",
+                "sha256": digest,
+            }
+            manifest_path.write_text(trace.canonical_json(record) + "\n", encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "loaded runtime libraries"):
+                self._seal_test_bundle(root)
+            self.assertFalse((root / trace.SIGNATURE_NAME).exists())
+
+    def test_authorization_tokenizer_hash_mutation_is_rejected_before_signing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            manifest_path = root / trace.MANIFEST_NAME
+            record = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            record["authorization"]["tokenizer_policy_sha256"] = "f" * 64
+            manifest_path.write_text(trace.canonical_json(record) + "\n", encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "tokenizer policy differs"):
+                self._seal_test_bundle(root)
+            self.assertFalse((root / trace.SIGNATURE_NAME).exists())
 
     def test_seal_rejects_protected_bundle_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3806,14 +4306,27 @@ class TraceFormatTests(unittest.TestCase):
                 TEST_PROMPT_BUILDER_POLICY_ID,
                 policies={TEST_PROMPT_BUILDER_POLICY_ID: builder_policy},
             )
-            builder_identity = run_matrix.approved_executable_identity(
-                builder,
-                expected_path=builder_policy["executable_path"],
-                expected_sha256=builder_policy["executable_sha256"],
-                label="prompt builder",
-            )
+            with isolated_test_install_trust():
+                builder_identity = run_matrix.approved_executable_identity(
+                    builder,
+                    install_root=builder_policy["install_root"],
+                    expected_owner_uid=builder_policy["install_owner_uid"],
+                    expected_path=builder_policy["executable_path"],
+                    expected_sha256=builder_policy["executable_sha256"],
+                    label="prompt builder",
+                )
 
             def run_builder(command, **_kwargs):
+                if "--dsv41-attest-build" in command:
+                    return (
+                        subprocess.CompletedProcess(
+                            command,
+                            0,
+                            json.dumps(fixture_runtime_build(builder_policy)),
+                            "",
+                        ),
+                        builder_identity,
+                    )
                 output.write_bytes(b"prompt")
                 return (
                     subprocess.CompletedProcess(
@@ -3823,7 +4336,8 @@ class TraceFormatTests(unittest.TestCase):
                             "target_tokens": 2,
                             "actual_tokens": 2,
                             "byte_count": 6,
-                            "add_bos": True,
+                            "tokenizer": builder_policy["tokenizer"],
+                            "runtime_build": fixture_runtime_build(builder_policy),
                             "temporary_directory": str(tmpdir.resolve()),
                         }),
                         "",
@@ -3831,7 +4345,8 @@ class TraceFormatTests(unittest.TestCase):
                     builder_identity,
                 )
 
-            with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
+            with isolated_test_install_trust(), mock.patch.dict(
+                    os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
                     run_matrix, "run_approved_executable", side_effect=run_builder), mock.patch.object(
                     sys, "stderr", io.StringIO()):
                 result = run_matrix.prepare_prompt(
@@ -3858,6 +4373,9 @@ class TraceFormatTests(unittest.TestCase):
                     "decode_steps", "builder_approval_id", "builder_approval_sha256",
                     "builder_path", "builder_sha256", "builder_revision",
                     "builder_runtime_profile", "target_tokens", "actual_tokens",
+                    "tokenizer", "builder_runtime_build", "builder_runtime_build_sha256",
+                    "builder_install_trust",
+                    "builder_install_trust_sha256",
                 },
             )
             preflight.validate_prompt_provenance(
@@ -4539,6 +5057,7 @@ class TraceFormatTests(unittest.TestCase):
                     "candidate_exporter",
                     TEST_CANDIDATE_EXPORTER_POLICY_ID,
                     candidate_policy_sha256,
+                    base_manifest["candidate"]["install_trust_sha256"],
                 )
             )
             with trace.TraceBundleWriter(base, base_manifest) as writer:

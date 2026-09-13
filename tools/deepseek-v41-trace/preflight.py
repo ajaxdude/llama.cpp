@@ -15,7 +15,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from trace_format import NO_EXTERNAL_STATE_STORAGE, TraceError, validate_watchdog_event
+from trace_format import (
+    NO_EXTERNAL_STATE_STORAGE,
+    TraceError,
+    install_trust_sha256,
+    runtime_build_evidence_sha256,
+    validate_install_trust_evidence,
+    validate_runtime_build_evidence,
+    validate_watchdog_event,
+)
 
 FORBIDDEN_ROOT = Path("/mnt/bigspace")
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
@@ -1376,12 +1384,32 @@ def validate_prompt_provenance(
         "builder_sha256": builder_policy["executable_sha256"],
         "builder_revision": builder_policy["revision"],
         "builder_runtime_profile": builder_policy["runtime_profile"],
+        "tokenizer": builder_policy["tokenizer"],
     }
     for key, value in expected.items():
         if record.get(key) != value:
             raise PreflightError(f"prompt provenance {key} mismatch")
-    if set(record) != set(expected):
+    required = set(expected) | {
+        "builder_runtime_build",
+        "builder_runtime_build_sha256",
+        "builder_install_trust",
+        "builder_install_trust_sha256",
+    }
+    if set(record) != required:
         raise PreflightError("prompt provenance fields are invalid")
+    try:
+        runtime_build = validate_runtime_build_evidence(
+            record["builder_runtime_build"], builder_policy, label="prompt builder")
+        runtime_build_sha256 = runtime_build_evidence_sha256(
+            runtime_build, builder_policy, label="prompt builder")
+        trust = validate_install_trust_evidence(record["builder_install_trust"], builder_policy)
+        trust_sha256 = install_trust_sha256(trust)
+    except TraceError as error:
+        raise PreflightError(f"prompt provenance runtime trust is invalid: {error}") from error
+    if record["builder_runtime_build_sha256"] != runtime_build_sha256:
+        raise PreflightError("prompt provenance runtime build SHA-256 mismatch")
+    if record["builder_install_trust_sha256"] != trust_sha256:
+        raise PreflightError("prompt provenance install trust SHA-256 mismatch")
     matches = [
         prompt_record for prompt_record in builder_policy["prompts"]
         if prompt_record["corpus_name"] == corpus_name and

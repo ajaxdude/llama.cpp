@@ -1505,6 +1505,25 @@ int main(int argc, char ** argv) {
         if (required_environment("HIP_LAUNCH_BLOCKING") != "1") {
             throw std::runtime_error("HIP_LAUNCH_BLOCKING=1 is required for gfx1151 correctness runs");
         }
+        const json tokenizer_policy = json::parse(required_environment("DSV41_TOKENIZER_POLICY"));
+        if (!tokenizer_policy.is_object() || tokenizer_policy.size() != 5 ||
+                !tokenizer_policy.contains("add_bos") ||
+                !tokenizer_policy.contains("parse_special") ||
+                !tokenizer_policy.contains("detokenize_special") ||
+                !tokenizer_policy.contains("remove_leading_bos_before_detokenize") ||
+                !tokenizer_policy.contains("require_round_trip") ||
+                !tokenizer_policy["add_bos"].is_boolean() ||
+                !tokenizer_policy["parse_special"].is_boolean() ||
+                !tokenizer_policy["detokenize_special"].is_boolean() ||
+                !tokenizer_policy["remove_leading_bos_before_detokenize"].is_boolean() ||
+                !tokenizer_policy["require_round_trip"].is_boolean() ||
+                !tokenizer_policy["parse_special"].get<bool>() ||
+                !tokenizer_policy["detokenize_special"].get<bool>() ||
+                !tokenizer_policy["require_round_trip"].get<bool>() ||
+                tokenizer_policy["remove_leading_bos_before_detokenize"].get<bool>() !=
+                    tokenizer_policy["add_bos"].get<bool>()) {
+            throw std::runtime_error("DSV41_TOKENIZER_POLICY is not the exact approved tokenizer policy");
+        }
         if (params.devices.size() != 1 || params.devices[0] == nullptr) {
             throw std::runtime_error("trace tool requires exactly one selected execution device");
         }
@@ -1561,7 +1580,11 @@ int main(int argc, char ** argv) {
         }
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const bool add_bos = llama_vocab_get_add_bos(vocab);
-        const std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+        if (add_bos != tokenizer_policy["add_bos"].get<bool>()) {
+            throw std::runtime_error("model tokenizer add_bos differs from the approved policy");
+        }
+        const std::vector<llama_token> tokens = common_tokenize(
+            ctx, params.prompt, add_bos, tokenizer_policy["parse_special"].get<bool>());
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         if (tokens.empty()) {
             throw std::runtime_error("prompt tokenization produced no tokens");
@@ -1602,8 +1625,7 @@ int main(int argc, char ** argv) {
                 {"load_mode", static_cast<int>(params.load_mode)},
                 {"expert_cache_slots", params.expert_cache_slots},
                 {"expert_cache_bytes", static_cast<uint64_t>(params.expert_cache_mib) << 20},
-                {"tokenizer_add_bos", add_bos},
-                {"tokenizer_parse_special", true},
+                {"tokenizer", tokenizer_policy},
                 {"deepseek41", {
                     {"layer_count", 40},
                     {"vocab_size", n_vocab},

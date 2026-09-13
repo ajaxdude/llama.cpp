@@ -46,6 +46,8 @@ from trace_format import (
     candidate_exporter_approval,
     canonical_json,
     execution_authorization,
+    install_trust_evidence,
+    install_trust_sha256,
     load_executable_approval_policy,
     reject_loader_overrides,
     run_approved_executable,
@@ -53,8 +55,10 @@ from trace_format import (
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    tokenizer_policy_sha256,
     prompt_builder_approval,
     validate_signing_identity,
+    validate_tokenizer_policy,
     verify_approved_executable_identity,
     verify_approved_runtime_file_identities,
 )
@@ -74,7 +78,8 @@ def candidate_attestation(
         approval_id: str,
         approval_sha256: str,
         approval: dict[str, object],
-        verifier_revision: str) -> dict[str, str]:
+        verifier_revision: str,
+        install_trust: dict[str, object]) -> dict[str, object]:
     repo = resolved(args.repo)
     exporter = resolved(exporter)
     observed_verifier_revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
@@ -133,6 +138,8 @@ def candidate_attestation(
         **expected,
         "exporter_approval_id": approval_id,
         "exporter_approval_sha256": approval_sha256,
+        "install_trust": install_trust,
+        "install_trust_sha256": install_trust_sha256(install_trust),
     }
 
 
@@ -272,6 +279,7 @@ def query_runtime_build_attestation(
     result, _identity = run_approved_executable(
         [str(exporter), "--dsv41-attest-build", device],
         path=exporter,
+        runtime_policy=approval,
         expected_path=approval["executable_path"],
         expected_sha256=approval["executable_sha256"],
         label="candidate exporter",
@@ -402,6 +410,7 @@ def query_accelerator_attestation(
             result, _identity = run_approved_executable(
                 [str(exporter), "--dsv41-attest-device", device],
                 path=exporter,
+                runtime_policy=approval,
                 expected_path=approval["executable_path"],
                 expected_sha256=approval["executable_sha256"],
                 label="candidate exporter",
@@ -517,27 +526,6 @@ def main() -> int:
             args.prompt_builder_policy_id,
             policies=approval_policy.prompt_builders,
         )
-        authorization = execution_authorization(
-            lane=CANDIDATE_LANE,
-            challenge=args.execution_challenge,
-            run_id=args.run_id,
-            issued_unix=args.authorization_issued_unix,
-            expires_unix=args.authorization_expires_unix,
-            approval_policy_sha256=approval_policy.sha256,
-            verifier_revision=approval_policy.verifier_revision,
-            approvals={
-                "candidate_exporter": approval_binding(
-                    "candidate_exporter",
-                    args.candidate_exporter_policy_id,
-                    candidate_policy_sha256,
-                ),
-                "prompt_builder": approval_binding(
-                    "prompt_builder",
-                    args.prompt_builder_policy_id,
-                    prompt_policy_sha256,
-                ),
-            },
-        )
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         validate_signing_identity(
@@ -549,12 +537,15 @@ def main() -> int:
         exporter = args.exporter
         exporter_identity = approved_executable_identity(
             exporter,
+            install_root=candidate_policy["install_root"],
+            expected_owner_uid=candidate_policy["install_owner_uid"],
             expected_path=candidate_policy["executable_path"],
             expected_sha256=candidate_policy["executable_sha256"],
             label="candidate exporter",
         )
         runtime_identities = approved_runtime_file_identities(
             candidate_policy, label="candidate exporter")
+        candidate_trust = install_trust_evidence(exporter_identity, runtime_identities)
         exporter_sha256 = exporter_identity.sha256
         if args.candidate_revision != candidate_policy["revision"] or (
                 args.base_revision != candidate_policy["base_revision"]) or (
@@ -566,6 +557,47 @@ def main() -> int:
             raise PreflightError("candidate verifier checkout differs from the external approval policy")
         if str(repo) != prompt_policy["source_root"] or candidate_policy["revision"] != prompt_policy["revision"]:
             raise PreflightError("candidate repository or revision differs from prompt builder approval")
+        model_sha256 = sha256_file(resolved(args.model))
+        if model_sha256 != MODEL_SHA256:
+            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        provenance = validate_prompt_provenance(
+            args.prompt_provenance,
+            prompt=args.prompt,
+            corpus_name=args.corpus_name,
+            corpus_sha256=args.corpus_sha256,
+            model_sha256=model_sha256,
+            target_tokens=args.context - args.decode_steps,
+            context=args.context,
+            decode_steps=args.decode_steps,
+            builder_approval_id=args.prompt_builder_policy_id,
+            builder_policy=prompt_policy,
+            builder_policy_sha256=prompt_policy_sha256,
+        )
+        prompt_trust_sha256 = provenance["record"]["builder_install_trust_sha256"]
+        authorization = execution_authorization(
+            lane=CANDIDATE_LANE,
+            challenge=args.execution_challenge,
+            run_id=args.run_id,
+            issued_unix=args.authorization_issued_unix,
+            expires_unix=args.authorization_expires_unix,
+            approval_policy_sha256=approval_policy.sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            tokenizer_policy_sha256_value=tokenizer_policy_sha256(prompt_policy["tokenizer"]),
+            approvals={
+                "candidate_exporter": approval_binding(
+                    "candidate_exporter",
+                    args.candidate_exporter_policy_id,
+                    candidate_policy_sha256,
+                    install_trust_sha256(candidate_trust),
+                ),
+                "prompt_builder": approval_binding(
+                    "prompt_builder",
+                    args.prompt_builder_policy_id,
+                    prompt_policy_sha256,
+                    prompt_trust_sha256,
+                ),
+            },
+        )
         verify_approved_runtime_file_identities(
             runtime_identities, label="candidate exporter")
         pre_runtime_build = query_runtime_build_attestation(
@@ -594,22 +626,6 @@ def main() -> int:
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
-        model_sha256 = sha256_file(resolved(args.model))
-        if model_sha256 != MODEL_SHA256:
-            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
-        provenance = validate_prompt_provenance(
-            args.prompt_provenance,
-            prompt=args.prompt,
-            corpus_name=args.corpus_name,
-            corpus_sha256=args.corpus_sha256,
-            model_sha256=model_sha256,
-            target_tokens=args.context - args.decode_steps,
-            context=args.context,
-            decode_steps=args.decode_steps,
-            builder_approval_id=args.prompt_builder_policy_id,
-            builder_policy=prompt_policy,
-            builder_policy_sha256=prompt_policy_sha256,
-        )
         attestation = candidate_attestation(
             args,
             exporter,
@@ -618,6 +634,7 @@ def main() -> int:
             candidate_policy_sha256,
             candidate_policy,
             approval_policy.verifier_revision,
+            candidate_trust,
         )
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
@@ -648,6 +665,7 @@ def main() -> int:
         environment["DSV41_TRACE_MEMORY_AUDIT"] = pre_audits["memory"]
         environment["DSV41_TRACE_SWAP_AUDIT"] = pre_audits["swap"]
         environment["DSV41_TRACE_WATCHDOG_AUDIT"] = pre_audits["watchdog"]
+        environment["DSV41_TOKENIZER_POLICY"] = canonical_json(prompt_policy["tokenizer"])
         command = build_command(args, exporter, output)
         print("exec:", shlex.join(command), file=sys.stderr)
         verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
@@ -656,6 +674,7 @@ def main() -> int:
         result, executed_identity = run_approved_executable(
             command,
             path=exporter,
+            runtime_policy=candidate_policy,
             expected_path=candidate_policy["executable_path"],
             expected_sha256=candidate_policy["executable_sha256"],
             label="candidate exporter",
@@ -705,6 +724,11 @@ def main() -> int:
         bind_candidate_attestation(
             output, attestation, accelerator, exporter, exporter_sha256, candidate_policy)
         bind_execution_authorization(output, authorization)
+        unsealed_manifest = strict_json_loads(
+            safe_trace_path(output, "manifest.json").read_text(encoding="ascii"))
+        if not isinstance(unsealed_manifest, dict) or validate_tokenizer_policy(
+                unsealed_manifest.get("config", {}).get("tokenizer")) != prompt_policy["tokenizer"]:
+            raise PreflightError("candidate manifest tokenizer policy differs from external approval")
         seal_bundle(
             output,
             private_key=args.signing_key,

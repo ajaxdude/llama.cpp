@@ -44,6 +44,7 @@ from trace_format import (
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    tokenizer_policy_sha256,
     validate_signing_identity,
 )
 
@@ -313,22 +314,6 @@ def main() -> int:
             args.prompt_builder_policy_id,
             policies=approval_policy.prompt_builders,
         )
-        authorization = execution_authorization(
-            lane=ORACLE_LANE,
-            challenge=args.execution_challenge,
-            run_id=args.run_id,
-            issued_unix=args.authorization_issued_unix,
-            expires_unix=args.authorization_expires_unix,
-            approval_policy_sha256=approval_policy.sha256,
-            verifier_revision=approval_policy.verifier_revision,
-            approvals={
-                "prompt_builder": approval_binding(
-                    "prompt_builder",
-                    args.prompt_builder_policy_id,
-                    prompt_policy_sha256,
-                ),
-            },
-        )
         harness_repo = resolved(args.repo)
         harness_revision = subprocess.check_output(
             ["git", "-C", str(harness_repo), "rev-parse", "HEAD"],
@@ -338,6 +323,42 @@ def main() -> int:
             raise PreflightError("ds4 verifier checkout differs from the external approval policy")
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
+        model_sha256 = sha256_file(resolved(args.model))
+        if model_sha256 != MODEL_SHA256:
+            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        provenance = validate_prompt_provenance(
+            args.prompt_provenance,
+            prompt=args.prompt,
+            corpus_name=args.corpus_name,
+            corpus_sha256=args.corpus_sha256,
+            model_sha256=model_sha256,
+            target_tokens=args.context - args.decode_steps,
+            context=args.context,
+            decode_steps=args.decode_steps,
+            builder_approval_id=args.prompt_builder_policy_id,
+            builder_policy=prompt_policy,
+            builder_policy_sha256=prompt_policy_sha256,
+            path_resolver=lambda path, label: Path(
+                str(darwin_storage_attestation(path, label)["resolved_path"])),
+        )
+        authorization = execution_authorization(
+            lane=ORACLE_LANE,
+            challenge=args.execution_challenge,
+            run_id=args.run_id,
+            issued_unix=args.authorization_issued_unix,
+            expires_unix=args.authorization_expires_unix,
+            approval_policy_sha256=approval_policy.sha256,
+            verifier_revision=approval_policy.verifier_revision,
+            tokenizer_policy_sha256_value=tokenizer_policy_sha256(prompt_policy["tokenizer"]),
+            approvals={
+                "prompt_builder": approval_binding(
+                    "prompt_builder",
+                    args.prompt_builder_policy_id,
+                    prompt_policy_sha256,
+                    provenance["record"]["builder_install_trust_sha256"],
+                ),
+            },
+        )
         exporter = resolved(args.exporter)
         if not exporter.is_file() or not os.access(exporter, os.X_OK):
             raise PreflightError(f"trace exporter is not executable: {exporter}")
@@ -374,24 +395,6 @@ def main() -> int:
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
-        model_sha256 = sha256_file(resolved(args.model))
-        if model_sha256 != MODEL_SHA256:
-            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
-        provenance = validate_prompt_provenance(
-            args.prompt_provenance,
-            prompt=args.prompt,
-            corpus_name=args.corpus_name,
-            corpus_sha256=args.corpus_sha256,
-            model_sha256=model_sha256,
-            target_tokens=args.context - args.decode_steps,
-            context=args.context,
-            decode_steps=args.decode_steps,
-            builder_approval_id=args.prompt_builder_policy_id,
-            builder_policy=prompt_policy,
-            builder_policy_sha256=prompt_policy_sha256,
-            path_resolver=lambda path, label: Path(
-                str(darwin_storage_attestation(path, label)["resolved_path"])),
-        )
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
         preflight_audit = preflight(args, accelerator=accelerator, runner=runner)
