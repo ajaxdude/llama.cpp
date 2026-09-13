@@ -1231,17 +1231,9 @@ class TraceFormatTests(unittest.TestCase):
             link.symlink_to(actual, target_is_directory=True)
             home = root / "home"
             (home / "tmp").mkdir(parents=True)
-            literal_home = Path("~/tmp")
             self.assertFalse(unusable.is_dir())
             self.assertFalse(os.access(unusable, os.W_OK | os.X_OK))
-            self.assertFalse(literal_home.is_dir())
-            self.assertFalse(os.access(literal_home, os.W_OK | os.X_OK))
             self.assertTrue(link.is_symlink())
-            cases = (
-                (unusable, "original lexical path"),
-                (link, "symlink"),
-                (literal_home, "existing writable directory"),
-            )
 
             def strix_storage(_path: Path, label: str) -> dict[str, object]:
                 if label == "temporary directory":
@@ -1256,8 +1248,8 @@ class TraceFormatTests(unittest.TestCase):
                     raise AssertionError("unusable TMPDIR reached storage attestation")
                 return metal_storage_record("/Users/oracle/test")
 
-            for tmpdir, message in cases:
-                with self.subTest(runtime="strix-rocm", tmpdir=tmpdir), mock.patch.dict(
+            def assert_rejected(tmpdir: Path, message: str) -> None:
+                with mock.patch.dict(
                         preflight.os.environ,
                         {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(tmpdir), "HOME": str(home)},
                         clear=True), mock.patch.object(
@@ -1272,7 +1264,7 @@ class TraceFormatTests(unittest.TestCase):
                             repo=Path("/home/repo"),
                             busy_patterns=[],
                         )
-                with self.subTest(runtime="apple-metal", tmpdir=tmpdir), mock.patch.dict(
+                with mock.patch.dict(
                         preflight.os.environ,
                         {"TMPDIR": str(tmpdir), "HOME": str(home)},
                         clear=True), mock.patch.object(
@@ -1290,6 +1282,60 @@ class TraceFormatTests(unittest.TestCase):
                             accelerator={},
                             runner={},
                         )
+
+            for tmpdir, message in (
+                    (unusable, "original lexical path"),
+                    (link, "symlink")):
+                with self.subTest(tmpdir=tmpdir):
+                    assert_rejected(tmpdir, message)
+
+            literal_parent = root / "~"
+            literal_target = root / "literal"
+            (literal_target / "tmp").mkdir(parents=True)
+            literal_parent.symlink_to(literal_target, target_is_directory=True)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                literal_home = Path("~/tmp")
+                self.assertTrue(literal_home.is_dir())
+                self.assertTrue(os.access(literal_home, os.W_OK | os.X_OK))
+                self.assertNotEqual(literal_home.absolute(), literal_home.expanduser().absolute())
+                assert_rejected(literal_home, "absolute literal path")
+            finally:
+                os.chdir(previous_cwd)
+
+            model = root / "model.gguf"
+            prompt = root / "prompt.txt"
+            output = root / "output"
+            repo = root / "repo"
+            model.write_bytes(b"model")
+            prompt.write_bytes(b"prompt")
+            output.mkdir()
+            repo.mkdir()
+            valid_tmpdir = root / "good" / "tmp"
+
+            def valid_strix_storage(path: Path, _label: str) -> dict[str, object]:
+                return storage_record(str(path.resolve()))
+
+            with mock.patch.dict(
+                    preflight.os.environ,
+                    {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(valid_tmpdir)},
+                    clear=True), mock.patch.object(
+                    preflight, "storage_attestation", side_effect=valid_strix_storage), mock.patch.object(
+                    preflight, "swap_audit", return_value={"enabled": False, "entries": []}), mock.patch.object(
+                    preflight, "watchdog_audit", return_value=copy.deepcopy(
+                        AUDIT_RECORDS["watchdog"]["data"])), mock.patch.object(
+                    preflight, "matching_workloads", return_value=[]), mock.patch.object(
+                    preflight, "memory_audit", return_value=copy.deepcopy(
+                        AUDIT_RECORDS["memory"]["data"])):
+                result = preflight.run_strix_preflight(
+                    model=model,
+                    prompt=prompt,
+                    output=output,
+                    repo=repo,
+                    busy_patterns=[],
+                )
+            self.assertEqual(result["storage"]["temporary_directory"]["resolved_path"], str(valid_tmpdir))
 
     def test_preflight_requires_explicit_nvme_tmpdir(self) -> None:
         with mock.patch.object(
@@ -1621,6 +1667,54 @@ class TraceFormatTests(unittest.TestCase):
                 64 * 1024 * 1024 * 1024,
                 (),
             )
+            canonical_finals = {}
+            for classification, exit_code in (
+                    ("procfs_error", watchdog.EXIT_PROCFS_ERROR),
+                    ("signal_error", watchdog.EXIT_SIGNAL_ERROR)):
+                stream = io.StringIO()
+                final_logger = watchdog.AuditLogger(stream, wall_clock=lambda: now)
+                with mock.patch.object(watchdog.signal, "pthread_sigmask", return_value=set()):
+                    watchdog._kill_and_finish(
+                        final_logger,
+                        guardian,
+                        snapshot,
+                        snapshot.used_bytes,
+                        classification,
+                        exit_code,
+                        f"test {classification}",
+                        lambda _pid, _signal: "sigkill_sent",
+                    )
+                final_event = trace.strict_json_loads(stream.getvalue().splitlines()[-1])
+                self.assertNotIn("error", final_event)
+                trace.validate_watchdog_event(final_event)
+                canonical_finals[classification] = final_event
+
+            class TimeoutProcess(FakeProcess):
+                @staticmethod
+                def wait(timeout: float | None = None) -> int:
+                    raise subprocess.TimeoutExpired(child_command, timeout)
+
+            timeout_stream = io.StringIO()
+            timeout_logger = watchdog.AuditLogger(timeout_stream, wall_clock=lambda: now)
+            timeout_guardian = watchdog.GuardianProcess(TimeoutProcess(), child_pid, -1)
+            with mock.patch.object(watchdog.signal, "pthread_sigmask", return_value=set()):
+                watchdog._kill_and_finish(
+                    timeout_logger,
+                    timeout_guardian,
+                    snapshot,
+                    snapshot.used_bytes,
+                    "procfs_error",
+                    watchdog.EXIT_PROCFS_ERROR,
+                    "test timeout",
+                    lambda _pid, _signal: "sigkill_sent",
+                )
+            timeout_final = trace.strict_json_loads(timeout_stream.getvalue().splitlines()[-1])
+            self.assertEqual(timeout_final["classification"], "termination_timeout")
+            self.assertEqual(timeout_final["process_group_status"], "sigkill_timeout")
+            self.assertIsInstance(timeout_final["error"], str)
+            trace.validate_watchdog_event(timeout_final)
+            canonical_finals["termination_timeout"] = timeout_final
+
             logger = watchdog.AuditLogger(io.StringIO(), wall_clock=lambda: now)
             logger.open_persistent(audit_path)
             state = watchdog._state_fields(
@@ -1697,6 +1791,14 @@ class TraceFormatTests(unittest.TestCase):
             preflight.bind_embedded_audits(trace_root, audit_sets)
             try:
                 trace.TraceBundle(trace_root)
+                for classification, final_event in canonical_finals.items():
+                    final_root = root / f"trace-{classification}"
+                    with trace.TraceBundleWriter(final_root, manifest("llama.cpp")) as writer:
+                        add_required_events(writer)
+                    for phase in ("pre", "post"):
+                        replace_watchdog_events(
+                            final_root, phase, [*WATCHDOG_EVENTS, final_event])
+                    trace.TraceBundle(final_root)
             finally:
                 logger.close()
 
@@ -2118,6 +2220,17 @@ class TraceFormatTests(unittest.TestCase):
                     trace.TraceBundle(root)
 
     def test_enforces_watchdog_final_error_classification(self) -> None:
+        self.assertEqual(trace.WATCHDOG_REQUIRED_ERROR_CLASSIFICATIONS, {
+            "configuration_error",
+            "internal_error",
+            "launch_error",
+            "lease_error",
+            "termination_timeout",
+        })
+        self.assertEqual(trace.WATCHDOG_OPTIONAL_ERROR_CLASSIFICATIONS, {
+            "procfs_error",
+            "signal_error",
+        })
         terminal = {
             key: copy.deepcopy(value)
             for key, value in WATCHDOG_EVENTS[1].items()
@@ -2136,6 +2249,25 @@ class TraceFormatTests(unittest.TestCase):
             for phase in ("pre", "post"):
                 replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, terminal])
             trace.TraceBundle(root)
+
+        for classification, error in (
+                ("procfs_error", None),
+                ("procfs_error", "initial snapshot failed"),
+                ("signal_error", None),
+                ("signal_error", "cannot signal process group")):
+            with self.subTest(classification=classification, error=error), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                candidate = copy.deepcopy(terminal)
+                candidate["classification"] = classification
+                if error is None:
+                    candidate.pop("error")
+                else:
+                    candidate["error"] = error
+                for phase in ("pre", "post"):
+                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
+                trace.TraceBundle(root)
 
         for classification, error in (
                 ("internal_error", None),

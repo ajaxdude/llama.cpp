@@ -406,14 +406,16 @@ WATCHDOG_STATE_KEYS = {
     "process_group_status",
     "threshold_reason",
 }
-WATCHDOG_ERROR_CLASSIFICATIONS = {
+WATCHDOG_REQUIRED_ERROR_CLASSIFICATIONS = {
     "configuration_error",
     "internal_error",
     "launch_error",
     "lease_error",
+    "termination_timeout",
+}
+WATCHDOG_OPTIONAL_ERROR_CLASSIFICATIONS = {
     "procfs_error",
     "signal_error",
-    "termination_timeout",
 }
 
 
@@ -463,7 +465,7 @@ def validate_watchdog_event(event: Any) -> dict[str, Any]:
     if event["process_group_status"] not in {
             "not_created", "active", "leader_exited", "signal_error",
             "termination_timeout", "missing", "sighup_sent", "sigint_sent",
-            "sigterm_sent", "sigkill_sent"}:
+            "sigterm_sent", "sigkill_sent", "sigkill_timeout"}:
         raise TraceError("watchdog JSONL process_group_status is invalid")
     if not isinstance(event["threshold_reason"], str) or not event["threshold_reason"]:
         raise TraceError("watchdog JSONL threshold_reason is invalid")
@@ -494,10 +496,14 @@ def validate_watchdog_event(event: Any) -> dict[str, Any]:
             raise TraceError("watchdog JSONL classification is invalid")
         if type(event["exit_code"]) is not int:
             raise TraceError("watchdog JSONL exit code is invalid")
-        requires_error = event["classification"] in WATCHDOG_ERROR_CLASSIFICATIONS
-        if ("error" in event) != requires_error:
+        classification = event["classification"]
+        requires_error = classification in WATCHDOG_REQUIRED_ERROR_CLASSIFICATIONS
+        allows_error = requires_error or classification in WATCHDOG_OPTIONAL_ERROR_CLASSIFICATIONS
+        if requires_error and "error" not in event:
             raise TraceError("watchdog JSONL error presence does not match classification")
-        if requires_error and (not isinstance(event["error"], str) or not event["error"]):
+        if not allows_error and "error" in event:
+            raise TraceError("watchdog JSONL error presence does not match classification")
+        if "error" in event and (not isinstance(event["error"], str) or not event["error"]):
             raise TraceError("watchdog JSONL error is invalid")
         secondary_errors = event.get("secondary_errors")
         if secondary_errors is not None:

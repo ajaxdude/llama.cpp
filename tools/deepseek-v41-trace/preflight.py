@@ -84,6 +84,8 @@ def reject_forbidden_path(
 
 
 def require_safe_tmpdir_path(path: Path) -> Path:
+    if not path.is_absolute():
+        raise PreflightError("TMPDIR must use an absolute literal path")
     lexical_path = reject_forbidden_path(path, "TMPDIR")
     try:
         status = os.lstat(path)
