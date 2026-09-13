@@ -1,0 +1,24 @@
+[Unit]
+Description=Restore the signed Strix Halo host baseline
+Documentation=file:///usr/local/share/doc/strix-host-restore/README.md
+After=local-fs.target docker.service
+ConditionPathExists=/etc/strix-host-restore/plan.json
+ConditionPathExists=/etc/strix-host-restore/plan.sig
+ConditionPathExists=/etc/strix-host-restore/plan.key
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/strix-host-restore restore --plan /etc/strix-host-restore/plan.json --signature /etc/strix-host-restore/plan.sig --key /etc/strix-host-restore/plan.key --expected-nonce @EXPECTED_NONCE@ --expected-deadline @EXPECTED_DEADLINE_EPOCH@ --audit-dir /var/lib/strix-host-restore
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true

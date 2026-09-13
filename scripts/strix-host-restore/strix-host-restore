@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+
+import argparse
+import dataclasses
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import platform
+import pwd
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SCHEMA_VERSION = 1
+MAX_ARM_HORIZON_SECONDS = 7 * 24 * 60 * 60
+MAX_EXPIRY_WINDOW_SECONDS = 60 * 60
+MAX_DOCKER_HEALTH_TIMEOUT_SECONDS = 10 * 60
+MAX_PLAN_BYTES = 64 * 1024
+MAX_AUTH_FILE_BYTES = 1024
+NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+
+SWAP_PATH = "/swapfile"
+DOCKER_CONTAINER = "monerod"
+SYSTEM_UNITS = (
+    ("p2pool", "p2pool.service"),
+    ("xmrig", "xmrig.service"),
+)
+USER_UNITS = (
+    ("llama_swap", "llama-swap.service"),
+    ("proxy", "llama-proxy.service"),
+)
+
+SWAPON = "/usr/sbin/swapon"
+DOCKER = "/usr/bin/docker"
+SYSTEMCTL = "/usr/bin/systemctl"
+RUNUSER = "/usr/sbin/runuser"
+ENV = "/usr/bin/env"
+INSTALLED_SCRIPT = "/usr/local/sbin/strix-host-restore"
+INSTALLED_PLAN = "/etc/strix-host-restore/plan.json"
+INSTALLED_SIGNATURE = "/etc/strix-host-restore/plan.sig"
+INSTALLED_KEY = "/etc/strix-host-restore/plan.key"
+INSTALLED_AUDIT_DIR = "/var/lib/strix-host-restore"
+
+
+class RestoreError(Exception):
+    pass
+
+
+def require_exact_keys(value, expected, context):
+    if type(value) is not dict:
+        raise RestoreError(f"{context} must be an object")
+    actual = set(value)
+    expected = set(expected)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing:
+        raise RestoreError(f"{context} is missing keys: {', '.join(missing)}")
+    if unknown:
+        raise RestoreError(f"{context} has unknown keys: {', '.join(unknown)}")
+
+
+def require_bool(value, context):
+    if type(value) is not bool:
+        raise RestoreError(f"{context} must be a boolean")
+    return value
+
+
+def require_int(value, context, minimum=None, maximum=None):
+    if type(value) is not int:
+        raise RestoreError(f"{context} must be an integer")
+    if minimum is not None and value < minimum:
+        raise RestoreError(f"{context} is below {minimum}")
+    if maximum is not None and value > maximum:
+        raise RestoreError(f"{context} is above {maximum}")
+    return value
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RestoreError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def open_parent_directory_nofollow(path):
+    absolute = os.path.abspath(os.fspath(path))
+    parts = Path(absolute).parts
+    if len(parts) < 2:
+        raise RestoreError(f"unsafe path: {path}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open("/", directory_flags)
+    try:
+        for component in parts[1:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+    except OSError as exc:
+        os.close(directory_fd)
+        raise RestoreError(f"path contains an unsafe directory: {path}: {exc}") from exc
+    return directory_fd, parts[-1]
+
+
+def secure_read(path, expected_uid, expected_mode, label, maximum_bytes):
+    directory_fd, filename = open_parent_directory_nofollow(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RestoreError(f"cannot securely open {label}: {exc}") from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RestoreError(f"{label} is not a regular file")
+        if info.st_uid != expected_uid:
+            raise RestoreError(f"{label} owner must be UID {expected_uid}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != expected_mode:
+            raise RestoreError(f"{label} mode must be {expected_mode:04o}, got {mode:04o}")
+        if info.st_nlink != 1:
+            raise RestoreError(f"{label} must have exactly one hard link")
+        if info.st_size > maximum_bytes:
+            raise RestoreError(f"{label} exceeds {maximum_bytes} bytes")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def parse_hex_file(raw, expected_bytes, label):
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RestoreError(f"{label} must contain ASCII hexadecimal") from exc
+    if len(text) != expected_bytes * 2 or not re.fullmatch(r"[0-9A-Fa-f]+", text):
+        raise RestoreError(f"{label} must contain exactly {expected_bytes * 2} hexadecimal characters")
+    return bytes.fromhex(text)
+
+
+@dataclasses.dataclass(frozen=True)
+class ServiceIntent:
+    active: bool
+    enabled: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RestorePlan:
+    nonce: str
+    restore_deadline_epoch: int
+    expires_epoch: int
+    target_uid: int
+    swap_enabled: bool
+    docker_running: bool
+    docker_health_timeout_seconds: int
+    system_services: tuple
+    user_services: tuple
+    digest: str
+
+    def intended_actions(self):
+        actions = []
+        if self.swap_enabled:
+            actions.append(f"enable swap on {SWAP_PATH}")
+        if self.docker_running:
+            actions.append(
+                f"start Docker container {DOCKER_CONTAINER}, then wait up to "
+                f"{self.docker_health_timeout_seconds}s for its configured health state"
+            )
+        for component, unit, intent in self.system_services:
+            if intent.enabled:
+                actions.append(f"enable system unit {unit}")
+            if intent.active:
+                actions.append(f"start system unit {unit}")
+        for component, unit, intent in self.user_services:
+            if intent.enabled:
+                actions.append(f"enable user unit {unit} as UID {self.target_uid}")
+            if intent.active:
+                actions.append(f"start user unit {unit} as UID {self.target_uid}")
+        return actions
+
+
+def parse_plan(raw, digest, expected_nonce, expected_deadline, now, require_due):
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except UnicodeDecodeError as exc:
+        raise RestoreError("plan must be UTF-8 JSON") from exc
+    except json.JSONDecodeError as exc:
+        raise RestoreError(f"plan is malformed JSON: {exc}") from exc
+
+    require_exact_keys(
+        data,
+        (
+            "schema",
+            "platform",
+            "nonce",
+            "restore_deadline_epoch",
+            "expires_epoch",
+            "target_uid",
+            "components",
+        ),
+        "plan",
+    )
+    schema = require_int(data["schema"], "schema")
+    if schema != SCHEMA_VERSION:
+        raise RestoreError(f"unsupported plan schema: {data['schema']!r}")
+
+    require_exact_keys(data["platform"], ("os", "architecture", "device"), "platform")
+    if data["platform"] != {
+        "os": "fedora",
+        "architecture": "x86_64",
+        "device": "strix-halo",
+    }:
+        raise RestoreError("plan platform must be Fedora x86_64 Strix Halo")
+
+    nonce = data["nonce"]
+    if type(nonce) is not str or NONCE_RE.fullmatch(nonce) is None:
+        raise RestoreError("nonce must be 16-64 characters from A-Z, a-z, 0-9, underscore, or hyphen")
+    if not hmac.compare_digest(nonce, expected_nonce):
+        raise RestoreError("plan nonce does not match the armed nonce")
+
+    deadline = require_int(data["restore_deadline_epoch"], "restore_deadline_epoch", 1)
+    expires = require_int(data["expires_epoch"], "expires_epoch", 1)
+    if deadline != expected_deadline:
+        raise RestoreError("plan deadline does not match the armed deadline")
+    if expires <= deadline:
+        raise RestoreError("plan expiry must be after its restore deadline")
+    if expires - deadline > MAX_EXPIRY_WINDOW_SECONDS:
+        raise RestoreError("plan expiry window exceeds one hour")
+    if deadline - now > MAX_ARM_HORIZON_SECONDS:
+        raise RestoreError("plan deadline is more than seven days in the future")
+    if now > expires:
+        raise RestoreError("plan has expired")
+    if require_due and now < deadline:
+        raise RestoreError("restore deadline has not been reached")
+
+    target_uid = require_int(data["target_uid"], "target_uid", 1, 2**31 - 1)
+    components = data["components"]
+    require_exact_keys(
+        components,
+        ("swapfile", "docker_monerod", "p2pool", "xmrig", "llama_swap", "proxy"),
+        "components",
+    )
+
+    require_exact_keys(components["swapfile"], ("enabled",), "components.swapfile")
+    swap_enabled = require_bool(components["swapfile"]["enabled"], "components.swapfile.enabled")
+
+    require_exact_keys(
+        components["docker_monerod"],
+        ("running", "health_timeout_seconds"),
+        "components.docker_monerod",
+    )
+    docker_running = require_bool(
+        components["docker_monerod"]["running"],
+        "components.docker_monerod.running",
+    )
+    docker_timeout = require_int(
+        components["docker_monerod"]["health_timeout_seconds"],
+        "components.docker_monerod.health_timeout_seconds",
+        1,
+        MAX_DOCKER_HEALTH_TIMEOUT_SECONDS,
+    )
+
+    system_services = []
+    for component, unit in SYSTEM_UNITS:
+        entry = components[component]
+        require_exact_keys(entry, ("active", "enabled"), f"components.{component}")
+        system_services.append(
+            (
+                component,
+                unit,
+                ServiceIntent(
+                    active=require_bool(entry["active"], f"components.{component}.active"),
+                    enabled=require_bool(entry["enabled"], f"components.{component}.enabled"),
+                ),
+            )
+        )
+
+    user_services = []
+    for component, unit in USER_UNITS:
+        entry = components[component]
+        require_exact_keys(entry, ("active", "enabled"), f"components.{component}")
+        user_services.append(
+            (
+                component,
+                unit,
+                ServiceIntent(
+                    active=require_bool(entry["active"], f"components.{component}.active"),
+                    enabled=require_bool(entry["enabled"], f"components.{component}.enabled"),
+                ),
+            )
+        )
+
+    return RestorePlan(
+        nonce=nonce,
+        restore_deadline_epoch=deadline,
+        expires_epoch=expires,
+        target_uid=target_uid,
+        swap_enabled=swap_enabled,
+        docker_running=docker_running,
+        docker_health_timeout_seconds=docker_timeout,
+        system_services=tuple(system_services),
+        user_services=tuple(user_services),
+        digest=digest,
+    )
+
+
+def load_authenticated_plan(
+    plan_path,
+    signature_path,
+    key_path,
+    expected_uid,
+    expected_nonce,
+    expected_deadline,
+    now,
+    require_due,
+):
+    raw_plan = secure_read(plan_path, expected_uid, 0o600, "plan", MAX_PLAN_BYTES)
+    raw_signature = secure_read(
+        signature_path,
+        expected_uid,
+        0o600,
+        "signature",
+        MAX_AUTH_FILE_BYTES,
+    )
+    raw_key = secure_read(
+        key_path,
+        expected_uid,
+        0o600,
+        "HMAC key",
+        MAX_AUTH_FILE_BYTES,
+    )
+    key = parse_hex_file(raw_key, 32, "HMAC key")
+    signature = parse_hex_file(raw_signature, 32, "signature")
+    actual_signature = hmac.new(key, raw_plan, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, actual_signature):
+        raise RestoreError("plan signature is invalid")
+    digest = hashlib.sha256(raw_plan).hexdigest()
+    return parse_plan(
+        raw_plan,
+        digest,
+        expected_nonce,
+        expected_deadline,
+        now,
+        require_due,
+    )
+
+
+def verify_host_platform():
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8")
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise RestoreError(f"cannot verify host platform: {exc}") from exc
+    os_id = None
+    for line in os_release.splitlines():
+        if line.startswith("ID="):
+            os_id = line[3:].strip().strip("\"'")
+            break
+    if os_id != "fedora":
+        raise RestoreError("restore is restricted to Fedora")
+    if platform.machine() != "x86_64":
+        raise RestoreError("restore is restricted to x86_64")
+    if "AMD Ryzen AI Max" not in cpuinfo:
+        raise RestoreError("restore is restricted to an AMD Ryzen AI Max Strix Halo host")
+
+
+def verify_restore_installation(args):
+    required_paths = {
+        "script": (os.path.abspath(sys.argv[0]), INSTALLED_SCRIPT),
+        "plan": (os.path.abspath(args.plan), INSTALLED_PLAN),
+        "signature": (os.path.abspath(args.signature), INSTALLED_SIGNATURE),
+        "key": (os.path.abspath(args.key), INSTALLED_KEY),
+        "audit directory": (os.path.abspath(args.audit_dir), INSTALLED_AUDIT_DIR),
+    }
+    for label, (actual, expected) in required_paths.items():
+        if actual != expected:
+            raise RestoreError(f"unsafe {label} path: expected {expected}")
+    try:
+        info = os.stat(INSTALLED_SCRIPT, follow_symlinks=False)
+    except OSError as exc:
+        raise RestoreError(f"cannot inspect installed restore script: {exc}") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o755
+        or info.st_nlink != 1
+    ):
+        raise RestoreError("installed restore script must be a root-owned 0755 regular file with one hard link")
+
+
+class CommandRunner:
+    def run(self, args, allowed_returncodes=(0,)):
+        try:
+            result = subprocess.run(
+                args,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RestoreError(f"command failed to execute: {' '.join(args)}: {exc}") from exc
+        if result.returncode not in allowed_returncodes:
+            stderr = result.stderr.strip()
+            raise RestoreError(
+                f"command failed ({result.returncode}): {' '.join(args)}"
+                + (f": {stderr}" if stderr else "")
+            )
+        return result.stdout.strip()
+
+
+def open_secure_directory(path, expected_uid, expected_mode, label):
+    directory_fd, filename = open_parent_directory_nofollow(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RestoreError(f"cannot inspect {label}: {exc}") from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise RestoreError(f"{label} is not a directory")
+        if info.st_uid != expected_uid:
+            raise RestoreError(f"{label} owner must be UID {expected_uid}")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != expected_mode:
+            raise RestoreError(f"{label} mode must be {expected_mode:04o}, got {mode:04o}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def validate_directory(path, expected_uid, expected_mode, label):
+    fd = open_secure_directory(path, expected_uid, expected_mode, label)
+    os.close(fd)
+
+
+class AuditWriter:
+    def __init__(self, audit_dir, nonce, expected_uid=0):
+        self.audit_dir = audit_dir
+        self.nonce = nonce
+        self.expected_uid = expected_uid
+        self.dir_fd = None
+        self.lock_fd = None
+        self.filename = f"restore-{nonce}.json"
+
+    def __enter__(self):
+        try:
+            self.dir_fd = open_secure_directory(
+                self.audit_dir,
+                self.expected_uid,
+                0o700,
+                "audit directory",
+            )
+            lock_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                lock_flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                lock_flags |= os.O_NOFOLLOW
+            try:
+                self.lock_fd = os.open(".lock", lock_flags, 0o600, dir_fd=self.dir_fd)
+            except FileExistsError:
+                lock_flags &= ~(os.O_CREAT | os.O_EXCL)
+                self.lock_fd = os.open(".lock", lock_flags, dir_fd=self.dir_fd)
+            lock_info = os.fstat(self.lock_fd)
+            if (
+                not stat.S_ISREG(lock_info.st_mode)
+                or lock_info.st_uid != self.expected_uid
+                or stat.S_IMODE(lock_info.st_mode) != 0o600
+                or lock_info.st_nlink != 1
+            ):
+                raise RestoreError("audit lock is not a secure regular file")
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+            self._validate_existing()
+        except (OSError, RestoreError) as exc:
+            self.__exit__(None, None, None)
+            if isinstance(exc, RestoreError):
+                raise
+            raise RestoreError(f"cannot initialize audit writer: {exc}") from exc
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+        if self.dir_fd is not None:
+            os.close(self.dir_fd)
+            self.dir_fd = None
+
+    def _validate_existing(self):
+        try:
+            info = os.stat(self.filename, dir_fd=self.dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RestoreError(f"cannot inspect audit record: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise RestoreError("audit record is not a regular file")
+        if info.st_uid != self.expected_uid or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RestoreError("audit record has unsafe ownership or mode")
+        if info.st_nlink != 1:
+            raise RestoreError("audit record must have exactly one hard link")
+
+    def write(self, state):
+        self._validate_existing()
+        encoded = (json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        temporary = f".{self.filename}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = None
+        try:
+            fd = os.open(temporary, flags, 0o600, dir_fd=self.dir_fd)
+            os.fchmod(fd, 0o600)
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(fd, encoded[offset:])
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            self._validate_existing()
+            os.replace(
+                temporary,
+                self.filename,
+                src_dir_fd=self.dir_fd,
+                dst_dir_fd=self.dir_fd,
+            )
+            os.fsync(self.dir_fd)
+        except OSError as exc:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temporary, dir_fd=self.dir_fd)
+            except OSError:
+                pass
+            raise RestoreError(f"cannot write durable audit record: {exc}") from exc
+
+
+class Restorer:
+    def __init__(
+        self,
+        plan,
+        audit,
+        runner=None,
+        monotonic=None,
+        sleeper=None,
+        runtime_validator=None,
+        username_lookup=None,
+        wall_clock=None,
+    ):
+        self.plan = plan
+        self.audit = audit
+        self.runner = runner or CommandRunner()
+        self.monotonic = monotonic or time.monotonic
+        self.sleeper = sleeper or time.sleep
+        self.runtime_validator = runtime_validator or self._validate_user_runtime
+        self.username_lookup = username_lookup or self._lookup_username
+        self.wall_clock = wall_clock or time.time
+        self.state = {
+            "schema": 1,
+            "nonce": plan.nonce,
+            "plan_sha256": plan.digest,
+            "restore_deadline_epoch": plan.restore_deadline_epoch,
+            "started_epoch": int(time.time()),
+            "status": "running",
+            "events": [],
+        }
+
+    def checkpoint(self):
+        self.audit.write(self.state)
+
+    def event(self, component, action, result):
+        self.state["events"].append(
+            {
+                "component": component,
+                "action": action,
+                "result": result,
+                "epoch": int(time.time()),
+            }
+        )
+        self.checkpoint()
+
+    def restore(self):
+        self.checkpoint()
+        try:
+            self._ensure_not_expired()
+            self._restore_swap()
+            self._ensure_not_expired()
+            self._restore_docker()
+            for component, unit, intent in self.plan.system_services:
+                self._ensure_not_expired()
+                self._restore_service(component, unit, intent, user_prefix=None)
+            username = None
+            prefix = None
+            if any(intent.active or intent.enabled for _, _, intent in self.plan.user_services):
+                username = self.username_lookup(self.plan.target_uid)
+                prefix = self.runtime_validator(self.plan.target_uid, username)
+            for component, unit, intent in self.plan.user_services:
+                self._ensure_not_expired()
+                self._restore_service(component, unit, intent, user_prefix=prefix)
+            self.state["status"] = "complete"
+            self.state["completed_epoch"] = int(time.time())
+            self.checkpoint()
+        except Exception as exc:
+            self.state["status"] = "failed"
+            self.state["error"] = str(exc)
+            self.state["failed_epoch"] = int(time.time())
+            try:
+                self.checkpoint()
+            except Exception as audit_exc:
+                raise RestoreError(f"{exc}; audit update also failed: {audit_exc}") from exc
+            if isinstance(exc, RestoreError):
+                raise
+            raise RestoreError(str(exc)) from exc
+
+    def _ensure_not_expired(self):
+        if int(self.wall_clock()) > self.plan.expires_epoch:
+            raise RestoreError("plan expired during restoration")
+
+    def _restore_swap(self):
+        if not self.plan.swap_enabled:
+            self.event("swapfile", "skip", "baseline-disabled")
+            return
+        output = self.runner.run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
+        active = {line.strip() for line in output.splitlines() if line.strip()}
+        if SWAP_PATH in active:
+            self.event("swapfile", "swapon", "already-restored")
+            return
+        self._ensure_not_expired()
+        self.runner.run((SWAPON, SWAP_PATH))
+        verify = self.runner.run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
+        if SWAP_PATH not in {line.strip() for line in verify.splitlines() if line.strip()}:
+            raise RestoreError(f"{SWAP_PATH} did not become active")
+        self.event("swapfile", "swapon", "restored")
+
+    def _docker_inspect(self, template):
+        return self.runner.run((DOCKER, "inspect", f"--format={template}", DOCKER_CONTAINER))
+
+    def _restore_docker(self):
+        if not self.plan.docker_running:
+            self.event("docker_monerod", "skip", "baseline-stopped")
+            return
+        running = self._docker_inspect("{{.State.Running}}")
+        if running not in ("true", "false"):
+            raise RestoreError(f"unsupported Docker running state: {running!r}")
+        if running == "false":
+            self._ensure_not_expired()
+            self.runner.run((DOCKER, "start", DOCKER_CONTAINER))
+            action = "started"
+        else:
+            action = "already-running"
+        health_test = self._docker_inspect("{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{end}}")
+        if not health_test or health_test in ("null", "[]"):
+            raise RestoreError("monerod has no existing Docker health command")
+        deadline = self.monotonic() + self.plan.docker_health_timeout_seconds
+        while True:
+            self._ensure_not_expired()
+            health = self._docker_inspect("{{.State.Health.Status}}")
+            if health == "healthy":
+                self.event("docker_monerod", "start-and-wait", f"{action}-healthy")
+                return
+            if health not in ("starting", "unhealthy"):
+                raise RestoreError(f"unsupported Docker health state: {health!r}")
+            if self.monotonic() >= deadline:
+                raise RestoreError("timed out waiting for monerod Docker health")
+            self.sleeper(min(2, max(0, deadline - self.monotonic())))
+
+    def _service_state(self, prefix, operation, unit):
+        command = tuple(prefix or ()) + (SYSTEMCTL, operation, unit)
+        if operation == "is-active":
+            output = self.runner.run(command, allowed_returncodes=(0, 3))
+            if output not in ("active", "inactive", "failed", "activating", "deactivating", "reloading"):
+                raise RestoreError(f"unsupported active state for {unit}: {output!r}")
+            return output
+        output = self.runner.run(command, allowed_returncodes=(0, 1))
+        if output not in (
+            "enabled",
+            "enabled-runtime",
+            "linked",
+            "linked-runtime",
+            "disabled",
+            "masked",
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+            "alias",
+        ):
+            raise RestoreError(f"unsupported enable state for {unit}: {output!r}")
+        return output
+
+    def _restore_service(self, component, unit, intent, user_prefix):
+        if not intent.active and not intent.enabled:
+            self.event(component, "skip", "baseline-inactive-disabled")
+            return
+        enable_state = self._service_state(user_prefix, "is-enabled", unit)
+        active_state = self._service_state(user_prefix, "is-active", unit)
+        restored = []
+        if intent.enabled:
+            if enable_state in ("masked", "static", "generated", "transient", "alias"):
+                raise RestoreError(f"cannot safely enable {unit} from state {enable_state}")
+            if enable_state not in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
+                self._ensure_not_expired()
+                self.runner.run(tuple(user_prefix or ()) + (SYSTEMCTL, "enable", unit))
+                verify = self._service_state(user_prefix, "is-enabled", unit)
+                if verify not in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
+                    raise RestoreError(f"{unit} did not become enabled")
+                restored.append("enabled")
+        if intent.active and active_state != "active":
+            if active_state in ("activating", "deactivating", "reloading"):
+                raise RestoreError(f"cannot safely start {unit} from state {active_state}")
+            self._ensure_not_expired()
+            self.runner.run(tuple(user_prefix or ()) + (SYSTEMCTL, "start", unit))
+            if self._service_state(user_prefix, "is-active", unit) != "active":
+                raise RestoreError(f"{unit} did not become active")
+            restored.append("started")
+        self.event(component, "reconcile", ",".join(restored) if restored else "already-restored")
+
+    @staticmethod
+    def _lookup_username(uid):
+        try:
+            entry = pwd.getpwuid(uid)
+        except KeyError as exc:
+            raise RestoreError(f"target UID {uid} does not exist") from exc
+        if entry.pw_uid != uid or not entry.pw_name:
+            raise RestoreError(f"target UID {uid} has an invalid account")
+        return entry.pw_name
+
+    @staticmethod
+    def _validate_user_runtime(uid, username):
+        runtime_dir = f"/run/user/{uid}"
+        validate_directory(runtime_dir, uid, 0o700, "target user runtime directory")
+        bus_path = f"{runtime_dir}/bus"
+        try:
+            info = os.stat(bus_path, follow_symlinks=False)
+        except OSError as exc:
+            raise RestoreError(f"cannot inspect target user systemd bus: {exc}") from exc
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid:
+            raise RestoreError("target user systemd bus is not a UID-owned socket")
+        return (
+            RUNUSER,
+            "--user",
+            username,
+            "--",
+            ENV,
+            f"XDG_RUNTIME_DIR={runtime_dir}",
+            f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}",
+        )
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Validate or execute the Fedora Strix Halo host baseline restoration plan."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("validate", "restore"):
+        subparser = subparsers.add_parser(command)
+        subparser.add_argument("--plan", required=True)
+        subparser.add_argument("--signature", required=True)
+        subparser.add_argument("--key", required=True)
+        subparser.add_argument("--expected-nonce", required=True)
+        subparser.add_argument("--expected-deadline", required=True, type=int)
+        if command == "restore":
+            subparser.add_argument(
+                "--audit-dir",
+                default="/var/lib/strix-host-restore",
+            )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    now = int(time.time())
+    if args.command == "restore":
+        if os.geteuid() != 0:
+            raise RestoreError("restore mode requires root")
+        verify_restore_installation(args)
+        verify_host_platform()
+        expected_uid = 0
+        require_due = True
+    else:
+        expected_uid = os.geteuid()
+        require_due = False
+
+    plan = load_authenticated_plan(
+        args.plan,
+        args.signature,
+        args.key,
+        expected_uid,
+        args.expected_nonce,
+        args.expected_deadline,
+        now,
+        require_due,
+    )
+
+    if args.command == "validate":
+        print(f"VALID plan_sha256={plan.digest} nonce={plan.nonce}")
+        actions = plan.intended_actions()
+        if not actions:
+            print("No restoration actions are requested.")
+        for index, action in enumerate(actions, 1):
+            print(f"{index}. {action}")
+        print("No commands were executed.")
+        return 0
+
+    with AuditWriter(args.audit_dir, plan.nonce) as audit:
+        Restorer(plan, audit).restore()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RestoreError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
