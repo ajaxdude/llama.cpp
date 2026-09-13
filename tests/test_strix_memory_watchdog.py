@@ -615,6 +615,18 @@ class TestWatchdogBehavior(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "grace period"):
             config.validate()
 
+    def test_configuration_rejects_thresholds_above_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "116 GiB"):
+            watchdog.WatchdogConfig(
+                command=("fake-command",),
+                soft_bytes=watchdog.DEFAULT_SOFT_BYTES + 1,
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "118 GiB"):
+            watchdog.WatchdogConfig(
+                command=("fake-command",),
+                emergency_bytes=watchdog.DEFAULT_EMERGENCY_BYTES + 1,
+            ).validate()
+
     def test_cli_fixture_launches_command_and_propagates_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

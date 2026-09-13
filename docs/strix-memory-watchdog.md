@@ -30,7 +30,7 @@ The wrapper performs these checks and actions:
 
 The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 120 GiB ceiling. The default sample interval is one second. This margin cannot guarantee the ceiling for a workload that can allocate more than 2 GiB between samples. Lower `--emergency-gib` or shorten `--sample-interval-seconds` for such a workload.
 
-Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB.
+Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. Threshold overrides may only lower the 116 GiB soft and 118 GiB emergency limits.
 
 The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Signal records are written immediately after each process-group signal. Child standard input, standard output, and standard error are inherited unchanged.
 
