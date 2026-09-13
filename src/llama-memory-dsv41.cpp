@@ -817,6 +817,16 @@ void llama_memory_dsv41::state_read(
             pimpl->config.engram->checkpoint() : llama_dsv41_engram_snapshot {};
     std::set<llama_seq_id> restored;
     std::vector<uint8_t> tensor_data;
+    struct staged_sequence {
+        llama_seq_id target = -1;
+        llama_pos pos = -1;
+        std::vector<int32_t> candidates;
+        std::vector<uint64_t> planes;
+    };
+    std::vector<staged_sequence> staged;
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        staged.reserve(count);
+    }
 
     try {
         for (uint32_t i = 0; i < count; ++i) {
@@ -848,23 +858,47 @@ void llama_memory_dsv41::state_read(
                 io.read(engram_state.history.tail.data(), sizeof(engram_state.history.tail));
                 engram_snapshot.sequences[target] = engram_state;
             }
+            std::vector<uint64_t> planes;
+            if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+                planes.reserve(tensors.size());
+            }
             for (ggml_tensor * tensor : tensors) {
                 uint64_t plane = 0;
                 io.read(&plane, sizeof(plane));
                 if (plane != pimpl->sequence_plane(tensor)) {
                     throw std::runtime_error("DeepSeek V4.1 state tensor layout differs");
                 }
-                tensor_data.resize(plane);
-                io.read(tensor_data.data(), plane);
-                ggml_backend_tensor_set(tensor, tensor_data.data(), (size_t) target*plane, plane);
+                if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+                    planes.push_back(plane);
+                } else {
+                    tensor_data.resize(plane);
+                    io.read(tensor_data.data(), plane);
+                    ggml_backend_tensor_set(tensor, tensor_data.data(), (size_t) target*plane, plane);
+                }
             }
-            pimpl->sequences[target].pos = pos;
-            pimpl->sequences[target].candidates = std::move(candidates);
-            pimpl->update_position_state(target);
-            pimpl->update_candidate_state(target);
+            if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+                staged.push_back({ target, pos, std::move(candidates), std::move(planes) });
+            } else {
+                pimpl->sequences[target].pos = pos;
+                pimpl->sequences[target].candidates = std::move(candidates);
+                pimpl->update_position_state(target);
+                pimpl->update_candidate_state(target);
+            }
         }
         if (pimpl->config.engram) {
             pimpl->config.engram->restore(engram_snapshot);
+        }
+        for (auto & sequence : staged) {
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                io.read_tensor(
+                        tensors[i],
+                        (size_t) sequence.target*sequence.planes[i],
+                        sequence.planes[i]);
+            }
+            pimpl->sequences[sequence.target].pos = sequence.pos;
+            pimpl->sequences[sequence.target].candidates = std::move(sequence.candidates);
+            pimpl->update_position_state(sequence.target);
+            pimpl->update_candidate_state(sequence.target);
         }
         if (seq_id == -1) {
             pimpl->engram_boundaries.clear();
