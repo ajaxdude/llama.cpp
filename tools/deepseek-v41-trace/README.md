@@ -12,7 +12,7 @@ Each trace is a directory:
 
 The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected.
 
-Internal tensors use raw ggml dimension order. The validator requires Engram rows as i32 `[24, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, attention-source IDs as nonempty rank-2 i32 with width at most 512 and `token_count` in the second dimension, layer-20 candidate blocks as rank-2 i32 with width at most 2048, propagated candidates as rank-2 i32 with width at most 512, and complete f32 logits as `[129280]`. Original expert IDs must be within `0..383`.
+Internal tensors use raw ggml dimension order, and every dimension must be positive. The validator requires Engram rows as i32 `[24, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, attention-source IDs as nonempty rank-2 i32 with width at most 512 and `token_count` in the second dimension, layer-20 candidate blocks as nonempty rank-2 i32 with width at most 2048, propagated candidates as nonempty rank-2 i32 with width at most 512, and complete f32 logits as `[129280]`. Original expert IDs must be within `0..383`.
 
 Validate or compare bundles:
 
@@ -40,7 +40,7 @@ Start at context 32768. `llama-deepseek-v41-prompt-builder` loads only the GGUF 
 
 ## Strix execution gate
 
-`run_ds4.py` verifies the pinned ds4 checkout and refuses model execution when swap is enabled, the watchdog lease or heartbeat is missing/stale, another matching DS4 workload is active, or any model/prompt/trace path resolves under `/mnt/bigspace`.
+`run_ds4.py` verifies that the pinned ds4 checkout has no tracked or untracked changes and refuses model execution when swap is enabled, the watchdog lease or heartbeat is missing/stale, another matching DS4 workload is active, or any model/prompt/trace path resolves under `/mnt/bigspace`.
 
 The watchdog lease is JSON, not a bare PID:
 

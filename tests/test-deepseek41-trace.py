@@ -17,6 +17,7 @@ assert SPEC is not None and SPEC.loader is not None
 trace = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(trace)
 import run_llama
+import run_ds4
 import preflight
 
 
@@ -541,7 +542,7 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(result["first_divergence"]["classification"], "artifact_identity")
 
     def test_rejects_empty_variable_width_components(self) -> None:
-        for component in ("attn.source", "attn.candidate_blocks"):
+        for component in ("attn.source", "attn.candidate_blocks", "attn.candidates"):
             with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
                 writer = trace.TraceBundleWriter(Path(temp) / "trace", manifest())
                 with self.assertRaisesRegex(trace.TraceError, "nonzero"):
@@ -557,6 +558,53 @@ class TraceFormatTests(unittest.TestCase):
                         data=b"",
                     )
                 writer.events.close()
+
+    def test_rejects_zero_dimensions_globally(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            writer = trace.TraceBundleWriter(Path(temp) / "trace", manifest())
+            with self.assertRaisesRegex(trace.TraceError, "nonzero"):
+                writer.add_event(
+                    component="prompt.bytes",
+                    phase="input",
+                    step=0,
+                    token_start=0,
+                    token_count=1,
+                    layer=None,
+                    dtype="bytes",
+                    shape=[0],
+                    data=b"",
+                )
+            writer.events.close()
+
+    def test_rejects_dirty_ds4_checkout(self) -> None:
+        original = run_ds4.git_output
+        try:
+            run_ds4.git_output = lambda checkout, *args: (
+                trace.DS4_REVISION if args == ("rev-parse", "HEAD") else " M runtime.py")
+            with self.assertRaisesRegex(preflight.PreflightError, "tracked or untracked"):
+                run_ds4.verify_checkout(Path("/tmp/ds4"))
+        finally:
+            run_ds4.git_output = original
+
+    def test_rejects_weakened_coverage_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            weakened = manifest()
+            del weakened["expected"]["components"]["expert.ids"]["decode"]
+            with trace.TraceBundleWriter(root, weakened) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "coverage contract"):
+                trace.TraceBundle(root)
+
+    def test_rejects_prompt_token_count_not_bound_to_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            mismatched = manifest()
+            mismatched["expected"]["prompt_tokens"] = 1
+            with trace.TraceBundleWriter(root, mismatched) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "prompt provenance"):
+                trace.TraceBundle(root)
 
     def test_watchdog_stat_parser_handles_parentheses(self) -> None:
         fields = ["S", *[str(value) for value in range(4, 23)]]

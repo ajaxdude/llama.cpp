@@ -22,20 +22,28 @@ from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, s
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 
 
-def read_revision(checkout: Path) -> str:
+def git_output(checkout: Path, *args: str) -> str:
     try:
         return subprocess.check_output(
-            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            ["git", "-C", str(checkout), *args],
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise PreflightError(f"cannot read ds4 revision: {error}") from error
+        raise PreflightError(f"ds4 git {' '.join(args)} failed: {error}") from error
+
+
+def verify_checkout(checkout: Path) -> str:
+    revision = git_output(checkout, "rev-parse", "HEAD")
+    status = git_output(checkout, "status", "--porcelain", "--untracked-files=all")
+    if status:
+        raise PreflightError("ds4 checkout has tracked or untracked changes")
+    return revision
 
 
 def preflight(args: argparse.Namespace) -> dict[str, object]:
     checkout = resolved(args.checkout)
-    revision = read_revision(checkout)
+    revision = verify_checkout(checkout)
     if revision != DS4_REVISION:
         raise PreflightError(f"ds4 revision mismatch: expected {DS4_REVISION}, found {revision}")
     result = run_preflight(

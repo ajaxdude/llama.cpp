@@ -1,5 +1,6 @@
 #include "../src/llama-dsv41.h"
 #include "../src/llama-arch.h"
+#include "../tools/deepseek-v41-trace/trace-components.h"
 
 #include "ggml.h"
 
@@ -308,14 +309,27 @@ static void test_graph_contract() {
                 llama_dsv41_graph_trace_name("expert.ids", il) ==
                     "dsv41.trace.expert.ids.l" + std::to_string(il),
                 "expert ID trace name is unstable");
+        const auto expert_ids = dsv41_trace_parse_name(llama_dsv41_graph_trace_name("expert.ids", il));
+        check(expert_ids && expert_ids->component == "expert.ids" &&
+                expert_ids->layer == (int) il &&
+                std::string(expert_ids->semantic_id_space) == "original",
+                "exporter does not recognize original expert ID trace");
         check(
                 llama_dsv41_graph_trace_name("expert.weights", il) ==
                     "dsv41.trace.expert.weights.l" + std::to_string(il),
                 "expert weight trace name is unstable");
+        const auto expert_weights = dsv41_trace_parse_name(llama_dsv41_graph_trace_name("expert.weights", il));
+        check(expert_weights && expert_weights->component == "expert.weights" &&
+                expert_weights->layer == (int) il,
+                "exporter does not recognize expert weight trace");
         check(
                 llama_dsv41_graph_trace_name("attn.source", il) ==
                     "dsv41.trace.attn.source.l" + std::to_string(il),
                 "attention source trace name is unstable");
+        const auto attention_source = dsv41_trace_parse_name(llama_dsv41_graph_trace_name("attn.source", il));
+        check(attention_source && attention_source->component == "attn.source" &&
+                attention_source->layer == (int) il,
+                "exporter does not recognize attention source trace");
         if (il > LLAMA_DSV41_CANDIDATE_SOURCE_LAYER &&
                 llama_dsv41_index_source_layer(il) == (int32_t) il) {
             candidate_trace_layers.push_back(il);
@@ -323,6 +337,10 @@ static void test_graph_contract() {
                     llama_dsv41_graph_trace_name("attn.candidates", il) ==
                         "dsv41.trace.attn.candidates.l" + std::to_string(il),
                     "attention candidate trace name is unstable");
+            const auto candidates = dsv41_trace_parse_name(llama_dsv41_graph_trace_name("attn.candidates", il));
+            check(candidates && candidates->component == "attn.candidates" &&
+                    candidates->layer == (int) il,
+                    "exporter does not recognize propagated candidate trace");
         }
     }
     check(ratio_count[0] == 2 && ratio_count[1] == 20 && ratio_count[2] == 18,
@@ -336,12 +354,25 @@ static void test_graph_contract() {
             llama_dsv41_graph_trace_name("attn.candidate_blocks", 20) ==
                 "dsv41.trace.attn.candidate_blocks.l20",
             "candidate block trace name is unstable");
+    const auto candidate_blocks =
+        dsv41_trace_parse_name(llama_dsv41_graph_trace_name("attn.candidate_blocks", 20));
+    check(candidate_blocks && candidate_blocks->component == "attn.candidate_blocks" &&
+            candidate_blocks->layer == 20,
+            "exporter does not recognize candidate block trace");
     check(
             llama_dsv41_graph_trace_name("engram.row_ids", 1) ==
                 "dsv41.trace.engram.row_ids.l1" &&
             llama_dsv41_graph_trace_name("engram.row_ids", 14) ==
                 "dsv41.trace.engram.row_ids.l14",
             "Engram row trace names are unstable");
+    for (uint32_t layer : { 1u, 14u }) {
+        const auto engram = dsv41_trace_parse_name(llama_dsv41_graph_trace_name("engram.row_ids", layer));
+        check(engram && engram->component == "engram.row_ids" &&
+                engram->layer == (int) layer,
+                "exporter does not recognize Engram row trace");
+    }
+    check(!dsv41_trace_parse_name("dsv41.trace.attn.candidates.l20"),
+            "exporter accepted an unexpected candidate trace layer");
     check(llama_dsv41_build_layer_plan(39, { 39 }, 1024).collapses_output,
             "final layer must preserve streams for carried-pre output collapse");
 }

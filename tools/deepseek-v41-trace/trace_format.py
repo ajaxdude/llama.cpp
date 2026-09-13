@@ -51,13 +51,18 @@ HARD_FAILURE_COMPONENTS = (
     "decode.greedy_token",
 )
 
-DEEPSEEK41_LAYERS = {
-    "engram.row_ids": [1, 14],
-    "expert.ids": list(range(40)),
-    "expert.weights": list(range(40)),
-    "attn.source": list(range(40)),
-    "attn.candidate_blocks": [20],
-    "attn.candidates": [24, 28, 32, 36],
+DEEPSEEK41_EXPECTED_COMPONENTS = {
+    "prompt.bytes": {"layers": None, "input": "tokens"},
+    "prompt.tokens": {"layers": None, "input": "tokens"},
+    "engram.row_ids": {"layers": [1, 14], "prefill": "tokens", "decode": "steps"},
+    "expert.ids": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
+    "expert.weights": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
+    "attn.source": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
+    "attn.candidate_blocks": {"layers": [20], "prefill": "tokens", "decode": "steps"},
+    "attn.candidates": {"layers": [24, 28, 32, 36], "prefill": "tokens", "decode": "steps"},
+    "logits.prefill": {"layers": None, "prefill": "final"},
+    "logits.decode": {"layers": None, "decode": "steps"},
+    "decode.greedy_token": {"layers": None, "decode": "steps"},
 }
 
 
@@ -119,8 +124,8 @@ def canonical_json(data: Any) -> str:
 def element_count(shape: Iterable[int]) -> int:
     count = 1
     for dim in shape:
-        if not isinstance(dim, int) or dim < 0:
-            raise TraceError(f"invalid shape dimension: {dim!r}")
+        if not isinstance(dim, int) or dim <= 0:
+            raise TraceError(f"shape dimension must be a nonzero positive integer: {dim!r}")
         count *= dim
     return count
 
@@ -391,6 +396,11 @@ class TraceBundle:
         for section in ("config", "comparison", "environment", "audits"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
+        context = self.manifest["config"].get("context")
+        decode_steps = self.manifest["config"].get("decode_steps")
+        if not isinstance(context, int) or not isinstance(decode_steps, int) or (
+                decode_steps <= 0 or context <= decode_steps):
+            raise TraceError("manifest context or decode_steps is invalid")
         if self.manifest["model"]["sha256"] != MODEL_SHA256:
             raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
         if self.manifest["model"].get("architecture") != "deepseek41":
@@ -416,7 +426,7 @@ class TraceBundle:
             raise TraceError(f"cannot read prompt provenance: {error}") from error
         if sha256_bytes(provenance_bytes) != provenance_sha256:
             raise TraceError("prompt provenance SHA-256 mismatch")
-        expected_target = self.manifest["config"].get("context", 0) - self.manifest["config"].get("decode_steps", 0)
+        expected_target = context - decode_steps
         provenance_checks = {
             "format": "dsv41-prompt-provenance",
             "version": 1,
@@ -552,14 +562,15 @@ class TraceBundle:
             raise TraceError("expected decode_steps is invalid")
         if self.manifest.get("config", {}).get("decode_steps") != decode_steps:
             raise TraceError("expected decode_steps does not match config")
+        if prompt_tokens != self.manifest.get("prompt", {}).get("target_tokens"):
+            raise TraceError("expected prompt_tokens does not match prompt provenance")
         for event in self.events:
             self._validate_component_schema(event)
         if not isinstance(components, dict):
             raise TraceError("expected components are invalid")
         if self.manifest.get("model", {}).get("architecture") == "deepseek41":
-            for component, layers in DEEPSEEK41_LAYERS.items():
-                if components.get(component, {}).get("layers") != layers:
-                    raise TraceError(f"DeepSeek V4.1 expected layers are invalid for {component}")
+            if components != DEEPSEEK41_EXPECTED_COMPONENTS:
+                raise TraceError("DeepSeek V4.1 expected component coverage contract is invalid")
 
         by_component: dict[str, list[dict[str, Any]]] = {}
         for event in self.events:

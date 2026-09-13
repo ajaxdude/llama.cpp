@@ -7,6 +7,7 @@ extern "C" {
 #include "hash/sha256/sha256.h"
 }
 #include "llama.h"
+#include "trace-components.h"
 
 #include <nlohmann/json.hpp>
 
@@ -22,7 +23,6 @@ extern "C" {
 #include <fstream>
 #include <iomanip>
 #include <limits>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,7 +32,6 @@ namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 
 static constexpr int TRACE_VERSION = 1;
-static constexpr const char * TRACE_PREFIX = "dsv41.trace.";
 
 static std::string sha256_hex(const unsigned char digest[SHA256_DIGEST_SIZE]) {
     std::ostringstream stream;
@@ -301,35 +300,15 @@ public:
 
     void add_tensor(const ggml_tensor * tensor) {
         const std::string name = tensor->name;
-        std::string component;
-        const char * semantic_id_space = nullptr;
-        if (name.rfind("dsv41.trace.engram.row_ids.l", 0) == 0) {
-            component = "engram.row_ids";
-        } else if (name.rfind("dsv41.trace.expert.ids.l", 0) == 0) {
-            component = "expert.ids";
-            semantic_id_space = "original";
-        } else if (name.rfind("dsv41.trace.expert.weights.l", 0) == 0) {
-            component = "expert.weights";
-        } else if (name.rfind("dsv41.trace.attn.source.l", 0) == 0) {
-            component = "attn.source";
-        } else if (name.rfind("dsv41.trace.attn.candidate_blocks.l", 0) == 0) {
-            component = "attn.candidate_blocks";
-        } else if (name.rfind("dsv41.trace.attn.candidates.l", 0) == 0) {
-            component = "attn.candidates";
-        } else {
+        const auto descriptor = dsv41_trace_parse_name(name);
+        if (!descriptor) {
             return;
         }
-
-        static const std::regex layer_pattern(R"(\.l([0-9]+)$)");
-        std::smatch match;
-        if (!std::regex_search(name, match, layer_pattern)) {
-            throw std::runtime_error("trace tensor name has no layer suffix: " + name);
-        }
-        const int layer = std::stoi(match[1].str());
         const size_t size = ggml_nbytes(tensor);
         buffer.resize(size);
         ggml_backend_tensor_get(tensor, buffer.data(), 0, size);
-        add(component, layer, tensor_dtype(tensor), tensor_shape(tensor), buffer.data(), size, semantic_id_space);
+        add(descriptor->component, descriptor->layer, tensor_dtype(tensor), tensor_shape(tensor),
+                buffer.data(), size, descriptor->semantic_id_space);
     }
 
     bool has_error() const {
@@ -381,7 +360,7 @@ private:
 static bool trace_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * writer = static_cast<trace_writer *>(user_data);
     if (ask) {
-        return std::string(tensor->name).rfind(TRACE_PREFIX, 0) == 0;
+        return dsv41_trace_parse_name(tensor->name).has_value();
     }
     try {
         writer->add_tensor(tensor);
