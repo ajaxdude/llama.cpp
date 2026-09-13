@@ -39,6 +39,15 @@ HARD_FAILURE_COMPONENTS = (
     "decode.greedy_token",
 )
 
+DEEPSEEK41_LAYERS = {
+    "engram.row_ids": [1, 14],
+    "expert.ids": list(range(40)),
+    "expert.weights": list(range(40)),
+    "attn.source": list(range(40)),
+    "attn.candidate_blocks": [20],
+    "attn.candidates": [24, 28, 32, 36],
+}
+
 
 class TraceError(RuntimeError):
     pass
@@ -344,6 +353,10 @@ class TraceBundle:
             raise TraceError("expected decode_steps does not match config")
         if not isinstance(components, dict):
             raise TraceError("expected components are invalid")
+        if self.manifest.get("model", {}).get("architecture") == "deepseek41":
+            for component, layers in DEEPSEEK41_LAYERS.items():
+                if components.get(component, {}).get("layers") != layers:
+                    raise TraceError(f"DeepSeek V4.1 expected layers are invalid for {component}")
 
         by_component: dict[str, list[dict[str, Any]]] = {}
         for event in self.events:
@@ -411,6 +424,7 @@ def first_byte_difference(left: bytes, right: bytes) -> int | None:
 def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
     checks = (
         ("model.sha256", "model_identity"),
+        ("model.architecture", "model_identity"),
         ("prompt.sha256", "prompt_identity"),
         ("prompt.byte_count", "prompt_identity"),
         ("config.context", "configuration"),

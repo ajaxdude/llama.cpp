@@ -135,11 +135,15 @@ static json audit_reference(const char * environment_name, const char * expected
         }
     }
 #endif
-    return {
+    json result = {
         {"path", fs::absolute(path).lexically_normal().string()},
         {"sha256", sha256_data(bytes.data(), bytes.size())},
         {"created_unix", created},
     };
+    if (std::string(expected_kind) == "watchdog") {
+        result["pid"] = audit["data"].value("pid", INT64_C(0));
+    }
+    return result;
 }
 
 static std::string tensor_dtype(const ggml_tensor * tensor) {
@@ -458,6 +462,9 @@ int main(int argc, char ** argv) {
         if (tokens.size() > llama_n_ctx(ctx)) {
             throw std::runtime_error("prompt token count exceeds the configured context");
         }
+        if (tokens.size() + static_cast<size_t>(params.n_predict) > llama_n_ctx(ctx)) {
+            throw std::runtime_error("prompt plus decode steps exceed the configured context");
+        }
 
         std::vector<int32_t> all_layers(40);
         for (int32_t layer = 0; layer < 40; ++layer) {
@@ -475,6 +482,7 @@ int main(int argc, char ** argv) {
             }},
             {"model", {
                 {"path", model_path.string()},
+                {"architecture", "deepseek41"},
                 {"byte_count", fs::file_size(model_path)},
                 {"sha256", sha256_file(model_path)},
             }},
@@ -569,6 +577,12 @@ int main(int argc, char ** argv) {
             ++position;
         }
 
+#if defined(__linux__)
+        const int64_t watchdog_pid = watchdog_audit.value("pid", INT64_C(0));
+        if (watchdog_pid <= 1 || !fs::exists("/proc/" + std::to_string(watchdog_pid))) {
+            throw std::runtime_error("watchdog stopped before trace completion");
+        }
+#endif
         writer.finish();
         llama_backend_free();
         return 0;
