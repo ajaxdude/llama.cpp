@@ -306,6 +306,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     device_types.reserve(devices.size());
     for (const auto & device : devices) {
         device_types.push_back(ggml_backend_dev_type(device.dev));
+        ggml_backend_dev_props properties;
+        ggml_backend_dev_get_props(device.dev, &properties);
+        if (properties.memory_total > UINT64_MAX - admission_params.device_reported_bytes) {
+            throw std::runtime_error("DeepSeek V4.1 device-reported memory byte count overflow");
+        }
+        admission_params.device_reported_bytes += properties.memory_total;
     }
     admission_params.unified_memory = llama_dsv41_has_unified_topology(device_types);
 
