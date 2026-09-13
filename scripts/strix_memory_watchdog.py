@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -15,7 +17,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 
 
 GIB = 1024**3
@@ -24,6 +26,12 @@ DEFAULT_SOFT_BYTES = 116 * GIB
 DEFAULT_EMERGENCY_BYTES = 118 * GIB
 DEFAULT_GRACE_SECONDS = 30.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 1.0
+DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 5.0
+
+LEASE_FORMAT = "strix-memory-watchdog-lease"
+LEASE_VERSION = 1
+HEARTBEAT_FORMAT = "strix-memory-watchdog-heartbeat"
+HEARTBEAT_VERSION = 1
 
 EXIT_PROCFS_ERROR = 2
 EXIT_SWAP_ACTIVE = 3
@@ -31,6 +39,7 @@ EXIT_SOFT_LIMIT = 4
 EXIT_EMERGENCY_LIMIT = 5
 EXIT_GRACE_TIMEOUT = 6
 EXIT_SIGNAL_ERROR = 7
+EXIT_LEASE_ERROR = 8
 EXIT_INTERNAL_ERROR = 70
 EXIT_LAUNCH_ERROR = 127
 
@@ -44,6 +53,16 @@ class ProcfsError(RuntimeError):
 
 
 class ProcessGroupError(RuntimeError):
+    pass
+
+
+class ArtifactError(RuntimeError):
+    def __init__(self, component: str, detail: str):
+        self.component = component
+        super().__init__(detail)
+
+
+class LeaseValidationError(RuntimeError):
     pass
 
 
@@ -81,6 +100,13 @@ class RuntimeState:
 
 
 @dataclass(frozen=True)
+class ArtifactPaths:
+    lease: Path
+    heartbeat: Path
+    audit: Path
+
+
+@dataclass(frozen=True)
 class WatchdogConfig:
     command: tuple[str, ...]
     procfs_root: Path = Path("/proc")
@@ -88,8 +114,16 @@ class WatchdogConfig:
     emergency_bytes: int = DEFAULT_EMERGENCY_BYTES
     grace_seconds: float = DEFAULT_GRACE_SECONDS
     sample_interval_seconds: float = DEFAULT_SAMPLE_INTERVAL_SECONDS
+    lease_path: Path | None = None
+    heartbeat_path: Path | None = None
+    audit_path: Path | None = None
+    heartbeat_max_age_seconds: float = DEFAULT_HEARTBEAT_MAX_AGE_SECONDS
 
-    def validate(self) -> None:
+    @property
+    def lease_enabled(self) -> bool:
+        return self.lease_path is not None
+
+    def validate(self) -> ArtifactPaths | None:
         if not self.command:
             raise ValueError("a command is required after --")
         if self.soft_bytes <= 0:
@@ -107,6 +141,45 @@ class WatchdogConfig:
             or self.sample_interval_seconds <= 0
         ):
             raise ValueError("sample interval must be greater than zero")
+        lease_paths = (
+            self.lease_path,
+            self.heartbeat_path,
+            self.audit_path,
+        )
+        if any(path is not None for path in lease_paths) and not all(
+            path is not None for path in lease_paths
+        ):
+            raise ValueError(
+                "lease, heartbeat, and audit paths must be specified together"
+            )
+        if self.lease_enabled:
+            assert self.lease_path is not None
+            assert self.heartbeat_path is not None
+            assert self.audit_path is not None
+            try:
+                paths = ArtifactPaths(
+                    self.lease_path.expanduser().resolve(),
+                    self.heartbeat_path.expanduser().resolve(),
+                    self.audit_path.expanduser().resolve(),
+                )
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"cannot resolve watchdog artifact path: {exc}"
+                ) from exc
+            if len({paths.lease, paths.heartbeat, paths.audit}) != 3:
+                raise ValueError(
+                    "lease, heartbeat, and audit paths must be distinct"
+                )
+            if (
+                not math.isfinite(self.heartbeat_max_age_seconds)
+                or self.heartbeat_max_age_seconds
+                <= self.sample_interval_seconds
+            ):
+                raise ValueError(
+                    "heartbeat max age must be greater than sample interval"
+                )
+            return paths
+        return None
 
 
 class ProcfsReader:
@@ -173,6 +246,532 @@ class ProcfsReader:
         return tuple(entries)
 
 
+def _timestamp_utc(
+    wall_clock: Callable[[], datetime] | None = None,
+) -> str:
+    timestamp = (wall_clock or (
+        lambda: datetime.now(timezone.utc)
+    ))().astimezone(timezone.utc)
+    return timestamp.isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise ArtifactError(
+            "lease", f"cannot hash {path}: {detail}"
+        ) from exc
+
+
+def _command_sha256(command: Sequence[str]) -> str:
+    encoded = json.dumps(
+        list(command),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _sha256_bytes(encoded)
+
+
+def _read_proc_bytes(root: Path, process_id: int, name: str) -> bytes:
+    path = root / str(process_id) / name
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise LeaseValidationError(
+            f"cannot read {path}: {detail}"
+        ) from exc
+
+
+def _parse_proc_stat(content: str) -> tuple[int, int, int]:
+    close_paren = content.rfind(")")
+    if close_paren < 0:
+        raise LeaseValidationError("malformed process stat")
+    fields = content[close_paren + 1:].split()
+    if len(fields) < 20:
+        raise LeaseValidationError("malformed process stat")
+    try:
+        return int(fields[1]), int(fields[2]), int(fields[19])
+    except ValueError as exc:
+        raise LeaseValidationError("malformed process stat") from exc
+
+
+def _read_proc_stat(
+    root: Path, process_id: int
+) -> tuple[int, int, int]:
+    content = _read_proc_bytes(
+        root, process_id, "stat"
+    ).decode("utf-8")
+    return _parse_proc_stat(content)
+
+
+def _write_json_atomic(
+    path: Path,
+    value: dict[str, object],
+    *,
+    create: bool = False,
+) -> None:
+    parent = path.parent
+    temp_path = parent / (
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    payload = (
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(
+            temp_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if create:
+            os.link(temp_path, path)
+            temp_path.unlink()
+        else:
+            os.replace(temp_path, path)
+        directory_descriptor = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError as exc:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        detail = exc.strerror or str(exc)
+        action = "create" if create else "write"
+        raise ArtifactError(
+            "lease", f"cannot atomically {action} {path}: {detail}"
+        ) from exc
+
+
+class LeaseManager:
+    def __init__(
+        self,
+        config: WatchdogConfig,
+        paths: ArtifactPaths,
+        *,
+        process_procfs_root: Path = Path("/proc"),
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_ns: Callable[[], int] | None = None,
+    ):
+        self.config = config
+        self.lease_path = paths.lease
+        self.heartbeat_path = paths.heartbeat
+        self.audit_path = paths.audit
+        self.process_procfs_root = process_procfs_root
+        self.wall_clock = wall_clock
+        self.monotonic_ns = monotonic_ns or time.monotonic_ns
+        self.lease_id = secrets.token_hex(16)
+        self.sequence = 0
+        self.lease: dict[str, object] | None = None
+
+    def _watchdog_identity(self) -> dict[str, object]:
+        script_path = Path(__file__).resolve()
+        cmdline_path = (
+            self.process_procfs_root / str(os.getpid()) / "cmdline"
+        )
+        proc_start_time_ticks: int | None = None
+        try:
+            cmdline = cmdline_path.read_bytes()
+            _, _, proc_start_time_ticks = _read_proc_stat(
+                self.process_procfs_root, os.getpid()
+            )
+        except (OSError, LeaseValidationError):
+            if sys.platform.startswith("linux"):
+                raise ArtifactError(
+                    "lease",
+                    "cannot read watchdog process identity from procfs",
+                )
+            cmdline = b"\0".join(
+                os.fsencode(argument) for argument in sys.argv
+            )
+        return {
+            "pid": os.getpid(),
+            "start_time_utc": _timestamp_utc(self.wall_clock),
+            "proc_start_time_ticks": proc_start_time_ticks,
+            "cmdline_sha256": _sha256_bytes(cmdline),
+            "script_path": str(script_path),
+            "script_sha256": _sha256_file(script_path),
+        }
+
+    def _heartbeat_record(
+        self,
+        state: str,
+        sample: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        assert self.lease is not None
+        self.sequence += 1
+        record: dict[str, object] = {
+            "format": HEARTBEAT_FORMAT,
+            "version": HEARTBEAT_VERSION,
+            "lease_id": self.lease_id,
+            "sequence": self.sequence,
+            "state": state,
+            "updated_at": _timestamp_utc(self.wall_clock),
+            "updated_monotonic_ns": self.monotonic_ns(),
+            "watchdog_pid": self.lease["watchdog_pid"],
+            "watchdog_start_time_ticks": (
+                self.lease["watchdog_start_time_ticks"]
+            ),
+            "child_pid": self.lease["child_pid"],
+            "child_process_group_id": (
+                self.lease["child_process_group_id"]
+            ),
+        }
+        if sample is not None:
+            record["sample"] = sample
+        return record
+
+    def start(self, child: ProcessHandle) -> None:
+        watchdog_identity = self._watchdog_identity()
+        self.lease = {
+            "format": LEASE_FORMAT,
+            "version": LEASE_VERSION,
+            "lease_id": self.lease_id,
+            "state": "active",
+            "watchdog_pid": watchdog_identity["pid"],
+            "watchdog_start_time_utc": (
+                watchdog_identity["start_time_utc"]
+            ),
+            "watchdog_start_time_ticks": (
+                watchdog_identity["proc_start_time_ticks"]
+            ),
+            "watchdog_command_sha256": (
+                watchdog_identity["cmdline_sha256"]
+            ),
+            "watchdog_script_path": watchdog_identity["script_path"],
+            "watchdog_script_sha256": (
+                watchdog_identity["script_sha256"]
+            ),
+            "soft_bytes": self.config.soft_bytes,
+            "emergency_bytes": self.config.emergency_bytes,
+            "strict_ceiling_bytes": STRICT_CEILING_BYTES,
+            "child_pid": child.pid,
+            "child_process_group_id": child.pid,
+            "command": list(self.config.command),
+            "child_command_sha256": _command_sha256(
+                self.config.command
+            ),
+            "heartbeat_path": str(self.heartbeat_path),
+            "max_heartbeat_age_seconds": (
+                self.config.heartbeat_max_age_seconds
+            ),
+            "audit_path": str(self.audit_path),
+            "procfs_root": str(
+                self.config.procfs_root.expanduser().resolve()
+            ),
+        }
+        heartbeat = self._heartbeat_record("active")
+        _write_json_atomic(self.heartbeat_path, heartbeat, create=True)
+        _write_json_atomic(self.lease_path, self.lease, create=True)
+
+    def update_heartbeat(self, sample: dict[str, object]) -> None:
+        heartbeat = self._heartbeat_record("active", sample)
+        _write_json_atomic(self.heartbeat_path, heartbeat)
+
+    def finalize(self, final_record: dict[str, object]) -> None:
+        if self.lease is None:
+            return
+        self.lease["state"] = "final"
+        self.lease["final"] = final_record
+        heartbeat = self._heartbeat_record("final")
+        _write_json_atomic(self.heartbeat_path, heartbeat)
+        _write_json_atomic(self.lease_path, self.lease)
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LeaseValidationError(
+            f"cannot read valid JSON from {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise LeaseValidationError(f"{path} must contain a JSON object")
+    return value
+
+
+def _require_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise LeaseValidationError(f"lease field {field} is invalid")
+    return value
+
+
+def _require_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise LeaseValidationError(f"lease field {field} is invalid")
+    return value
+
+
+def validate_active_lease(
+    lease_path: Path,
+    *,
+    expected_script_path: Path,
+    expected_soft_bytes: int = DEFAULT_SOFT_BYTES,
+    expected_emergency_bytes: int = DEFAULT_EMERGENCY_BYTES,
+    expected_procfs_root: Path = Path("/proc"),
+    expected_command_sha256: str | None = None,
+    expected_heartbeat_path: Path | None = None,
+    expected_audit_path: Path | None = None,
+    expected_max_heartbeat_age_seconds: float | None = None,
+    current_process_id: int | None = None,
+    process_procfs_root: Path = Path("/proc"),
+    monotonic_ns: Callable[[], int] | None = None,
+) -> dict[str, object]:
+    lease_path = lease_path.expanduser().resolve()
+    lease = _read_json_object(lease_path)
+    if (
+        lease.get("format") != LEASE_FORMAT
+        or lease.get("version") != LEASE_VERSION
+        or lease.get("state") != "active"
+    ):
+        raise LeaseValidationError("lease format, version, or state is invalid")
+
+    script_path = Path(
+        _require_string(
+            lease.get("watchdog_script_path"),
+            "watchdog_script_path",
+        )
+    ).resolve()
+    expected_script_path = expected_script_path.expanduser().resolve()
+    if script_path != expected_script_path:
+        raise LeaseValidationError("watchdog script path does not match")
+    script_sha256 = _require_string(
+        lease.get("watchdog_script_sha256"),
+        "watchdog_script_sha256",
+    )
+    if script_sha256 != _sha256_file(expected_script_path):
+        raise LeaseValidationError("watchdog script SHA does not match")
+
+    if (
+        _require_int(
+            lease.get("soft_bytes"), "soft_bytes"
+        )
+        != expected_soft_bytes
+        or _require_int(
+            lease.get("emergency_bytes"),
+            "emergency_bytes",
+        )
+        != expected_emergency_bytes
+        or _require_int(
+            lease.get("strict_ceiling_bytes"),
+            "strict_ceiling_bytes",
+        )
+        != STRICT_CEILING_BYTES
+    ):
+        raise LeaseValidationError("watchdog thresholds do not match")
+    lease_procfs_root = Path(
+        _require_string(lease.get("procfs_root"), "procfs_root")
+    ).resolve()
+    if lease_procfs_root != expected_procfs_root.expanduser().resolve():
+        raise LeaseValidationError("watchdog procfs root does not match")
+
+    watchdog_pid = _require_int(
+        lease.get("watchdog_pid"), "watchdog_pid"
+    )
+    watchdog_start_ticks = _require_int(
+        lease.get("watchdog_start_time_ticks"),
+        "watchdog_start_time_ticks",
+    )
+    _, _, live_watchdog_start_ticks = _read_proc_stat(
+        process_procfs_root, watchdog_pid
+    )
+    if live_watchdog_start_ticks != watchdog_start_ticks:
+        raise LeaseValidationError("watchdog process start time does not match")
+    live_cmdline = _read_proc_bytes(
+        process_procfs_root, watchdog_pid, "cmdline"
+    )
+    if _sha256_bytes(live_cmdline) != _require_string(
+        lease.get("watchdog_command_sha256"),
+        "watchdog_command_sha256",
+    ):
+        raise LeaseValidationError("watchdog command line does not match")
+    script_named = False
+    watchdog_cwd: Path | None = None
+    for raw_argument in live_cmdline.split(b"\0"):
+        if not raw_argument:
+            continue
+        argument_path = Path(os.fsdecode(raw_argument)).expanduser()
+        if not argument_path.is_absolute():
+            if watchdog_cwd is None:
+                try:
+                    watchdog_cwd = (
+                        process_procfs_root
+                        / str(watchdog_pid)
+                        / "cwd"
+                    ).resolve()
+                except OSError as exc:
+                    raise LeaseValidationError(
+                        "cannot resolve watchdog working directory"
+                    ) from exc
+            argument_path = watchdog_cwd / argument_path
+        if argument_path.resolve() == expected_script_path:
+            script_named = True
+            break
+    if not script_named:
+        raise LeaseValidationError(
+            "watchdog command line does not name the expected script"
+        )
+
+    child_pid = _require_int(lease.get("child_pid"), "child_pid")
+    process_group_id = _require_int(
+        lease.get("child_process_group_id"),
+        "child_process_group_id",
+    )
+    child_parent_pid, child_group_id, _ = _read_proc_stat(
+        process_procfs_root, child_pid
+    )
+    if (
+        child_parent_pid != watchdog_pid
+        or child_group_id != process_group_id
+        or process_group_id != child_pid
+    ):
+        raise LeaseValidationError(
+            "monitored child parent or process group does not match"
+        )
+    command = lease.get("command")
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(argument, str) for argument in command)
+    ):
+        raise LeaseValidationError("lease field command is invalid")
+    command_sha256 = _require_string(
+        lease.get("child_command_sha256"),
+        "child_command_sha256",
+    )
+    if command_sha256 != _command_sha256(command):
+        raise LeaseValidationError("monitored command SHA is invalid")
+    if (
+        expected_command_sha256 is not None
+        and command_sha256 != expected_command_sha256
+    ):
+        raise LeaseValidationError("monitored command SHA does not match")
+
+    process_id = (
+        current_process_id
+        if current_process_id is not None
+        else os.getpid()
+    )
+    _, current_group_id, _ = _read_proc_stat(
+        process_procfs_root, process_id
+    )
+    if current_group_id != process_group_id:
+        raise LeaseValidationError(
+            "current process is outside the monitored process group"
+        )
+
+    heartbeat_path = Path(
+        _require_string(
+            lease.get("heartbeat_path"), "heartbeat_path"
+        )
+    ).resolve()
+    if (
+        expected_heartbeat_path is not None
+        and heartbeat_path
+        != expected_heartbeat_path.expanduser().resolve()
+    ):
+        raise LeaseValidationError("heartbeat path does not match")
+    heartbeat_max_age = lease.get("max_heartbeat_age_seconds")
+    if (
+        not isinstance(heartbeat_max_age, (int, float))
+        or isinstance(heartbeat_max_age, bool)
+        or not math.isfinite(heartbeat_max_age)
+        or heartbeat_max_age <= 0
+    ):
+        raise LeaseValidationError(
+            "lease field max_heartbeat_age_seconds is invalid"
+        )
+    if (
+        expected_max_heartbeat_age_seconds is not None
+        and heartbeat_max_age != expected_max_heartbeat_age_seconds
+    ):
+        raise LeaseValidationError("heartbeat max age does not match")
+    heartbeat = _read_json_object(heartbeat_path)
+    lease_id = _require_string(lease.get("lease_id"), "lease_id")
+    if (
+        heartbeat.get("format") != HEARTBEAT_FORMAT
+        or heartbeat.get("version") != HEARTBEAT_VERSION
+        or heartbeat.get("state") != "active"
+        or heartbeat.get("lease_id") != lease_id
+        or heartbeat.get("watchdog_pid") != watchdog_pid
+        or heartbeat.get("watchdog_start_time_ticks")
+        != watchdog_start_ticks
+        or heartbeat.get("child_pid") != child_pid
+        or heartbeat.get("child_process_group_id") != process_group_id
+    ):
+        raise LeaseValidationError("heartbeat identity does not match lease")
+    updated_monotonic_ns = _require_int(
+        heartbeat.get("updated_monotonic_ns"),
+        "heartbeat.updated_monotonic_ns",
+    )
+    _require_int(heartbeat.get("sequence"), "heartbeat.sequence")
+    _require_string(heartbeat.get("updated_at"), "heartbeat.updated_at")
+    now_monotonic_ns = (monotonic_ns or time.monotonic_ns)()
+    age_ns = now_monotonic_ns - updated_monotonic_ns
+    if age_ns < 0 or age_ns > int(heartbeat_max_age * 1_000_000_000):
+        raise LeaseValidationError("watchdog heartbeat is stale")
+
+    audit_path = Path(
+        _require_string(lease.get("audit_path"), "audit_path")
+    ).resolve()
+    if (
+        expected_audit_path is not None
+        and audit_path != expected_audit_path.expanduser().resolve()
+    ):
+        raise LeaseValidationError("persistent audit path does not match")
+    try:
+        first_line = next(
+            line
+            for line in audit_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        )
+        first_record = json.loads(first_line)
+        if (
+            not isinstance(first_record, dict)
+            or not isinstance(first_record.get("event"), str)
+            or not isinstance(first_record.get("timestamp"), str)
+        ):
+            raise LeaseValidationError(
+                "persistent audit does not contain watchdog records"
+            )
+    except StopIteration as exc:
+        raise LeaseValidationError("persistent audit is empty") from exc
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise LeaseValidationError(
+            "persistent audit does not contain valid JSONL"
+        ) from exc
+    except LeaseValidationError:
+        raise
+    except OSError as exc:
+        raise LeaseValidationError(
+            f"cannot inspect persistent audit {audit_path}: {exc}"
+        ) from exc
+    return lease
+
+
 class AuditLogger:
     def __init__(
         self,
@@ -180,23 +779,77 @@ class AuditLogger:
         wall_clock: Callable[[], datetime] | None = None,
     ):
         self.stream = stream
-        self.wall_clock = wall_clock or (
-            lambda: datetime.now(timezone.utc)
-        )
+        self.wall_clock = wall_clock
+        self.persistent_stream: IO[str] | None = None
+        self.lease_manager: LeaseManager | None = None
+        self.finalized = False
+        self.final_exit_code = EXIT_INTERNAL_ERROR
 
-    def emit(self, event: str, **fields: object) -> None:
-        timestamp = self.wall_clock().astimezone(timezone.utc)
+    def open_persistent(self, path: Path) -> None:
+        resolved_path = path.expanduser().resolve()
+        try:
+            descriptor = os.open(
+                resolved_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            self.persistent_stream = os.fdopen(
+                descriptor, "w", encoding="utf-8"
+            )
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            raise ArtifactError(
+                "audit",
+                f"cannot create persistent audit {resolved_path}: {detail}",
+            ) from exc
+
+    def close(self) -> None:
+        if self.persistent_stream is not None:
+            self.persistent_stream.close()
+            self.persistent_stream = None
+
+    def disable_component(self, component: str) -> None:
+        if component == "audit":
+            self.close()
+        elif component == "lease":
+            self.lease_manager = None
+
+    def emit(self, event: str, **fields: object) -> dict[str, object]:
         record = {
-            "timestamp": timestamp.isoformat(timespec="milliseconds").replace(
-                "+00:00", "Z"
-            ),
+            "timestamp": _timestamp_utc(self.wall_clock),
             "event": event,
             **fields,
         }
-        self.stream.write(
-            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        line = (
+            json.dumps(record, sort_keys=True, separators=(",", ":"))
+            + "\n"
         )
+        self.stream.write(line)
         self.stream.flush()
+        if self.persistent_stream is not None:
+            try:
+                self.persistent_stream.write(line)
+                self.persistent_stream.flush()
+                os.fsync(self.persistent_stream.fileno())
+            except OSError as exc:
+                detail = exc.strerror or str(exc)
+                raise ArtifactError(
+                    "audit",
+                    f"cannot write persistent audit: {detail}",
+                ) from exc
+        return record
+
+    def heartbeat(self, sample: dict[str, object]) -> None:
+        if self.lease_manager is not None:
+            self.lease_manager.update_heartbeat(sample)
+
+    def finalize(self, record: dict[str, object]) -> None:
+        if self.lease_manager is not None:
+            self.lease_manager.finalize(record)
+
+    def mark_final(self, exit_code: int) -> None:
+        self.finalized = True
+        self.final_exit_code = exit_code
 
 
 def _child_status(returncode: int | None, started: bool = True) -> str:
@@ -255,8 +908,35 @@ def _emit_final(
     fields.update(classification=classification, exit_code=exit_code)
     if error:
         fields["error"] = error
-    audit.emit("final", **fields)
-    return exit_code
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, PARENT_SIGNALS
+    )
+    try:
+        try:
+            record = audit.emit("final", **fields)
+            audit.finalize(record)
+        except ArtifactError as exc:
+            audit.disable_component(exc.component)
+            fields.update(
+                classification="lease_error",
+                exit_code=EXIT_LEASE_ERROR,
+                threshold_reason="watchdog artifact finalization failed",
+                error=f"{exc.component}: {exc}",
+            )
+            try:
+                record = audit.emit("final", **fields)
+            except ArtifactError as nested_exc:
+                audit.disable_component(nested_exc.component)
+                record = audit.emit("final", **fields)
+            try:
+                audit.finalize(record)
+            except ArtifactError as nested_exc:
+                audit.disable_component(nested_exc.component)
+            exit_code = EXIT_LEASE_ERROR
+        audit.mark_final(exit_code)
+        return exit_code
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _signal_process_group(process_group_id: int, signal_number: int) -> str:
@@ -278,6 +958,8 @@ def _process_group_alive(process_group_id: int) -> bool:
         os.killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     except OSError as exc:
         detail = exc.strerror or str(exc)
         raise ProcessGroupError(
@@ -291,16 +973,16 @@ def _raise_parent_signal(signal_number: int, _frame: object) -> None:
 
 
 def _set_parent_signal_handlers(
-    handler: signal.Handlers,
-) -> dict[int, signal.Handlers]:
-    previous: dict[int, signal.Handlers] = {}
+    handler: Any,
+) -> dict[int, Any]:
+    previous: dict[int, Any] = {}
     for signal_number in PARENT_SIGNALS:
         previous[signal_number] = signal.signal(signal_number, handler)
     return previous
 
 
 def _restore_parent_signal_handlers(
-    previous: dict[int, signal.Handlers],
+    previous: dict[int, Any],
 ) -> None:
     for signal_number, handler in previous.items():
         signal.signal(signal_number, handler)
@@ -593,7 +1275,7 @@ def _monitor_child(
         state.peak_used_bytes = max(
             state.peak_used_bytes, state.snapshot.used_bytes
         )
-        audit.emit(
+        sample_record = audit.emit(
             "sample",
             **_state_fields(
                 state.snapshot,
@@ -604,6 +1286,7 @@ def _monitor_child(
                 "none",
             ),
         )
+        audit.heartbeat(sample_record)
 
         if state.snapshot.active_swaps:
             return _kill_and_finish(
@@ -681,7 +1364,7 @@ def run_watchdog(
     monotonic: Callable[[], float] | None = None,
     sleeper: Callable[[float], None] | None = None,
 ) -> int:
-    config.validate()
+    artifact_paths = config.validate()
     reader = reader or ProcfsReader(config.procfs_root)
     audit = audit or AuditLogger(sys.stderr)
     launcher = launcher or subprocess.Popen
@@ -689,6 +1372,20 @@ def run_watchdog(
     group_alive = group_alive or _process_group_alive
     monotonic = monotonic or time.monotonic
     sleeper = sleeper or time.sleep
+
+    if artifact_paths is not None:
+        try:
+            audit.open_persistent(artifact_paths.audit)
+        except ArtifactError as exc:
+            return _emit_final(
+                audit,
+                "lease_error",
+                EXIT_LEASE_ERROR,
+                "cannot initialize watchdog artifacts",
+                None,
+                None,
+                error=f"{exc.component}: {exc}",
+            )
 
     try:
         snapshot = reader.read_snapshot()
@@ -703,20 +1400,32 @@ def run_watchdog(
             error=str(exc),
         )
 
-    audit.emit(
-        "preflight",
-        **_state_fields(
+    try:
+        audit.emit(
+            "preflight",
+            **_state_fields(
+                snapshot,
+                snapshot.used_bytes,
+                None,
+                None,
+                "not_created",
+                "none",
+            ),
+            soft_bytes=config.soft_bytes,
+            emergency_bytes=config.emergency_bytes,
+            strict_ceiling_bytes=STRICT_CEILING_BYTES,
+        )
+    except ArtifactError as exc:
+        audit.disable_component(exc.component)
+        return _emit_final(
+            audit,
+            "lease_error",
+            EXIT_LEASE_ERROR,
+            "cannot write watchdog preflight audit",
             snapshot,
             snapshot.used_bytes,
-            None,
-            None,
-            "not_created",
-            "none",
-        ),
-        soft_bytes=config.soft_bytes,
-        emergency_bytes=config.emergency_bytes,
-        strict_ceiling_bytes=STRICT_CEILING_BYTES,
-    )
+            error=f"{exc.component}: {exc}",
+        )
 
     if snapshot.active_swaps:
         return _emit_final(
@@ -750,21 +1459,51 @@ def run_watchdog(
         signal.SIG_BLOCK, PARENT_SIGNALS
     )
     mask_restored = False
-    previous_handlers: dict[int, signal.Handlers] = {}
+    previous_handlers: dict[int, Any] = {}
     child: ProcessHandle | None = None
     state = RuntimeState(snapshot, snapshot.used_bytes)
     try:
         launch_mask = previous_mask
+        lease_manager = (
+            LeaseManager(config, artifact_paths)
+            if artifact_paths is not None
+            else None
+        )
 
         def restore_child_signal_mask() -> None:
             signal.pthread_sigmask(signal.SIG_SETMASK, launch_mask)
 
         try:
-            child = launcher(
-                config.command,
-                start_new_session=True,
-                preexec_fn=restore_child_signal_mask,
-            )
+            if lease_manager is not None:
+                child_environment = os.environ.copy()
+                child_environment.update(
+                    {
+                        "STRIX_MEMORY_WATCHDOG_LEASE_PATH": str(
+                            lease_manager.lease_path
+                        ),
+                        "STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH": str(
+                            lease_manager.heartbeat_path
+                        ),
+                        "STRIX_MEMORY_WATCHDOG_AUDIT_PATH": str(
+                            lease_manager.audit_path
+                        ),
+                        "STRIX_MEMORY_WATCHDOG_HEARTBEAT_MAX_AGE_SECONDS": (
+                            str(config.heartbeat_max_age_seconds)
+                        ),
+                    }
+                )
+                child = launcher(
+                    config.command,
+                    start_new_session=True,
+                    preexec_fn=restore_child_signal_mask,
+                    env=child_environment,
+                )
+            else:
+                child = launcher(
+                    config.command,
+                    start_new_session=True,
+                    preexec_fn=restore_child_signal_mask,
+                )
         except (OSError, ValueError) as exc:
             detail = getattr(exc, "strerror", None) or str(exc)
             return _emit_final(
@@ -780,6 +1519,9 @@ def run_watchdog(
         previous_handlers = _set_parent_signal_handlers(
             _raise_parent_signal
         )
+        if lease_manager is not None:
+            lease_manager.start(child)
+            audit.lease_manager = lease_manager
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         mask_restored = True
         audit.emit(
@@ -805,8 +1547,41 @@ def run_watchdog(
             monotonic,
             sleeper,
         )
-    except ParentSignal as exc:
+    except ArtifactError as exc:
         _set_parent_signal_handlers(signal.SIG_IGN)
+        if exc.component == "audit":
+            audit.disable_component(exc.component)
+        if child is None:
+            return _emit_final(
+                audit,
+                "lease_error",
+                EXIT_LEASE_ERROR,
+                "watchdog artifact initialization failed",
+                state.snapshot,
+                state.peak_used_bytes,
+                error=f"{exc.component}: {exc}",
+            )
+        return _graceful_cleanup(
+            audit,
+            child,
+            state.snapshot,
+            state.peak_used_bytes,
+            "lease_error",
+            EXIT_LEASE_ERROR,
+            "watchdog artifact update failed",
+            signal.SIGTERM,
+            config.grace_seconds,
+            signal_group,
+            group_alive,
+            monotonic,
+            sleeper,
+            error=f"{exc.component}: {exc}",
+        )
+    except ParentSignal as exc:
+        if audit.finalized:
+            return audit.final_exit_code
+        _set_parent_signal_handlers(signal.SIG_IGN)
+        assert child is not None
         signal_name = signal.Signals(exc.signal_number).name
         return _graceful_cleanup(
             audit,
@@ -824,7 +1599,19 @@ def run_watchdog(
             sleeper,
         )
     except Exception as exc:
+        if audit.finalized:
+            return audit.final_exit_code
         _set_parent_signal_handlers(signal.SIG_IGN)
+        if child is None:
+            return _emit_final(
+                audit,
+                "internal_error",
+                EXIT_INTERNAL_ERROR,
+                "unexpected pre-launch exception",
+                state.snapshot,
+                state.peak_used_bytes,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         return _graceful_cleanup(
             audit,
             child,
@@ -903,6 +1690,39 @@ def parse_args(argv: Sequence[str]) -> WatchdogConfig:
         help="procfs sampling interval (default: 1)",
     )
     parser.add_argument(
+        "--lease-path",
+        type=Path,
+        help=(
+            "atomically publish the watchdog-owned lease JSON; requires "
+            "--heartbeat-path and --audit-path"
+        ),
+    )
+    parser.add_argument(
+        "--heartbeat-path",
+        type=Path,
+        help=(
+            "atomically update watchdog heartbeat JSON on every sample; "
+            "requires --lease-path and --audit-path"
+        ),
+    )
+    parser.add_argument(
+        "--audit-path",
+        type=Path,
+        help=(
+            "create a persistent JSONL audit in addition to standard error; "
+            "requires --lease-path and --heartbeat-path"
+        ),
+    )
+    parser.add_argument(
+        "--heartbeat-max-age-seconds",
+        type=_positive_float,
+        default=DEFAULT_HEARTBEAT_MAX_AGE_SECONDS,
+        help=(
+            "maximum heartbeat age accepted by a matching harness "
+            "(default: 5)"
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="command and arguments, preceded by --",
@@ -918,6 +1738,10 @@ def parse_args(argv: Sequence[str]) -> WatchdogConfig:
         emergency_bytes=args.emergency_gib * GIB,
         grace_seconds=args.grace_seconds,
         sample_interval_seconds=args.sample_interval_seconds,
+        lease_path=args.lease_path,
+        heartbeat_path=args.heartbeat_path,
+        audit_path=args.audit_path,
+        heartbeat_max_age_seconds=args.heartbeat_max_age_seconds,
     )
 
 
@@ -936,6 +1760,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             None,
             error=str(exc),
         )
+    except Exception as exc:
+        return _emit_final(
+            audit,
+            "internal_error",
+            EXIT_INTERNAL_ERROR,
+            "unexpected watchdog error",
+            None,
+            None,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        audit.close()
 
 
 if __name__ == "__main__":
