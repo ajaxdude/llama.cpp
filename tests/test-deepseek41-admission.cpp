@@ -323,11 +323,15 @@ void test_expert_replacement_peak() {
     auto params = base_params();
     params.n_ubatch = 32;
     params.configured_cache_slots = 192;
+    params.configured_cache_bytes = 72900ULL << 20;
     auto result = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);
+    REQUIRE(result.expert_slots == 192);
+    REQUIRE(result.expert_cache_bytes == params.configured_cache_bytes);
     REQUIRE(result.expert_replacement_bytes == 1911029760);
     REQUIRE(result.direct_io_bounce_bytes == 3874816);
     REQUIRE(result.expert_replacement_bytes + result.direct_io_bounce_bytes == 1914904576);
 
+    params.configured_cache_bytes = 0;
     params.n_ubatch = 36;
     params.configured_cache_slots = 216;
     result = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);

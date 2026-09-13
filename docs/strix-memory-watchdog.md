@@ -3,13 +3,19 @@
 `scripts/strix_memory_watchdog.py` is an external Linux command wrapper for headless Strix Halo validation. It does not change model loading or cache sizing. It measures host-wide memory from procfs and controls the launched command's process group.
 
 ```sh
+ROCR_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES=0 \
+HIP_LAUNCH_BLOCKING=1 \
 ./scripts/strix_memory_watchdog.py -- \
     ./build/bin/llama-server \
     -m /mnt/models/deepseek-v41/DeepSeek-V4.1-Flash-Q2.gguf \
-    -c 32768 -b 2048 -ub 32 -ngl 99
+    -c 32768 -b 2048 -ub 32 -ngl 99 -dev ROCm0 \
+    --expert-cache-slots 192 --expert-cache-mib 72900
 ```
 
 DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, measure the full-graph state through its no-allocation memory implementation, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The context checks the measured scheduler workspace against the admitted conservative workspace envelope before inference. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
+
+The final Strix validation preflight must confirm that `ROCm0` reports `gfx1151` before running this command. It must also verify the inherited device and launch-blocking environment, the exact ubatch and cache arguments, and the active watchdog lease. The 72900 MiB budget is exactly 192 published expert slots; admission rejects a disagreement between the byte and slot caps.
 
 Use `--dsv41-procfs-root`, `--dsv41-memory-soft-mib`, `--dsv41-memory-watchdog-mib`, `--dsv41-memory-hard-mib`, and `--dsv41-memory-safety-margin-mib` only when reproducing admission tests or applying a more conservative host policy. `--expert-cache-slots` and `--expert-cache-mib` are optional caps; zero auto-fits. If both cache options are set, their capacity must describe the same number of complete published tensor slots.
 
