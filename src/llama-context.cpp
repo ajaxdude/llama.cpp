@@ -1187,6 +1187,9 @@ void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb_eval, 
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
+        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support embedding outputs");
+    }
     cparams.embeddings = value;
 
     // TODO: not sure yet if we want to reserve here
@@ -1196,6 +1199,9 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
+        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support next-token embedding outputs");
+    }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
@@ -1205,6 +1211,9 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
+    if (enable && model.arch == LLM_ARCH_DEEPSEEK41) {
+        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support layer embedding outputs");
+    }
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
