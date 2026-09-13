@@ -2864,7 +2864,7 @@ llama_model_params llama_model_default_params() {
         /*.dsv41_admission_context     =*/ 32768,
         /*.dsv41_admission_batch       =*/ 2048,
         /*.dsv41_admission_sequences   =*/ 1,
-        /*.dsv41_admission_ubatch      =*/ 2048,
+        /*.dsv41_admission_ubatch      =*/ 32,
         /*.dsv41_admission_outputs     =*/ 2048,
         /*.dsv41_admission_outputs_per_seq =*/ 2048,
         /*.dsv41_admission_type_k      =*/ GGML_TYPE_F16,

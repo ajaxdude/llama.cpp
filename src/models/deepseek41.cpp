@@ -733,7 +733,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     admission_params.n_ubatch = std::min(
             admission_params.n_batch,
             params.dsv41_admission_ubatch == 0 ?
-                    admission_params.n_batch : params.dsv41_admission_ubatch);
+                    32U : params.dsv41_admission_ubatch);
     admission_params.n_outputs_max = std::min(
             admission_params.n_batch,
             params.dsv41_admission_outputs == 0 ?

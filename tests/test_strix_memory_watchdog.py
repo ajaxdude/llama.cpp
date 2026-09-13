@@ -228,6 +228,7 @@ class TestWatchdogBehavior(unittest.TestCase):
     def test_parent_signals_leave_no_child_or_grandchild(self) -> None:
         child_code = (
             "import os,signal,sys,time;"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
             "signal.signal(signal.SIGINT,signal.SIG_IGN);"
             "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
             "grandchild=os.fork();"
@@ -238,7 +239,11 @@ class TestWatchdogBehavior(unittest.TestCase):
             "f'{os.getpid()} {grandchild}\\n');"
             " time.sleep(30)\n"
         )
-        for signal_number in (signal.SIGINT, signal.SIGTERM):
+        for signal_number in (
+            signal.SIGHUP,
+            signal.SIGINT,
+            signal.SIGTERM,
+        ):
             with self.subTest(signal=signal.Signals(signal_number).name):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     root = Path(temp_dir)

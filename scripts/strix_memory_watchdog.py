@@ -36,7 +36,7 @@ EXIT_LAUNCH_ERROR = 127
 
 MEMINFO_VALUE_RE = re.compile(r"([0-9]+) kB")
 SWAPS_HEADER = ["Filename", "Type", "Size", "Used", "Priority"]
-PARENT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+PARENT_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
 
 
 class ProcfsError(RuntimeError):

@@ -9,7 +9,7 @@
     -c 32768 -b 2048 -ub 32 -ngl 99
 ```
 
-DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
+DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, measure the full-graph state through its no-allocation memory implementation, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The context checks the measured scheduler workspace against the admitted conservative workspace envelope before inference. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
 
 Use `--dsv41-procfs-root`, `--dsv41-memory-soft-mib`, `--dsv41-memory-watchdog-mib`, `--dsv41-memory-hard-mib`, and `--dsv41-memory-safety-margin-mib` only when reproducing admission tests or applying a more conservative host policy. `--expert-cache-slots` and `--expert-cache-mib` are optional caps; zero auto-fits. If both cache options are set, their capacity must describe the same number of complete published tensor slots.
 
@@ -25,7 +25,7 @@ The wrapper performs these checks and actions:
 - It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.
 - It reports `grace_timeout` if any descendant requires `SIGKILL` after the soft-threshold grace period, even when the direct child exited earlier.
 - It sends `SIGKILL` and fails if swap appears or required procfs data becomes unavailable during execution.
-- It forwards wrapper `SIGINT` or `SIGTERM` to the process group, waits the configured grace period, then sends `SIGKILL` if any group member remains.
+- It forwards wrapper `SIGHUP`, `SIGINT`, or `SIGTERM` to the process group, waits the configured grace period, then sends `SIGKILL` if any group member remains.
 - It checks the process group after the direct child exits and cleans up remaining descendants before returning the child's classification.
 - It applies the same bounded process-group cleanup if an unexpected post-launch error occurs.
 - It propagates an unmonitored child exit code. A signal exit uses the shell convention `128 + signal`.

@@ -1201,7 +1201,8 @@ void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
-        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support embedding outputs\n", __func__);
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
         return;
     }
     cparams.embeddings = value;
@@ -1214,7 +1215,8 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
-        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support next-token embedding outputs\n", __func__);
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support next-token embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
         return;
     }
     cparams.embeddings_nextn        = value;
@@ -1227,7 +1229,8 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
     if (enable && model.arch == LLM_ARCH_DEEPSEEK41) {
-        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support layer embedding outputs\n", __func__);
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support layer embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
         return;
     }
     cparams.embeddings_layer_inp[lid] = enable;
@@ -1238,6 +1241,15 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+bool llama_context::consume_pending_config_error() {
+    if (pending_config_error.empty()) {
+        return false;
+    }
+    LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
+    pending_config_error.clear();
+    return true;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1504,6 +1516,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    if (consume_pending_config_error()) {
+        return -1;
+    }
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1741,6 +1757,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    if (consume_pending_config_error()) {
+        return -1;
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
