@@ -2255,6 +2255,20 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+ggml_backend_buffer_type_t llama_model::select_moe_buft(
+        int il, enum ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) const {
+    return ::select_buft(
+            *pimpl->dev_layer.at(il).buft_list,
+            [&](ggml_context * ctx) {
+                const int64_t n_expert_used = hparams.n_expert_used_max();
+                GGML_ASSERT(n_expert_used > 0);
+                ggml_tensor * weight = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+                ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, n_expert_used, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+                return ggml_mul_mat_id(ctx, weight, input, ids);
+            });
+}
+
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }

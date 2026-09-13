@@ -182,7 +182,10 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     experts = std::make_shared<llama_dsv41_expert_runtime>(
             expert_tensors,
             expert_params,
-            [this](int32_t layer) { return select_buft(layer); });
+            [this](const llama_expert_store_tensor & tensor) {
+                return select_moe_buft(
+                        tensor.layer, tensor.type, tensor.ne[0], tensor.ne[1], params.expert_cache_slots);
+            });
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
