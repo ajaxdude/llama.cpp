@@ -327,15 +327,9 @@ public:
             }
             transaction->upload_layer(
                     index, 0, n_tokens, engram_rows[index], engram_select[index]);
-            std::vector<int32_t> ids((size_t) LLAMA_ENGRAM_COLS*n_tokens);
-            const uint32_t * source = transaction->row_ids(index);
-            for (uint32_t token = 0; token < n_tokens; ++token) {
-                std::copy_n(
-                        source + (size_t) token*LLAMA_ENGRAM_LAYERS*LLAMA_ENGRAM_COLS,
-                        LLAMA_ENGRAM_COLS,
-                        ids.begin() + (size_t) token*LLAMA_ENGRAM_COLS);
-            }
-            set_tensor(engram_row_ids[index], ids);
+            set_tensor(
+                    engram_row_ids[index],
+                    mctx->engram_row_ids(index));
         }
     }
 
