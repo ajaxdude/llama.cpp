@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("strix-host-restore")
@@ -53,12 +54,13 @@ def plan_data():
 
 
 def make_plan(data=None):
-    raw = json.dumps(data or plan_data(), sort_keys=True).encode()
+    data = data or plan_data()
+    raw = json.dumps(data, sort_keys=True).encode()
     return restore.parse_plan(
         raw,
         hashlib.sha256(raw).hexdigest(),
         NONCE,
-        DEADLINE,
+        data["restore_deadline_epoch"],
         NOW,
         require_due=False,
     )
@@ -104,19 +106,28 @@ class RecordingAudit:
 
 
 class FakeClock:
-    def __init__(self):
-        self.value = 0
+    def __init__(self, wall=NOW):
+        self.monotonic_value = 0
+        self.wall_value = wall
 
     def monotonic(self):
-        return self.value
+        return self.monotonic_value
+
+    def wall(self):
+        return self.wall_value
 
     def sleep(self, seconds):
-        self.value += seconds
+        self.advance(seconds)
+
+    def advance(self, seconds):
+        self.monotonic_value += seconds
+        self.wall_value += seconds
 
 
 class FakeRunner:
     def __init__(self):
         self.calls = []
+        self.timeouts = []
         self.swap_active = False
         self.docker_running = False
         self.docker_health_test = '["CMD","check"]'
@@ -129,9 +140,10 @@ class FakeRunner:
         }
         self.fail_on = None
 
-    def run(self, args, allowed_returncodes=(0,)):
+    def run(self, args, allowed_returncodes=(0,), timeout=30):
         args = tuple(args)
         self.calls.append(args)
+        self.timeouts.append(timeout)
         if self.fail_on is not None and args[-len(self.fail_on):] == self.fail_on:
             raise restore.RestoreError("injected command failure")
         if args[:1] == (restore.SWAPON,):
@@ -158,7 +170,10 @@ class FakeRunner:
         except ValueError:
             index = -1
         if index >= 0:
-            operation, unit = args[index + 1:index + 3]
+            offset = index + 1
+            if args[offset] == "--user":
+                offset += 1
+            operation, unit = args[offset:offset + 2]
             state = self.units[unit]
             if operation == "is-enabled":
                 return state["enabled"]
@@ -171,6 +186,21 @@ class FakeRunner:
                 state["active"] = "active"
                 return ""
         raise AssertionError(f"unexpected command: {args}")
+
+
+class AdvancingRunner(FakeRunner):
+    def __init__(self, clock, suffix, advance_seconds):
+        super().__init__()
+        self.clock = clock
+        self.suffix = tuple(suffix)
+        self.advance_seconds = advance_seconds
+
+    def run(self, args, allowed_returncodes=(0,), timeout=30):
+        result = super().run(args, allowed_returncodes, timeout)
+        args = tuple(args)
+        if args[-len(self.suffix):] == self.suffix:
+            self.clock.advance(self.advance_seconds)
+        return result
 
 
 def runtime_prefix(uid, username):
@@ -276,12 +306,70 @@ class PlanValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)
             real = root / "real"
-            real.mkdir()
+            real.mkdir(mode=0o700)
             files = PlanFiles(real)
             link = root / "linked"
             link.symlink_to(real, target_is_directory=True)
-            with self.assertRaisesRegex(restore.RestoreError, "unsafe directory"):
-                files.load(plan_path=link / "plan.json")
+            with self.assertRaisesRegex(restore.RestoreError, "cannot inspect|unsafe directory"):
+                files.load(
+                    plan_path=link / "plan.json",
+                    signature_path=link / "plan.sig",
+                    key_path=link / "plan.key",
+                )
+
+    def test_untrusted_or_writable_ancestor_is_rejected(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            writable = Path(directory) / "writable"
+            writable.mkdir(mode=0o700)
+            writable.chmod(0o777)
+            private = writable / "private"
+            private.mkdir(mode=0o700)
+            files = PlanFiles(private)
+            with self.assertRaisesRegex(restore.RestoreError, "group-writable or world-writable"):
+                files.load()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            files = PlanFiles(directory)
+            with self.assertRaisesRegex(restore.RestoreError, "untrusted owner"):
+                files.load(expected_uid=os.geteuid() + 1)
+
+    def test_plan_directory_must_be_private(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            files = PlanFiles(directory)
+            Path(directory).chmod(0o755)
+            with self.assertRaisesRegex(restore.RestoreError, "mode 0700"):
+                files.load()
+
+    def test_plan_directory_replacement_is_rejected(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            plan_directory = root / "plan"
+            plan_directory.mkdir(mode=0o700)
+            files = PlanFiles(plan_directory)
+            original_read = restore.secure_read_at
+            replaced = False
+
+            def replace_after_plan(*args, **kwargs):
+                nonlocal replaced
+                result = original_read(*args, **kwargs)
+                if args[4] == "plan" and not replaced:
+                    replaced = True
+                    plan_directory.rename(root / "original")
+                    plan_directory.mkdir(mode=0o700)
+                return result
+
+            with mock.patch.object(restore, "secure_read_at", side_effect=replace_after_plan):
+                with self.assertRaisesRegex(restore.RestoreError, "replaced during validation"):
+                    files.load()
+
+    def test_fifo_plan_is_rejected_without_blocking(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            files = PlanFiles(directory)
+            files.plan.unlink()
+            os.mkfifo(files.plan, mode=0o600)
+            started = time.monotonic()
+            with self.assertRaisesRegex(restore.RestoreError, "not a regular file"):
+                files.load()
+            self.assertLess(time.monotonic() - started, 1)
 
     def test_file_mode_and_hard_links_are_rejected(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -342,7 +430,7 @@ class RestorationTests(unittest.TestCase):
             sleeper=clock.sleep,
             runtime_validator=lambda uid, username: runtime_prefix(uid, username),
             username_lookup=lambda uid: "modeluser",
-            wall_clock=wall_clock,
+            wall_clock=wall_clock or clock.wall,
         )
         return restorer, runner, audit
 
@@ -357,7 +445,8 @@ class RestorationTests(unittest.TestCase):
                 mutations.append("docker_monerod")
             elif restore.SYSTEMCTL in call:
                 index = call.index(restore.SYSTEMCTL)
-                operation, unit = call[index + 1:index + 3]
+                offset = index + 2 if call[index + 1] == "--user" else index + 1
+                operation, unit = call[offset:offset + 2]
                 if operation in ("enable", "start"):
                     mutations.append(f"{unit}:{operation}")
         self.assertEqual(
@@ -398,7 +487,10 @@ class RestorationTests(unittest.TestCase):
             or call[:2] == (restore.DOCKER, "start")
             or (
                 restore.SYSTEMCTL in call
-                and call[call.index(restore.SYSTEMCTL) + 1] in ("enable", "start")
+                and (
+                    call[call.index(restore.SYSTEMCTL) + 1] in ("enable", "start")
+                    or call[call.index(restore.SYSTEMCTL) + 2] in ("enable", "start")
+                )
             )
         ]
         self.assertEqual(mutating, [])
@@ -431,7 +523,42 @@ class RestorationTests(unittest.TestCase):
         ]
         prefix = runtime_prefix(1000, "modeluser")
         self.assertTrue(user_calls)
-        self.assertTrue(all(call[:len(prefix)] == prefix for call in user_calls))
+        self.assertTrue(
+            all(
+                call[:len(prefix)] == prefix
+                and call[len(prefix):len(prefix) + 2] == (restore.SYSTEMCTL, "--user")
+                for call in user_calls
+            )
+        )
+
+    def test_linked_and_runtime_enabled_states_are_not_persistent(self):
+        for current_state in ("linked", "linked-runtime", "enabled-runtime"):
+            with self.subTest(current_state=current_state):
+                runner = FakeRunner()
+                runner.units["p2pool.service"]["enabled"] = current_state
+                restorer, runner, _ = self.create_restorer(runner=runner)
+                restorer.restore()
+                self.assertIn(
+                    (restore.SYSTEMCTL, "enable", "p2pool.service"),
+                    runner.calls,
+                )
+                self.assertEqual(runner.units["p2pool.service"]["enabled"], "enabled")
+
+    def test_linked_state_that_stays_linked_fails_closed(self):
+        class LinkedRunner(FakeRunner):
+            def run(self, args, allowed_returncodes=(0,), timeout=30):
+                if tuple(args) == (restore.SYSTEMCTL, "enable", "p2pool.service"):
+                    self.calls.append(tuple(args))
+                    self.timeouts.append(timeout)
+                    return ""
+                return super().run(args, allowed_returncodes, timeout)
+
+        runner = LinkedRunner()
+        runner.units["p2pool.service"]["enabled"] = "linked"
+        restorer, _, audit = self.create_restorer(runner=runner)
+        with self.assertRaisesRegex(restore.RestoreError, "persistently enabled"):
+            restorer.restore()
+        self.assertEqual(audit.records[-1]["status"], "failed")
 
     def test_command_failure_stops_later_components_and_is_audited(self):
         runner = FakeRunner()
@@ -473,17 +600,83 @@ class RestorationTests(unittest.TestCase):
         self.assertEqual(audit.records[-1]["status"], "failed")
 
     def test_expiry_during_restoration_stops_later_components(self):
-        values = iter((NOW, NOW, DEADLINE + 601))
-        runner = FakeRunner()
+        clock = FakeClock()
+        runner = AdvancingRunner(
+            clock,
+            (restore.SWAPON, restore.SWAP_PATH),
+            DEADLINE + 601 - NOW,
+        )
         restorer, runner, audit = self.create_restorer(
             runner=runner,
-            wall_clock=lambda: next(values),
+            clock=clock,
         )
         with self.assertRaisesRegex(restore.RestoreError, "expired during restoration"):
             restorer.restore()
         self.assertTrue(runner.swap_active)
         self.assertFalse(runner.docker_running)
         self.assertEqual(audit.records[-1]["status"], "failed")
+
+    def test_healthy_result_crossing_expiry_is_rejected(self):
+        clock = FakeClock()
+        runner = AdvancingRunner(
+            clock,
+            (
+                restore.DOCKER,
+                "inspect",
+                "--format={{.State.Health.Status}}",
+                restore.DOCKER_CONTAINER,
+            ),
+            DEADLINE + 601 - NOW,
+        )
+        runner.swap_active = True
+        runner.docker_running = True
+        runner.docker_health = ["healthy"]
+        restorer, _, audit = self.create_restorer(runner=runner, clock=clock)
+        with self.assertRaisesRegex(restore.RestoreError, "expired during restoration"):
+            restorer.restore()
+        self.assertEqual(audit.records[-1]["status"], "failed")
+        self.assertFalse(any(event["component"] == "docker_monerod" for event in audit.records[-1]["events"]))
+
+    def test_final_proxy_completion_crossing_expiry_is_rejected(self):
+        clock = FakeClock()
+        runner = AdvancingRunner(
+            clock,
+            (restore.SYSTEMCTL, "--user", "start", "llama-proxy.service"),
+            DEADLINE + 601 - NOW,
+        )
+        runner.swap_active = True
+        runner.docker_running = True
+        runner.docker_health = ["healthy"]
+        for unit, state in runner.units.items():
+            state["enabled"] = "enabled"
+            state["active"] = "active"
+        runner.units["llama-proxy.service"]["active"] = "inactive"
+        restorer, _, audit = self.create_restorer(runner=runner, clock=clock)
+        with self.assertRaisesRegex(restore.RestoreError, "expired during restoration"):
+            restorer.restore()
+        self.assertEqual(audit.records[-1]["status"], "failed")
+        self.assertNotIn("completed_epoch", audit.records[-1])
+
+    def test_command_timeout_is_bounded_by_signed_expiry(self):
+        data = plan_data()
+        data["restore_deadline_epoch"] = NOW - 10
+        data["expires_epoch"] = NOW + 5
+        clock = FakeClock()
+        runner = FakeRunner()
+        runner.swap_active = True
+        runner.docker_running = True
+        runner.docker_health = ["healthy"]
+        for state in runner.units.values():
+            state["enabled"] = "enabled"
+            state["active"] = "active"
+        restorer, runner, _ = self.create_restorer(
+            plan=make_plan(data),
+            runner=runner,
+            clock=clock,
+        )
+        restorer.restore()
+        self.assertTrue(runner.timeouts)
+        self.assertTrue(all(0 < timeout <= 5 for timeout in runner.timeouts))
 
     def test_initial_audit_failure_prevents_commands(self):
         audit = RecordingAudit(fail_at=0)
@@ -565,11 +758,36 @@ class AuditWriterTests(unittest.TestCase):
                 with restore.AuditWriter(directory, NONCE, expected_uid=os.geteuid()):
                     pass
 
+    def test_preflight_plan_failure_is_recorded(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            directory = Path(directory)
+            directory.chmod(0o700)
+            restore.write_preflight_audit(
+                directory,
+                NONCE,
+                DEADLINE,
+                restore.RestoreError("missing plan"),
+                expected_uid=os.geteuid(),
+            )
+            record = json.loads((directory / "restore-preflight.json").read_text())
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(record["phase"], "plan-validation")
+            self.assertEqual(record["expected_nonce"], NONCE)
+            self.assertEqual(record["error"], "missing plan")
+
 
 class TemplateTests(unittest.TestCase):
+    def test_readme_denies_model_execution_authorization(self):
+        readme = SCRIPT.with_name("README.md").read_text()
+        self.assertIn(
+            "Arming this restoration timer is not authorization to load or execute a model.",
+            readme,
+        )
+
     def test_service_is_inert_until_timer_invocation(self):
         service = SCRIPT.with_name("strix-host-restore.service.in").read_text()
         self.assertNotIn("Wants=docker.service", service)
+        self.assertNotIn("ConditionPathExists=", service)
         self.assertNotIn("Restart=", service)
         self.assertNotIn("[Install]", service)
         self.assertIn("User=root", service)
@@ -578,7 +796,7 @@ class TemplateTests(unittest.TestCase):
 
     def test_timer_has_exact_persistent_deadline_template(self):
         timer = SCRIPT.with_name("strix-host-restore.timer.in").read_text()
-        self.assertIn("OnCalendar=@RESTORE_DEADLINE_UTC@", timer)
+        self.assertIn("OnCalendar=@@EXPECTED_DEADLINE_EPOCH@", timer)
         self.assertIn("AccuracySec=1s", timer)
         self.assertIn("RandomizedDelaySec=0", timer)
         self.assertIn("Persistent=true", timer)

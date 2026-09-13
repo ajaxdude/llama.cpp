@@ -3,7 +3,7 @@ Description=Run the signed Strix Halo host baseline restore at its deadline
 Documentation=file:///usr/local/share/doc/strix-host-restore/README.md
 
 [Timer]
-OnCalendar=@RESTORE_DEADLINE_UTC@
+OnCalendar=@@EXPECTED_DEADLINE_EPOCH@
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=true

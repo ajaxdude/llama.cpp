@@ -2,9 +2,6 @@
 Description=Restore the signed Strix Halo host baseline
 Documentation=file:///usr/local/share/doc/strix-host-restore/README.md
 After=local-fs.target docker.service
-ConditionPathExists=/etc/strix-host-restore/plan.json
-ConditionPathExists=/etc/strix-host-restore/plan.sig
-ConditionPathExists=/etc/strix-host-restore/plan.key
 
 [Service]
 Type=oneshot

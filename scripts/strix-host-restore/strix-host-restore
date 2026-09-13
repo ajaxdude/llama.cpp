@@ -91,7 +91,19 @@ def reject_duplicate_keys(pairs):
     return result
 
 
-def open_parent_directory_nofollow(path):
+def validate_trusted_directory(info, expected_uid, label, require_private):
+    if not stat.S_ISDIR(info.st_mode):
+        raise RestoreError(f"{label} is not a directory")
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid not in (0, expected_uid):
+        raise RestoreError(f"{label} has an untrusted owner")
+    if mode & 0o022:
+        raise RestoreError(f"{label} is group-writable or world-writable")
+    if require_private and (info.st_uid != expected_uid or mode != 0o700):
+        raise RestoreError(f"{label} must be owned by UID {expected_uid} with mode 0700")
+
+
+def open_parent_directory_nofollow(path, expected_uid, require_private_parent):
     absolute = os.path.abspath(os.fspath(path))
     parts = Path(absolute).parts
     if len(parts) < 2:
@@ -101,21 +113,40 @@ def open_parent_directory_nofollow(path):
         directory_flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
-    directory_fd = os.open("/", directory_flags)
     try:
-        for component in parts[1:-1]:
+        directory_fd = os.open("/", directory_flags)
+    except OSError as exc:
+        raise RestoreError(f"cannot open path root for {path}: {exc}") from exc
+    try:
+        validate_trusted_directory(os.fstat(directory_fd), expected_uid, "path root", False)
+    except RestoreError:
+        os.close(directory_fd)
+        raise
+    try:
+        parent_components = parts[1:-1]
+        for index, component in enumerate(parent_components):
             next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_fd
+            validate_trusted_directory(
+                os.fstat(directory_fd),
+                expected_uid,
+                f"path ancestor {os.path.join(*parts[:index + 2])}",
+                require_private_parent and index == len(parent_components) - 1,
+            )
     except OSError as exc:
         os.close(directory_fd)
         raise RestoreError(f"path contains an unsafe directory: {path}: {exc}") from exc
+    except RestoreError:
+        os.close(directory_fd)
+        raise
     return directory_fd, parts[-1]
 
 
-def secure_read(path, expected_uid, expected_mode, label, maximum_bytes):
-    directory_fd, filename = open_parent_directory_nofollow(path)
-    flags = os.O_RDONLY
+def secure_read_at(directory_fd, filename, expected_uid, expected_mode, label, maximum_bytes):
+    if filename in ("", ".", "..") or "/" in filename:
+        raise RestoreError(f"unsafe {label} filename")
+    flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -124,8 +155,6 @@ def secure_read(path, expected_uid, expected_mode, label, maximum_bytes):
         fd = os.open(filename, flags, dir_fd=directory_fd)
     except OSError as exc:
         raise RestoreError(f"cannot securely open {label}: {exc}") from exc
-    finally:
-        os.close(directory_fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -140,11 +169,15 @@ def secure_read(path, expected_uid, expected_mode, label, maximum_bytes):
         if info.st_size > maximum_bytes:
             raise RestoreError(f"{label} exceeds {maximum_bytes} bytes")
         chunks = []
+        total = 0
         while True:
             chunk = os.read(fd, 65536)
             if not chunk:
                 break
             chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise RestoreError(f"{label} exceeds {maximum_bytes} bytes")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -336,21 +369,60 @@ def load_authenticated_plan(
     now,
     require_due,
 ):
-    raw_plan = secure_read(plan_path, expected_uid, 0o600, "plan", MAX_PLAN_BYTES)
-    raw_signature = secure_read(
-        signature_path,
+    paths = tuple(os.path.abspath(os.fspath(path)) for path in (plan_path, signature_path, key_path))
+    directories = {os.path.dirname(path) for path in paths}
+    if len(directories) != 1:
+        raise RestoreError("plan, signature, and HMAC key must share one private directory")
+    directory = directories.pop()
+    directory_fd = open_secure_directory(
+        directory,
         expected_uid,
-        0o600,
-        "signature",
-        MAX_AUTH_FILE_BYTES,
+        0o700,
+        "plan directory",
     )
-    raw_key = secure_read(
-        key_path,
-        expected_uid,
-        0o600,
-        "HMAC key",
-        MAX_AUTH_FILE_BYTES,
-    )
+    original_directory = os.fstat(directory_fd)
+    try:
+        raw_plan = secure_read_at(
+            directory_fd,
+            os.path.basename(paths[0]),
+            expected_uid,
+            0o600,
+            "plan",
+            MAX_PLAN_BYTES,
+        )
+        raw_signature = secure_read_at(
+            directory_fd,
+            os.path.basename(paths[1]),
+            expected_uid,
+            0o600,
+            "signature",
+            MAX_AUTH_FILE_BYTES,
+        )
+        raw_key = secure_read_at(
+            directory_fd,
+            os.path.basename(paths[2]),
+            expected_uid,
+            0o600,
+            "HMAC key",
+            MAX_AUTH_FILE_BYTES,
+        )
+        verify_fd = open_secure_directory(
+            directory,
+            expected_uid,
+            0o700,
+            "plan directory",
+        )
+        try:
+            verified_directory = os.fstat(verify_fd)
+            if (
+                verified_directory.st_dev != original_directory.st_dev
+                or verified_directory.st_ino != original_directory.st_ino
+            ):
+                raise RestoreError("plan directory was replaced during validation")
+        finally:
+            os.close(verify_fd)
+    finally:
+        os.close(directory_fd)
     key = parse_hex_file(raw_key, 32, "HMAC key")
     signature = parse_hex_file(raw_signature, 32, "signature")
     actual_signature = hmac.new(key, raw_plan, hashlib.sha256).digest()
@@ -397,6 +469,12 @@ def verify_restore_installation(args):
     for label, (actual, expected) in required_paths.items():
         if actual != expected:
             raise RestoreError(f"unsafe {label} path: expected {expected}")
+    script_parent_fd, _ = open_parent_directory_nofollow(
+        INSTALLED_SCRIPT,
+        0,
+        require_private_parent=False,
+    )
+    os.close(script_parent_fd)
     try:
         info = os.stat(INSTALLED_SCRIPT, follow_symlinks=False)
     except OSError as exc:
@@ -411,14 +489,14 @@ def verify_restore_installation(args):
 
 
 class CommandRunner:
-    def run(self, args, allowed_returncodes=(0,)):
+    def run(self, args, allowed_returncodes=(0,), timeout=30):
         try:
             result = subprocess.run(
                 args,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RestoreError(f"command failed to execute: {' '.join(args)}: {exc}") from exc
@@ -432,7 +510,11 @@ class CommandRunner:
 
 
 def open_secure_directory(path, expected_uid, expected_mode, label):
-    directory_fd, filename = open_parent_directory_nofollow(path)
+    directory_fd, filename = open_parent_directory_nofollow(
+        path,
+        expected_uid,
+        require_private_parent=False,
+    )
     flags = os.O_RDONLY | os.O_DIRECTORY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -446,13 +528,10 @@ def open_secure_directory(path, expected_uid, expected_mode, label):
         os.close(directory_fd)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISDIR(info.st_mode):
-            raise RestoreError(f"{label} is not a directory")
-        if info.st_uid != expected_uid:
-            raise RestoreError(f"{label} owner must be UID {expected_uid}")
+        validate_trusted_directory(info, expected_uid, label, False)
         mode = stat.S_IMODE(info.st_mode)
-        if mode != expected_mode:
-            raise RestoreError(f"{label} mode must be {expected_mode:04o}, got {mode:04o}")
+        if info.st_uid != expected_uid or mode != expected_mode:
+            raise RestoreError(f"{label} must be owned by UID {expected_uid} with mode {expected_mode:04o}")
         return fd
     except Exception:
         os.close(fd)
@@ -567,6 +646,26 @@ class AuditWriter:
             raise RestoreError(f"cannot write durable audit record: {exc}") from exc
 
 
+def write_preflight_audit(
+    audit_dir,
+    expected_nonce,
+    expected_deadline,
+    error,
+    expected_uid=0,
+):
+    state = {
+        "schema": 1,
+        "status": "failed",
+        "phase": "plan-validation",
+        "expected_nonce": expected_nonce,
+        "expected_deadline_epoch": expected_deadline,
+        "error": str(error),
+        "failed_epoch": int(time.time()),
+    }
+    with AuditWriter(audit_dir, "preflight", expected_uid=expected_uid) as audit:
+        audit.write(state)
+
+
 class Restorer:
     def __init__(
         self,
@@ -587,6 +686,7 @@ class Restorer:
         self.runtime_validator = runtime_validator or self._validate_user_runtime
         self.username_lookup = username_lookup or self._lookup_username
         self.wall_clock = wall_clock or time.time
+        self.expiry_monotonic = self.monotonic() + max(0, plan.expires_epoch - self.wall_clock())
         self.state = {
             "schema": 1,
             "nonce": plan.nonce,
@@ -629,11 +729,14 @@ class Restorer:
             for component, unit, intent in self.plan.user_services:
                 self._ensure_not_expired()
                 self._restore_service(component, unit, intent, user_prefix=prefix)
+            self._ensure_not_expired()
             self.state["status"] = "complete"
             self.state["completed_epoch"] = int(time.time())
             self.checkpoint()
+            self._ensure_not_expired()
         except Exception as exc:
             self.state["status"] = "failed"
+            self.state.pop("completed_epoch", None)
             self.state["error"] = str(exc)
             self.state["failed_epoch"] = int(time.time())
             try:
@@ -645,27 +748,50 @@ class Restorer:
             raise RestoreError(str(exc)) from exc
 
     def _ensure_not_expired(self):
-        if int(self.wall_clock()) > self.plan.expires_epoch:
+        self._remaining_seconds()
+
+    def _remaining_seconds(self, operation_deadline=None):
+        remaining = min(
+            self.plan.expires_epoch - self.wall_clock(),
+            self.expiry_monotonic - self.monotonic(),
+        )
+        if operation_deadline is not None:
+            remaining = min(remaining, operation_deadline - self.monotonic())
+        if remaining <= 0:
             raise RestoreError("plan expired during restoration")
+        return remaining
+
+    def _run(self, args, allowed_returncodes=(0,), operation_deadline=None):
+        timeout = min(30, self._remaining_seconds(operation_deadline))
+        output = self.runner.run(
+            args,
+            allowed_returncodes=allowed_returncodes,
+            timeout=timeout,
+        )
+        self._remaining_seconds(operation_deadline)
+        return output
 
     def _restore_swap(self):
         if not self.plan.swap_enabled:
             self.event("swapfile", "skip", "baseline-disabled")
             return
-        output = self.runner.run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
+        output = self._run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
         active = {line.strip() for line in output.splitlines() if line.strip()}
         if SWAP_PATH in active:
             self.event("swapfile", "swapon", "already-restored")
             return
         self._ensure_not_expired()
-        self.runner.run((SWAPON, SWAP_PATH))
-        verify = self.runner.run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
+        self._run((SWAPON, SWAP_PATH))
+        verify = self._run((SWAPON, "--show=NAME", "--noheadings", "--raw"))
         if SWAP_PATH not in {line.strip() for line in verify.splitlines() if line.strip()}:
             raise RestoreError(f"{SWAP_PATH} did not become active")
         self.event("swapfile", "swapon", "restored")
 
-    def _docker_inspect(self, template):
-        return self.runner.run((DOCKER, "inspect", f"--format={template}", DOCKER_CONTAINER))
+    def _docker_inspect(self, template, operation_deadline=None):
+        return self._run(
+            (DOCKER, "inspect", f"--format={template}", DOCKER_CONTAINER),
+            operation_deadline=operation_deadline,
+        )
 
     def _restore_docker(self):
         if not self.plan.docker_running:
@@ -676,7 +802,7 @@ class Restorer:
             raise RestoreError(f"unsupported Docker running state: {running!r}")
         if running == "false":
             self._ensure_not_expired()
-            self.runner.run((DOCKER, "start", DOCKER_CONTAINER))
+            self._run((DOCKER, "start", DOCKER_CONTAINER))
             action = "started"
         else:
             action = "already-running"
@@ -686,7 +812,12 @@ class Restorer:
         deadline = self.monotonic() + self.plan.docker_health_timeout_seconds
         while True:
             self._ensure_not_expired()
-            health = self._docker_inspect("{{.State.Health.Status}}")
+            if self.monotonic() >= deadline:
+                raise RestoreError("timed out waiting for monerod Docker health")
+            health = self._docker_inspect(
+                "{{.State.Health.Status}}",
+                operation_deadline=deadline,
+            )
             if health == "healthy":
                 self.event("docker_monerod", "start-and-wait", f"{action}-healthy")
                 return
@@ -694,16 +825,23 @@ class Restorer:
                 raise RestoreError(f"unsupported Docker health state: {health!r}")
             if self.monotonic() >= deadline:
                 raise RestoreError("timed out waiting for monerod Docker health")
-            self.sleeper(min(2, max(0, deadline - self.monotonic())))
+            self.sleeper(min(2, self._remaining_seconds(deadline)))
+
+    @staticmethod
+    def _systemctl_command(prefix, operation, unit):
+        command = tuple(prefix or ()) + (SYSTEMCTL,)
+        if prefix is not None:
+            command += ("--user",)
+        return command + (operation, unit)
 
     def _service_state(self, prefix, operation, unit):
-        command = tuple(prefix or ()) + (SYSTEMCTL, operation, unit)
+        command = self._systemctl_command(prefix, operation, unit)
         if operation == "is-active":
-            output = self.runner.run(command, allowed_returncodes=(0, 3))
+            output = self._run(command, allowed_returncodes=(0, 3))
             if output not in ("active", "inactive", "failed", "activating", "deactivating", "reloading"):
                 raise RestoreError(f"unsupported active state for {unit}: {output!r}")
             return output
-        output = self.runner.run(command, allowed_returncodes=(0, 1))
+        output = self._run(command, allowed_returncodes=(0, 1))
         if output not in (
             "enabled",
             "enabled-runtime",
@@ -730,18 +868,18 @@ class Restorer:
         if intent.enabled:
             if enable_state in ("masked", "static", "generated", "transient", "alias"):
                 raise RestoreError(f"cannot safely enable {unit} from state {enable_state}")
-            if enable_state not in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
+            if enable_state != "enabled":
                 self._ensure_not_expired()
-                self.runner.run(tuple(user_prefix or ()) + (SYSTEMCTL, "enable", unit))
+                self._run(self._systemctl_command(user_prefix, "enable", unit))
                 verify = self._service_state(user_prefix, "is-enabled", unit)
-                if verify not in ("enabled", "enabled-runtime", "linked", "linked-runtime"):
-                    raise RestoreError(f"{unit} did not become enabled")
+                if verify != "enabled":
+                    raise RestoreError(f"{unit} did not become persistently enabled")
                 restored.append("enabled")
         if intent.active and active_state != "active":
             if active_state in ("activating", "deactivating", "reloading"):
                 raise RestoreError(f"cannot safely start {unit} from state {active_state}")
             self._ensure_not_expired()
-            self.runner.run(tuple(user_prefix or ()) + (SYSTEMCTL, "start", unit))
+            self._run(self._systemctl_command(user_prefix, "start", unit))
             if self._service_state(user_prefix, "is-active", unit) != "active":
                 raise RestoreError(f"{unit} did not become active")
             restored.append("started")
@@ -813,16 +951,29 @@ def main(argv=None):
         expected_uid = os.geteuid()
         require_due = False
 
-    plan = load_authenticated_plan(
-        args.plan,
-        args.signature,
-        args.key,
-        expected_uid,
-        args.expected_nonce,
-        args.expected_deadline,
-        now,
-        require_due,
-    )
+    try:
+        plan = load_authenticated_plan(
+            args.plan,
+            args.signature,
+            args.key,
+            expected_uid,
+            args.expected_nonce,
+            args.expected_deadline,
+            now,
+            require_due,
+        )
+    except RestoreError as exc:
+        if args.command == "restore":
+            try:
+                write_preflight_audit(
+                    args.audit_dir,
+                    args.expected_nonce,
+                    args.expected_deadline,
+                    exc,
+                )
+            except RestoreError as audit_exc:
+                raise RestoreError(f"{exc}; preflight audit also failed: {audit_exc}") from exc
+        raise
 
     if args.command == "validate":
         print(f"VALID plan_sha256={plan.digest} nonce={plan.nonce}")
