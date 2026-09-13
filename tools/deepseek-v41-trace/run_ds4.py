@@ -23,16 +23,24 @@ from preflight import (
 from trace_format import (
     ADMITTED_UBATCH,
     APPROVED_EXPORTERS,
+    APPROVED_TRACE_SIGNERS,
     CORPUS_SHA256,
     DS4_REVISION,
     MODEL_SHA256,
     NO_EXTERNAL_STATE_STORAGE,
+    ORACLE_LANE,
     TraceBundle,
     TraceError,
+    TraceVerifier,
+    bind_execution_authorization,
     canonical_json,
+    execution_authorization,
+    reject_loader_overrides,
+    seal_bundle,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    validate_signing_identity,
 )
 
 def git_output(checkout: Path, *args: str) -> str:
@@ -271,6 +279,12 @@ def main() -> int:
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--prefill-chunk", type=int, default=ADMITTED_UBATCH)
     parser.add_argument("--device", default="Metal0")
+    parser.add_argument("--signer-principal", required=True)
+    parser.add_argument("--signing-key", type=Path, required=True)
+    parser.add_argument("--execution-challenge", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--authorization-issued-unix", type=int, required=True)
+    parser.add_argument("--authorization-expires-unix", type=int, required=True)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
@@ -279,6 +293,15 @@ def main() -> int:
             raise PreflightError(
                 f"DeepSeek V4.1 correctness runs require admitted prefill chunk {ADMITTED_UBATCH}, "
                 f"found {args.prefill_chunk}")
+        reject_loader_overrides()
+        authorization = execution_authorization(
+            lane=ORACLE_LANE,
+            challenge=args.execution_challenge,
+            run_id=args.run_id,
+            issued_unix=args.authorization_issued_unix,
+            expires_unix=args.authorization_expires_unix,
+        )
+        output = resolved(args.output)
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         exporter = resolved(args.exporter)
@@ -289,7 +312,12 @@ def main() -> int:
             raise PreflightError(
                 f"trace exporter SHA-256 mismatch: expected {args.exporter_sha256}, found {exporter_sha256}")
         verify_exporter_approval(exporter_sha256)
-        output = resolved(args.output)
+        validate_signing_identity(
+            args.signing_key,
+            args.signer_principal,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+            forbidden_root=output,
+        )
         command = [
             str(exporter),
             "--model", str(resolved(args.model)),
@@ -346,7 +374,25 @@ def main() -> int:
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
         bind_oracle_attestation(output, preflight_audit, accelerator, command)
-        bundle = TraceBundle(output)
+        bind_execution_authorization(output, authorization)
+        seal_bundle(
+            output,
+            private_key=args.signing_key,
+            principal=args.signer_principal,
+            expected_lane=ORACLE_LANE,
+            expected_challenge=args.execution_challenge,
+            expected_run_id=args.run_id,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+        )
+        bundle = TraceBundle(
+            output,
+            verifier=TraceVerifier.production(
+                args.signer_principal,
+                expected_lane=ORACLE_LANE,
+                expected_challenge=args.execution_challenge,
+                expected_run_id=args.run_id,
+            ),
+        )
         if bundle.manifest.get("runtime") != "ds4":
             raise PreflightError("ds4 exporter wrote a non-ds4 trace")
         if bundle.manifest.get("revision") != DS4_REVISION:

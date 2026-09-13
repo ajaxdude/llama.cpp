@@ -214,6 +214,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek41-trace.py
         )
+        if(BUILD_SHARED_LIBS AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+            set_property(
+                TEST test-deepseek41-trace
+                APPEND PROPERTY ENVIRONMENT
+                    "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:llama-deepseek-v41-trace>"
+                    "DSV41_NATIVE_MANIFEST_BINARY=$<TARGET_FILE:test-deepseek41-trace-manifest>"
+                    "DSV41_NATIVE_INJECT_LIBRARY=$<TARGET_FILE:test-deepseek41-trace-injected>")
+        endif()
     endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

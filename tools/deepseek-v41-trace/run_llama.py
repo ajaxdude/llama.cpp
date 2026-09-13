@@ -25,6 +25,8 @@ from preflight import (
 from trace_format import (
     ADMITTED_BATCH,
     ADMITTED_UBATCH,
+    APPROVED_TRACE_SIGNERS,
+    CANDIDATE_LANE,
     CORPUS_SHA256,
     MODEL_SHA256,
     REPOSITORY,
@@ -33,10 +35,16 @@ from trace_format import (
     REQUIRED_EXPERT_SLOTS,
     TraceBundle,
     TraceError,
+    TraceVerifier,
+    bind_execution_authorization,
     canonical_json,
+    execution_authorization,
+    reject_loader_overrides,
+    seal_bundle,
     sha256_bytes,
     sha256_file,
     strict_json_loads,
+    validate_signing_identity,
 )
 
 
@@ -100,20 +108,12 @@ def candidate_attestation(
     }
 
 
-def _path_is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
 def validate_runtime_build(
         manifest: dict[str, object],
         *,
         exporter: Path,
         exporter_sha256: str,
-        candidate_revision: str) -> str:
+        candidate_revision: str) -> tuple[str, str]:
     build = manifest.get("build")
     if not isinstance(build, dict):
         raise PreflightError("llama trace build identity is missing")
@@ -129,27 +129,64 @@ def validate_runtime_build(
     libraries = build.get("runtime_libraries")
     if not isinstance(libraries, list) or not libraries:
         raise PreflightError("llama trace runtime library identities are missing")
-    expected_roles = {"build-info", "llama", "ggml", "selected-backend"}
+    post_libraries = build.get("runtime_libraries_post")
+    if post_libraries != libraries:
+        raise PreflightError("llama trace runtime library closure changed during trace generation")
+    module_monitor = build.get("runtime_module_monitor")
+    if not isinstance(module_monitor, dict) or set(module_monitor) != {
+            "mechanism", "checked_after_trace", "project_additions"}:
+        raise PreflightError("llama trace runtime module monitor is invalid")
+    if module_monitor["mechanism"] not in {"dyld-add-image", "pre-post-snapshot"}:
+        raise PreflightError("llama trace runtime module monitor mechanism is invalid")
+    if module_monitor["checked_after_trace"] is not True:
+        raise PreflightError("llama trace runtime module monitor did not complete")
+    if module_monitor["project_additions"] != []:
+        raise PreflightError("llama trace records a runtime module addition during trace generation")
+    profile = build.get("runtime_profile")
+    if not isinstance(profile, dict) or set(profile) != {
+            "name", "components", "selected_backend_component"}:
+        raise PreflightError("llama trace runtime profile is invalid")
+    if profile.get("name") != "sibling-lib":
+        raise PreflightError("llama trace runtime profile is not the Linux sibling-lib profile")
+    components = profile.get("components")
+    if not isinstance(components, list) or components != sorted(components) or (
+            len(components) != len(set(components))):
+        raise PreflightError("llama trace runtime profile components are invalid")
+    if not {"llama-common", "llama", "ggml", "ggml-base", "ggml-hip"}.issubset(set(components)):
+        raise PreflightError("llama trace runtime profile is missing required ROCm components")
+    selected_backend_component = profile.get("selected_backend_component")
+    if selected_backend_component != "ggml-hip":
+        raise PreflightError("llama trace selected backend component is not ggml-hip")
     roles = set()
     paths = set()
+    found_components = set()
     previous_path = None
-    binary_directory = exporter.parent
-    library_directory = binary_directory.parent / "lib"
+    library_directory = resolved(exporter.parent.parent / "lib")
     for library in libraries:
-        if not isinstance(library, dict):
+        if not isinstance(library, dict) or set(library) != {
+                "component", "filename", "path", "sha256", "role", "revision"}:
             raise PreflightError("llama trace runtime library identity is invalid")
+        component = library.get("component")
+        filename = library.get("filename")
         path_value = library.get("path")
         digest = library.get("sha256")
-        library_roles = library.get("roles")
+        role = library.get("role")
         revision = library.get("revision")
-        if not isinstance(library_roles, list) or library_roles != sorted(library_roles) or any(
-                role not in expected_roles for role in library_roles):
-            raise PreflightError("llama trace runtime library roles are invalid")
-        for role in library_roles:
-            if role in roles:
-                raise PreflightError("llama trace runtime library role is invalid")
-            roles.add(role)
-        if bool(set(library_roles) & {"build-info", "ggml"}):
+        if component not in components or component in found_components:
+            raise PreflightError("llama trace runtime library component is invalid")
+        found_components.add(component)
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise PreflightError("llama trace runtime library filename is invalid")
+        expected_role = {
+            "llama-common": "build-info",
+            "llama": "llama",
+            "ggml-base": "ggml",
+            selected_backend_component: "selected-backend",
+        }.get(component, f"runtime:{component}")
+        if role != expected_role or role in roles:
+            raise PreflightError("llama trace runtime library role is invalid")
+        roles.add(role)
+        if component in {"llama-common", "ggml-base"}:
             if revision != candidate_revision:
                 raise PreflightError("llama trace runtime library revision mismatch")
         elif revision is not None:
@@ -163,13 +200,35 @@ def validate_runtime_build(
             raise PreflightError("llama trace runtime library paths are duplicated or unsorted")
         paths.add(path)
         previous_path = path
-        if path != exporter and path.parent != binary_directory and not _path_is_within(path, library_directory):
-            raise PreflightError("llama trace runtime library is outside the exporter runtime directory")
+        if path.parent != library_directory or path.name != filename:
+            raise PreflightError("llama trace runtime library path differs from the exact runtime profile")
         if not path.is_file() or not isinstance(digest, str) or sha256_file(path) != digest:
             raise PreflightError("llama trace runtime library SHA-256 mismatch")
-    if roles != expected_roles:
-        raise PreflightError("llama trace runtime library identities are incomplete")
-    return sha256_bytes(canonical_json(libraries).encode("ascii"))
+    if found_components != set(components):
+        raise PreflightError("llama trace runtime library set differs from the runtime profile")
+    receipt = {
+        "format": "dsv41-runtime-receipt",
+        "version": 1,
+        "revision": candidate_revision,
+        "profile": profile["name"],
+        "components": sorted(
+            [
+                {
+                    "component": library["component"],
+                    "filename": library["filename"],
+                    "sha256": library["sha256"],
+                    "revision": library["revision"],
+                }
+                for library in libraries
+            ],
+            key=lambda item: item["component"],
+        ),
+    }
+    receipt_sha256 = sha256_bytes(canonical_json(receipt).encode("ascii"))
+    if build.get("runtime_receipt_sha256") != receipt_sha256:
+        raise PreflightError("llama trace runtime receipt SHA-256 mismatch")
+    closure = {"pre": libraries, "post": post_libraries}
+    return sha256_bytes(canonical_json(closure).encode("ascii")), receipt_sha256
 
 
 def bind_candidate_attestation(
@@ -186,12 +245,14 @@ def bind_candidate_attestation(
     if manifest.get("accelerator") != accelerator:
         raise PreflightError("llama trace accelerator attestation differs from the preflight query")
     bound_attestation = dict(attestation)
-    bound_attestation["runtime_libraries_sha256"] = validate_runtime_build(
+    libraries_sha256, receipt_sha256 = validate_runtime_build(
         manifest,
         exporter=exporter,
         exporter_sha256=exporter_sha256,
         candidate_revision=attestation["revision"],
     )
+    bound_attestation["runtime_libraries_sha256"] = libraries_sha256
+    bound_attestation["runtime_receipt_sha256"] = receipt_sha256
     manifest["candidate"] = bound_attestation
     temp = manifest_path.with_suffix(".tmp")
     temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
@@ -332,13 +393,34 @@ def main() -> int:
     parser.add_argument("--expert-cache-slots", type=int, default=REQUIRED_EXPERT_SLOTS)
     parser.add_argument("--expert-cache-mib", type=int, default=REQUIRED_EXPERT_CACHE_MIB)
     parser.add_argument("--gpu-layers", type=int, default=99)
+    parser.add_argument("--signer-principal", required=True)
+    parser.add_argument("--signing-key", type=Path, required=True)
+    parser.add_argument("--execution-challenge", required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--authorization-issued-unix", type=int, required=True)
+    parser.add_argument("--authorization-expires-unix", type=int, required=True)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
     try:
         validate_runtime_config(args)
+        reject_loader_overrides()
+        authorization = execution_authorization(
+            lane=CANDIDATE_LANE,
+            challenge=args.execution_challenge,
+            run_id=args.run_id,
+            issued_unix=args.authorization_issued_unix,
+            expires_unix=args.authorization_expires_unix,
+        )
+        output = resolved(args.output)
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
+        validate_signing_identity(
+            args.signing_key,
+            args.signer_principal,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+            forbidden_root=output,
+        )
         exporter = resolved(args.exporter)
         if not exporter.is_file() or not os.access(exporter, os.X_OK):
             raise PreflightError(f"trace exporter is not executable: {exporter}")
@@ -368,7 +450,6 @@ def main() -> int:
             target_tokens=args.context - args.decode_steps,
         )
         attestation = candidate_attestation(args, exporter, exporter_sha256)
-        output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
         preflight_audit = run_strix_preflight(
@@ -420,7 +501,25 @@ def main() -> int:
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
         bind_candidate_attestation(output, attestation, accelerator, exporter, exporter_sha256)
-        bundle = TraceBundle(output)
+        bind_execution_authorization(output, authorization)
+        seal_bundle(
+            output,
+            private_key=args.signing_key,
+            principal=args.signer_principal,
+            expected_lane=CANDIDATE_LANE,
+            expected_challenge=args.execution_challenge,
+            expected_run_id=args.run_id,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+        )
+        bundle = TraceBundle(
+            output,
+            verifier=TraceVerifier.production(
+                args.signer_principal,
+                expected_lane=CANDIDATE_LANE,
+                expected_challenge=args.execution_challenge,
+                expected_run_id=args.run_id,
+            ),
+        )
         if bundle.manifest.get("runtime") != "llama.cpp":
             raise PreflightError("llama exporter wrote a non-llama.cpp trace")
         if bundle.manifest.get("build", {}).get("sha256") != exporter_sha256:

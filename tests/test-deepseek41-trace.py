@@ -10,6 +10,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -33,6 +34,13 @@ trace.APPROVED_WATCHDOGS[trace.WATCHDOG_SCRIPT_SHA256] = trace.WATCHDOG_REVISION
 FIXTURE_DS4_EXPORTER_SHA256 = "3" * 64
 trace.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
 run_ds4.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
+TEST_AUTH_ISSUED = int(time.time()) - 60
+TEST_AUTH_EXPIRES = TEST_AUTH_ISSUED + 3600
+TEST_CHALLENGE = "d" * 64
+TEST_RUN_IDS = {
+    "llama.cpp": "strix-llama-test-run",
+    "ds4": "apple-ds4-test-run",
+}
 
 WATCHDOG_EVENTS = [
     {
@@ -376,9 +384,49 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
     is_ds4 = runtime == "ds4"
     storage = DS4_STORAGE_ATTESTATION if is_ds4 else STORAGE_ATTESTATION
     audit_kinds = ("memory", "swap", "runner") if is_ds4 else ("memory", "swap", "watchdog")
+    runtime_components = [
+        ("ggml", "libggml.so", "4", "runtime:ggml", None),
+        ("ggml-base", "libggml-base.so", "5", "ggml", "a" * 40),
+        ("ggml-hip", "libggml-hip.so", "6", "selected-backend", None),
+        ("llama", "libllama.so", "7", "llama", None),
+        ("llama-common", "libllama-common.so", "9", "build-info", "a" * 40),
+    ]
+    runtime_libraries = [
+        {
+            "component": component,
+            "filename": filename,
+            "path": f"/home/repo/build/lib/{filename}",
+            "sha256": digest * 64,
+            "role": role,
+            "revision": revision,
+        }
+        for component, filename, digest, role, revision in runtime_components
+    ]
+    runtime_receipt = {
+        "format": "dsv41-runtime-receipt",
+        "version": 1,
+        "revision": "a" * 40,
+        "profile": "sibling-lib",
+        "components": [
+            {
+                "component": component,
+                "filename": filename,
+                "sha256": digest * 64,
+                "revision": revision,
+            }
+            for component, filename, digest, _role, revision in runtime_components
+        ],
+    }
     result = {
         "runtime": runtime,
         "revision": trace.DS4_REVISION if is_ds4 else "a" * 40,
+        "authorization": trace.execution_authorization(
+            lane=trace.ORACLE_LANE if is_ds4 else trace.CANDIDATE_LANE,
+            challenge=TEST_CHALLENGE,
+            run_id=TEST_RUN_IDS[runtime],
+            issued_unix=TEST_AUTH_ISSUED,
+            expires_unix=TEST_AUTH_EXPIRES,
+        ),
         "build": (
             {
                 "compiler": "clang",
@@ -394,20 +442,21 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "target": "arm64-apple-darwin",
                 "path": "/home/repo/build/bin/llama-deepseek-v41-trace",
                 "sha256": "3" * 64,
-                "runtime_libraries": sorted([
-                    {
-                        "roles": [role],
-                        "path": f"/home/repo/build/bin/{name}",
-                        "sha256": digest * 64,
-                        "revision": "a" * 40 if role in {"build-info", "ggml"} else None,
-                    }
-                    for role, name, digest in (
-                        ("build-info", "libllama-common.so", "4"),
-                        ("llama", "libllama.so", "5"),
-                        ("ggml", "libggml.so", "6"),
-                        ("selected-backend", "libggml-hip.so", "7"),
-                    )
-                ], key=lambda library: library["path"]),
+                "runtime_profile": {
+                    "name": "sibling-lib",
+                    "components": [component for component, *_rest in runtime_components],
+                    "selected_backend_component": "ggml-hip",
+                },
+                "runtime_receipt_sha256": trace.sha256_bytes(
+                    trace.canonical_json(runtime_receipt).encode("ascii")),
+                "runtime_libraries": sorted(runtime_libraries, key=lambda library: library["path"]),
+                "runtime_libraries_post": sorted(
+                    copy.deepcopy(runtime_libraries), key=lambda library: library["path"]),
+                "runtime_module_monitor": {
+                    "mechanism": "pre-post-snapshot",
+                    "checked_after_trace": True,
+                    "project_additions": [],
+                },
             }
         ),
         "model": {
@@ -519,7 +568,11 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "executable_path": result["build"]["path"],
             "executable_sha256": "3" * 64,
             "runtime_libraries_sha256": trace.sha256_bytes(
-                trace.canonical_json(result["build"]["runtime_libraries"]).encode("ascii")),
+                trace.canonical_json({
+                    "pre": result["build"]["runtime_libraries"],
+                    "post": result["build"]["runtime_libraries_post"],
+                }).encode("ascii")),
+            "runtime_receipt_sha256": result["build"]["runtime_receipt_sha256"],
         }
     else:
         result["host"] = dict(DS4_HOST_ATTESTATION)
@@ -787,12 +840,533 @@ def replace_event_blob(
 
 
 class TraceFormatTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._signing_directory = tempfile.TemporaryDirectory()
+        cls.ssh_keygen = trace.trusted_ssh_keygen_path()
+        cls.signing_keys = {}
+        cls.signer_principals = {
+            "llama.cpp": "dsv41-test-candidate",
+            "ds4": "dsv41-test-oracle",
+        }
+        cls.test_signers = {}
+        for runtime, principal in cls.signer_principals.items():
+            signing_key = Path(cls._signing_directory.name) / f"{runtime.replace('.', '-')}-key"
+            subprocess.run(
+                [
+                    str(cls.ssh_keygen),
+                    "-q",
+                    "-t", "ed25519",
+                    "-N", "",
+                    "-f", str(signing_key),
+                ],
+                check=True,
+            )
+            signing_key.chmod(0o600)
+            public_key = subprocess.check_output(
+                [str(cls.ssh_keygen), "-y", "-f", str(signing_key)],
+                text=True,
+            ).strip()
+            public_key = " ".join(public_key.split()[:2])
+            lane = trace.ORACLE_LANE if runtime == "ds4" else trace.CANDIDATE_LANE
+            profile = "apple-metal" if runtime == "ds4" else "sibling-lib"
+            cls.signing_keys[runtime] = signing_key
+            cls.test_signers[principal] = {
+                "public_key": public_key,
+                "lane": lane,
+                "runtime": runtime,
+                "runtime_profile": profile,
+            }
+        cls.signing_key = cls.signing_keys["llama.cpp"]
+        cls.signer_principal = cls.signer_principals["llama.cpp"]
+        cls.verifier = cls._verifier_for_runtime("llama.cpp")
+        cls._trace_bundle_class = trace.TraceBundle
+
+    @classmethod
+    def _verifier_for_runtime(
+            cls,
+            runtime: str,
+            *,
+            expected_challenge: str = TEST_CHALLENGE,
+            expected_run_id: str | None = None,
+            verification_unix: int | None = None,
+            seen_run_ids: set[str] | None = None) -> trace.TraceVerifier:
+        principal = cls.signer_principals[runtime]
+        policy = cls.test_signers[principal]
+        return trace.TraceVerifier.for_tests(
+            principal,
+            policy["public_key"],
+            lane=policy["lane"],
+            runtime=runtime,
+            runtime_profile=policy["runtime_profile"],
+            expected_challenge=expected_challenge,
+            expected_run_id=expected_run_id or TEST_RUN_IDS[runtime],
+            verification_unix=verification_unix or int(time.time()),
+            ssh_keygen=cls.ssh_keygen,
+            seen_run_ids=seen_run_ids,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._signing_directory.cleanup()
+
     def setUp(self) -> None:
         self._require_nvme_path = preflight.require_nvme_path
         preflight.require_nvme_path = lambda path, label, **kwargs: preflight.resolved(path)
+        self._trace_bundle_symbol = trace.TraceBundle
+
+        def test_bundle(root: Path, verify_blobs: bool = True, **_kwargs: object) -> object:
+            self._prune_fixture_extras(Path(root))
+            signature = Path(root) / trace.SIGNATURE_NAME
+            if signature.exists() or signature.is_symlink():
+                signature.unlink()
+            manifest_record = trace.strict_json_loads(
+                (Path(root) / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+            runtime = manifest_record["runtime"]
+            principal = self.signer_principals[runtime]
+            authorization = manifest_record["authorization"]
+            trace.seal_bundle(
+                Path(root),
+                private_key=self.signing_keys[runtime],
+                principal=principal,
+                expected_lane=authorization["lane"],
+                expected_challenge=authorization["challenge"],
+                expected_run_id=authorization["run_id"],
+                trusted_signers=self.test_signers,
+                ssh_keygen=self.ssh_keygen,
+            )
+            return self._trace_bundle_class(
+                Path(root),
+                verify_blobs,
+                verifier=self._verifier_for_runtime(
+                    runtime,
+                    expected_challenge=authorization["challenge"],
+                    expected_run_id=authorization["run_id"],
+                ),
+            )
+
+        trace.TraceBundle = test_bundle
 
     def tearDown(self) -> None:
         preflight.require_nvme_path = self._require_nvme_path
+        trace.TraceBundle = self._trace_bundle_symbol
+
+    def _seal_test_bundle(self, root: Path) -> str:
+        signature = root / trace.SIGNATURE_NAME
+        if signature.exists() or signature.is_symlink():
+            signature.unlink()
+        manifest_record = trace.strict_json_loads(
+            (root / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+        runtime = manifest_record["runtime"]
+        principal = self.signer_principals[runtime]
+        authorization = manifest_record["authorization"]
+        return trace.seal_bundle(
+            root,
+            private_key=self.signing_keys[runtime],
+            principal=principal,
+            expected_lane=authorization["lane"],
+            expected_challenge=authorization["challenge"],
+            expected_run_id=authorization["run_id"],
+            trusted_signers=self.test_signers,
+            ssh_keygen=self.ssh_keygen,
+        )
+
+    def _prune_fixture_extras(self, root: Path) -> None:
+        manifest_path = root / trace.MANIFEST_NAME
+        events_path = root / trace.EVENTS_NAME
+        if not manifest_path.is_file() or not events_path.is_file():
+            return
+        try:
+            manifest_record = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            events = [
+                trace.strict_json_loads(line)
+                for line in events_path.read_text(encoding="ascii").splitlines()
+            ]
+        except (OSError, UnicodeError, trace.TraceError):
+            return
+        expected = {trace.MANIFEST_NAME, trace.EVENTS_NAME}
+        if isinstance(manifest_record, dict):
+            prompt = manifest_record.get("prompt")
+            provenance = prompt.get("provenance") if isinstance(prompt, dict) else None
+            if isinstance(provenance, dict) and isinstance(provenance.get("path"), str):
+                expected.add(provenance["path"])
+            audits = manifest_record.get("audits")
+            if isinstance(audits, dict):
+                for phase in audits.values():
+                    if not isinstance(phase, dict):
+                        continue
+                    for reference in phase.values():
+                        if not isinstance(reference, dict) or not isinstance(reference.get("path"), str):
+                            continue
+                        expected.add(reference["path"])
+                        audit_path = root / reference["path"]
+                        if not audit_path.is_file():
+                            continue
+                        try:
+                            audit = trace.strict_json_loads(audit_path.read_text(encoding="ascii"))
+                        except (OSError, UnicodeError, trace.TraceError):
+                            continue
+                        nested = audit.get("data", {}).get("audit") if isinstance(audit, dict) else None
+                        if isinstance(nested, dict) and isinstance(nested.get("path"), str):
+                            expected.add(nested["path"])
+        for event in events:
+            if isinstance(event, dict) and isinstance(event.get("blob"), str):
+                expected.add(event["blob"])
+        for path in root.rglob("*"):
+            if path.is_file() and path.relative_to(root).as_posix() not in expected | {trace.SIGNATURE_NAME}:
+                path.unlink()
+
+    def _read_sealed_bundle(self, root: Path) -> object:
+        return self._trace_bundle_class(root, verifier=self.verifier)
+
+    def test_seal_requires_external_trust_and_fixed_verifier(self) -> None:
+        self.assertEqual(trace.APPROVED_TRACE_SIGNERS, {})
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            self._seal_test_bundle(root)
+            self._read_sealed_bundle(root)
+            with self.assertRaisesRegex(trace.TraceError, "external signer, lane, challenge, and run ID"):
+                self._trace_bundle_class(root)
+            with self.assertRaisesRegex(trace.TraceError, "not approved"):
+                self._trace_bundle_class(
+                    root,
+                    signer_principal=self.signer_principal,
+                    expected_lane=trace.CANDIDATE_LANE,
+                    expected_challenge=TEST_CHALLENGE,
+                    expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                )
+            candidate_policy = self.test_signers[self.signer_principal]
+            unknown = trace.TraceVerifier.for_tests(
+                "unknown",
+                candidate_policy["public_key"],
+                lane=trace.CANDIDATE_LANE,
+                runtime="llama.cpp",
+                runtime_profile="sibling-lib",
+                expected_challenge=TEST_CHALLENGE,
+                expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                verification_unix=int(time.time()),
+            )
+            with self.assertRaisesRegex(trace.TraceError, "externally expected signer"):
+                self._trace_bundle_class(root, verifier=unknown)
+
+            fake_directory = Path(temp) / "fake-bin"
+            fake_directory.mkdir()
+            fake = fake_directory / "ssh-keygen"
+            fake.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            fake.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": str(fake_directory)}):
+                self._read_sealed_bundle(root)
+            substituted = Path(temp) / "substituted-ssh-keygen"
+            substituted.symlink_to(fake)
+            verifier = trace.TraceVerifier.for_tests(
+                self.signer_principal,
+                candidate_policy["public_key"],
+                lane=trace.CANDIDATE_LANE,
+                runtime="llama.cpp",
+                runtime_profile="sibling-lib",
+                expected_challenge=TEST_CHALLENGE,
+                expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                verification_unix=int(time.time()),
+                ssh_keygen=substituted,
+            )
+            with self.assertRaisesRegex(trace.TraceError, "non-symlink"):
+                self._trace_bundle_class(root, verifier=verifier)
+
+            with self.assertRaisesRegex(trace.TraceError, "already exists"):
+                trace.seal_bundle(
+                    root,
+                    private_key=self.signing_key,
+                    principal=self.signer_principal,
+                    expected_lane=trace.CANDIDATE_LANE,
+                    expected_challenge=TEST_CHALLENGE,
+                    expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
+
+            other_key = Path(temp) / "other-key"
+            subprocess.run(
+                [
+                    str(self.ssh_keygen),
+                    "-q",
+                    "-t", "ed25519",
+                    "-N", "",
+                    "-f", str(other_key),
+                ],
+                check=True,
+            )
+            other_key.chmod(0o600)
+            with self.assertRaisesRegex(trace.TraceError, "does not match"):
+                trace.validate_signing_identity(
+                    other_key,
+                    self.signer_principal,
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
+
+    def test_seal_rejects_protected_bundle_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = Path(temp) / "baseline"
+            with trace.TraceBundleWriter(baseline, manifest()) as writer:
+                add_required_events(writer)
+            self._seal_test_bundle(baseline)
+            self._read_sealed_bundle(baseline)
+
+            mutations = {
+                "manifest": lambda root: (root / trace.MANIFEST_NAME).write_bytes(
+                    (root / trace.MANIFEST_NAME).read_bytes().replace(b'"event_count":259', b'"event_count":258')),
+                "events": lambda root: (root / trace.EVENTS_NAME).write_bytes(
+                    (root / trace.EVENTS_NAME).read_bytes().replace(b'"step":0', b'"step":1', 1)),
+                "audit": lambda root: next((root / "audits").rglob("*.json")).write_bytes(b"{}\n"),
+                "blob": lambda root: next((root / trace.BLOBS_DIR).iterdir()).write_bytes(b"changed"),
+                "provenance": lambda root: next((root / "provenance").iterdir()).write_bytes(b"{}\n"),
+                "added": lambda root: (root / "unexpected").write_bytes(b"x"),
+                "signature": lambda root: (root / trace.SIGNATURE_NAME).write_bytes(
+                    (root / trace.SIGNATURE_NAME).read_bytes().replace(b"SSH SIGNATURE", b"SSH SIGNATURX", 1)),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(name=name):
+                    root = Path(temp) / name
+                    shutil.copytree(baseline, root)
+                    mutate(root)
+                    with self.assertRaises(trace.TraceError):
+                        self._read_sealed_bundle(root)
+
+    def test_seal_binds_runtime_lane_challenge_and_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            self._seal_test_bundle(root)
+
+            with self.assertRaisesRegex(trace.TraceError, "external challenge"):
+                self._trace_bundle_class(
+                    root,
+                    verifier=self._verifier_for_runtime("llama.cpp", expected_challenge="e" * 64),
+                )
+            with self.assertRaisesRegex(trace.TraceError, "external run ID"):
+                self._trace_bundle_class(
+                    root,
+                    verifier=self._verifier_for_runtime(
+                        "llama.cpp", expected_run_id="strix-llama-other-run"),
+                )
+            with self.assertRaisesRegex(trace.TraceError, "expected execution lane"):
+                wrong_lane = trace.TraceVerifier.for_tests(
+                    self.signer_principal,
+                    self.test_signers[self.signer_principal]["public_key"],
+                    lane=trace.ORACLE_LANE,
+                    runtime="ds4",
+                    runtime_profile="apple-metal",
+                    expected_challenge=TEST_CHALLENGE,
+                    expected_run_id=TEST_RUN_IDS["ds4"],
+                    verification_unix=int(time.time()),
+                    ssh_keygen=self.ssh_keygen,
+                )
+                self._trace_bundle_class(root, verifier=wrong_lane)
+
+            seen_run_ids: set[str] = set()
+            self._trace_bundle_class(
+                root,
+                verifier=self._verifier_for_runtime("llama.cpp", seen_run_ids=seen_run_ids),
+            )
+            with self.assertRaisesRegex(trace.TraceError, "reused"):
+                self._trace_bundle_class(
+                    root,
+                    verifier=self._verifier_for_runtime("llama.cpp", seen_run_ids=seen_run_ids),
+                )
+
+            with self.assertRaisesRegex(trace.TraceError, "expired"):
+                self._trace_bundle_class(
+                    root,
+                    verifier=self._verifier_for_runtime(
+                        "llama.cpp", verification_unix=TEST_AUTH_EXPIRES + 1),
+                )
+
+    def test_seal_rejects_nonportable_signed_paths(self) -> None:
+        invalid_paths = (
+            "../escape.json",
+            "./provenance.json",
+            "audit//record.json",
+            r"audit\record.json",
+            "C:/audit/record.json",
+            "//server/share.json",
+            "%2e%2e/escape.json",
+            "audit/\x01.json",
+            "audit/\N{LATIN SMALL LETTER E WITH ACUTE}.json",
+        )
+        for index, invalid in enumerate(invalid_paths):
+            with self.subTest(path=invalid), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                record = manifest()
+                record["prompt"]["provenance"]["path"] = invalid
+                with trace.TraceBundleWriter(root, record) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, "trace path"):
+                    self._seal_test_bundle(root)
+
+    def test_signing_rejects_bundle_key_and_public_key_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            bundled_key = root / "private-key"
+            shutil.copyfile(self.signing_key, bundled_key)
+            bundled_key.chmod(0o600)
+            with self.assertRaisesRegex(trace.TraceError, "outside the bundle"):
+                trace.seal_bundle(
+                    root,
+                    private_key=bundled_key,
+                    principal=self.signer_principal,
+                    expected_lane=trace.CANDIDATE_LANE,
+                    expected_challenge=TEST_CHALLENGE,
+                    expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
+            public_key_path = self.signing_key.with_suffix(".pub")
+            public_key_path.chmod(0o600)
+            with self.assertRaisesRegex(trace.TraceError, "derive|match"):
+                trace.validate_signing_identity(
+                    public_key_path,
+                    self.signer_principal,
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
+            with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/attacker-agent"}):
+                trace.validate_signing_identity(
+                    self.signing_key,
+                    self.signer_principal,
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
+
+    def test_signer_policy_rejects_open_ssh_options_certificates_and_extra_fields(self) -> None:
+        policy = copy.deepcopy(self.test_signers[self.signer_principal])
+        public_key = policy["public_key"]
+        invalid_keys = (
+            f"cert-authority {public_key}",
+            public_key.replace("ssh-ed25519", "ssh-ed25519-cert-v01@openssh.com", 1),
+            f"{public_key} comment",
+            f"{public_key}\n{public_key}",
+        )
+        for public_key_value in invalid_keys:
+            with self.subTest(public_key=public_key_value):
+                invalid_policy = copy.deepcopy(policy)
+                invalid_policy["public_key"] = public_key_value
+                with self.assertRaisesRegex(trace.TraceError, "OpenSSH Ed25519 key"):
+                    trace.validate_signing_identity(
+                        self.signing_key,
+                        self.signer_principal,
+                        trusted_signers={self.signer_principal: invalid_policy},
+                        ssh_keygen=self.ssh_keygen,
+                    )
+        with self.assertRaisesRegex(trace.TraceError, "principal is invalid"):
+            trace.validate_signing_identity(
+                self.signing_key,
+                "*",
+                trusted_signers={"*": policy},
+                ssh_keygen=self.ssh_keygen,
+            )
+
+    def test_seal_rejects_noncanonical_duplicate_and_incomplete_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = Path(temp) / "baseline"
+            with trace.TraceBundleWriter(baseline, manifest()) as writer:
+                add_required_events(writer)
+            self._seal_test_bundle(baseline)
+
+            noncanonical = Path(temp) / "noncanonical"
+            shutil.copytree(baseline, noncanonical)
+            record = json.loads((noncanonical / trace.MANIFEST_NAME).read_text(encoding="ascii"))
+            (noncanonical / trace.MANIFEST_NAME).write_text(
+                json.dumps(record, sort_keys=True, indent=2) + "\n",
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(trace.TraceError, "not canonical"):
+                self._read_sealed_bundle(noncanonical)
+
+            duplicate = Path(temp) / "duplicate"
+            shutil.copytree(baseline, duplicate)
+            manifest_path = duplicate / trace.MANIFEST_NAME
+            data = manifest_path.read_text(encoding="ascii")
+            manifest_path.write_text(data.replace("{", '{"trace_format":"dsv41-trace",', 1), encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "duplicate JSON key"):
+                self._read_sealed_bundle(duplicate)
+
+            truncated = Path(temp) / "truncated"
+            shutil.copytree(baseline, truncated)
+            events_path = truncated / trace.EVENTS_NAME
+            events_path.write_bytes(events_path.read_bytes()[:-1])
+            with self.assertRaisesRegex(trace.TraceError, "truncated"):
+                self._read_sealed_bundle(truncated)
+
+            missing = Path(temp) / "missing"
+            shutil.copytree(baseline, missing)
+            next((missing / trace.BLOBS_DIR).iterdir()).unlink()
+            with self.assertRaises(trace.TraceError):
+                self._read_sealed_bundle(missing)
+
+            unsigned = Path(temp) / "unsigned"
+            shutil.copytree(baseline, unsigned)
+            (unsigned / trace.SIGNATURE_NAME).unlink()
+            with self.assertRaisesRegex(trace.TraceError, "bundle-signature"):
+                self._read_sealed_bundle(unsigned)
+
+            for field, value in (
+                    ("namespace", "wrong-namespace"),
+                    ("principal", "other-principal"),
+                    ("format", "other-format"),
+                    ("version", 2)):
+                with self.subTest(envelope_field=field):
+                    root = Path(temp) / f"envelope-{field}"
+                    shutil.copytree(baseline, root)
+                    envelope_path = root / trace.SIGNATURE_NAME
+                    envelope = json.loads(envelope_path.read_text(encoding="ascii"))
+                    envelope[field] = value
+                    envelope_path.write_text(
+                        json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n",
+                        encoding="ascii",
+                    )
+                    with self.assertRaises(trace.TraceError):
+                        self._read_sealed_bundle(root)
+
+    def test_bundle_cannot_supply_signature_trust_inputs(self) -> None:
+        for field in ("signer_public_key", "signer_principal", "verifier_path", "allowed_signers"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                record = manifest()
+                record[field] = "attacker-controlled"
+                with trace.TraceBundleWriter(root, record) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, f"unexpected {field}"):
+                    trace.TraceBundle(root)
+
+    def test_seal_rejects_hard_links_and_post_verify_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest()) as writer:
+                add_required_events(writer)
+            self._seal_test_bundle(root)
+            bundle = self._read_sealed_bundle(root)
+            event = bundle.events[0]
+            blob = root / event["blob"]
+            replacement = root / "replacement"
+            replacement.write_bytes(blob.read_bytes())
+            os.replace(replacement, blob)
+            with self.assertRaisesRegex(trace.TraceError, "changed after signature verification"):
+                bundle.read_blob(event)
+
+        if os.name != "nt":
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest()) as writer:
+                    add_required_events(writer)
+                blob = next((root / trace.BLOBS_DIR).iterdir())
+                os.link(blob, Path(temp) / "hard-link")
+                with self.assertRaisesRegex(trace.TraceError, "hard linked"):
+                    self._seal_test_bundle(root)
 
     def test_serialization_preserves_float_bits_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1929,7 +2503,7 @@ class TraceFormatTests(unittest.TestCase):
             bad_manifest["audits"]["pre"]["watchdog"] = "watchdog.json"
             with trace.TraceBundleWriter(root, bad_manifest) as writer:
                 add_required_events(writer)
-            with self.assertRaisesRegex(trace.TraceError, "watchdog audit reference"):
+            with self.assertRaisesRegex(trace.TraceError, "audit reference"):
                 trace.TraceBundle(root)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1938,7 +2512,7 @@ class TraceFormatTests(unittest.TestCase):
             with trace.TraceBundleWriter(root, trace_manifest) as writer:
                 add_required_events(writer)
             (root / trace_manifest["audits"]["pre"]["memory"]["path"]).unlink()
-            with self.assertRaisesRegex(trace.TraceError, "pre memory audit evidence"):
+            with self.assertRaisesRegex(trace.TraceError, "missing or not regular"):
                 trace.TraceBundle(root)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -1947,7 +2521,7 @@ class TraceFormatTests(unittest.TestCase):
             with trace.TraceBundleWriter(root, trace_manifest) as writer:
                 add_required_events(writer)
             (root / trace_manifest["audits"]["post"]["watchdog"]["path"]).unlink()
-            with self.assertRaisesRegex(trace.TraceError, "post watchdog audit evidence"):
+            with self.assertRaisesRegex(trace.TraceError, "missing or not regular"):
                 trace.TraceBundle(root)
 
     def test_rejects_unpinned_ds4_revision(self) -> None:
@@ -1982,10 +2556,22 @@ class TraceFormatTests(unittest.TestCase):
 
         library_manifest = manifest()
         library_manifest["build"]["runtime_libraries"][0]["sha256"] = "e" * 64
-        cases.append((library_manifest, "candidate runtime library identities"))
+        library_manifest["build"]["runtime_libraries_post"][0]["sha256"] = "e" * 64
+        cases.append((library_manifest, "runtime receipt SHA-256"))
+
+        added_module_manifest = manifest()
+        added_module_manifest["build"]["runtime_module_monitor"]["project_additions"] = [
+            {"path": "lib/libggml-injected.module"}]
+        cases.append((added_module_manifest, "runtime module addition during trace generation"))
+
+        incomplete_monitor_manifest = manifest()
+        incomplete_monitor_manifest["build"]["runtime_module_monitor"]["checked_after_trace"] = False
+        cases.append((incomplete_monitor_manifest, "runtime module monitor did not complete"))
 
         library_path_manifest = manifest()
         library_path_manifest["build"]["runtime_libraries"][0]["path"] = (
+            "/home/repo/build/bin/../substituted/libllama-common.so")
+        library_path_manifest["build"]["runtime_libraries_post"][0]["path"] = (
             "/home/repo/build/bin/../substituted/libllama-common.so")
         cases.append((library_path_manifest, "runtime library path is not canonical"))
 
@@ -1993,44 +2579,61 @@ class TraceFormatTests(unittest.TestCase):
         external_library_manifest["build"]["runtime_libraries"][0]["path"] = (
             "/Users/attacker/libggml-injected.dylib")
         external_library_manifest["build"]["runtime_libraries"].sort(key=lambda item: item["path"])
+        external_library_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+            external_library_manifest["build"]["runtime_libraries"])
         cases.append((external_library_manifest, "outside the exporter runtime directory"))
 
         omitted_library_manifest = manifest()
         omitted_library_manifest["build"]["runtime_libraries"] = [
             library
             for library in omitted_library_manifest["build"]["runtime_libraries"]
-            if "selected-backend" not in library["roles"]
+            if library["role"] != "selected-backend"
         ]
-        cases.append((omitted_library_manifest, "runtime library identities are incomplete"))
+        omitted_library_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+            omitted_library_manifest["build"]["runtime_libraries"])
+        cases.append((omitted_library_manifest, "set differs from the runtime profile"))
 
         duplicate_path_manifest = manifest()
         duplicate_path_manifest["build"]["runtime_libraries"][1]["path"] = (
             duplicate_path_manifest["build"]["runtime_libraries"][0]["path"])
+        duplicate_path_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+            duplicate_path_manifest["build"]["runtime_libraries"])
         cases.append((duplicate_path_manifest, "runtime library path is duplicated"))
 
         duplicate_role_manifest = manifest()
-        duplicate_role_manifest["build"]["runtime_libraries"][1]["roles"] = (
-            duplicate_role_manifest["build"]["runtime_libraries"][0]["roles"])
-        cases.append((duplicate_role_manifest, "runtime library role is duplicated"))
+        duplicate_role_manifest["build"]["runtime_libraries"][1]["role"] = (
+            duplicate_role_manifest["build"]["runtime_libraries"][0]["role"])
+        duplicate_role_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+            duplicate_role_manifest["build"]["runtime_libraries"])
+        cases.append((duplicate_role_manifest, "runtime library role is invalid"))
 
-        unsorted_role_manifest = manifest()
-        unsorted_role_manifest["build"]["runtime_libraries"][0]["roles"] = ["llama", "build-info"]
-        cases.append((unsorted_role_manifest, "runtime library roles are not sorted"))
+        unknown_component_manifest = manifest()
+        unknown_component_manifest["build"]["runtime_libraries"][0]["component"] = "ggml-injected"
+        unknown_component_manifest["build"]["runtime_libraries_post"][0]["component"] = "ggml-injected"
+        cases.append((unknown_component_manifest, "runtime library component is invalid"))
 
         revision_library_manifest = manifest()
         revision_library = next(
             library
             for library in revision_library_manifest["build"]["runtime_libraries"]
-            if "build-info" in library["roles"])
+            if library["role"] == "build-info")
         revision_library["revision"] = "b" * 40
+        next(
+            library
+            for library in revision_library_manifest["build"]["runtime_libraries_post"]
+            if library["role"] == "build-info")["revision"] = "b" * 40
         cases.append((revision_library_manifest, "runtime library revision is invalid"))
 
         unexpected_revision_manifest = manifest()
         unexpected_revision = next(
             library
             for library in unexpected_revision_manifest["build"]["runtime_libraries"]
-            if not set(library["roles"]) & {"build-info", "ggml"})
+            if library["role"].startswith("runtime:"))
         unexpected_revision["revision"] = "a" * 40
+        next(
+            library
+            for library in unexpected_revision_manifest["build"]["runtime_libraries_post"]
+            if library["role"].startswith("runtime:"))["revision"] = "a" * 40
         cases.append((unexpected_revision_manifest, "runtime library revision is unexpected"))
 
         for trace_manifest, message in cases:
@@ -2074,7 +2677,7 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_rejects_cross_runtime_attestation_substitution(self) -> None:
         for runtime, accelerator, message in (
-                ("ds4", ACCELERATOR_ATTESTATION, "ds4 accelerator attestation fields"),
+                ("ds4", ACCELERATOR_ATTESTATION, "runtime profile"),
                 ("llama.cpp", METAL_ACCELERATOR_ATTESTATION, "llama.cpp accelerator attestation fields")):
             with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp) / "trace"
@@ -2189,7 +2792,7 @@ class TraceFormatTests(unittest.TestCase):
             trace_manifest["accelerator"]["runtime_kind"] = "unknown"
             with trace.TraceBundleWriter(root, trace_manifest) as writer:
                 add_required_events(writer)
-            with self.assertRaisesRegex(trace.TraceError, "runtime_kind mismatch"):
+            with self.assertRaisesRegex(trace.TraceError, "runtime profile"):
                 trace.TraceBundle(root)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -2198,7 +2801,7 @@ class TraceFormatTests(unittest.TestCase):
             del trace_manifest["accelerator"]["runtime_kind"]
             with trace.TraceBundleWriter(root, trace_manifest) as writer:
                 add_required_events(writer)
-            with self.assertRaisesRegex(trace.TraceError, "fields are invalid"):
+            with self.assertRaisesRegex(trace.TraceError, "runtime profile"):
                 trace.TraceBundle(root)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -2278,13 +2881,30 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(native["revision"], revision)
             self.assertEqual(native["build"]["path"], str(manifest_binary.resolve()))
             self.assertIn("test-only manifest harness", native["build"]["info"])
+            self.assertEqual(native["accelerator"]["runtime_kind"], "native-test")
+            self.assertEqual(native["accelerator"]["device_type"], "cpu")
+            self.assertIs(native["accelerator"]["test_only"], True)
+            components = native["build"]["runtime_profile"]["components"]
+            self.assertEqual(components, sorted(components))
             self.assertEqual(
+                native["build"]["runtime_libraries_post"],
+                native["build"]["runtime_libraries"],
+            )
+            self.assertEqual(
+                native["build"]["runtime_module_monitor"],
                 {
-                    role
-                    for library in native["build"]["runtime_libraries"]
-                    for role in library["roles"]
+                    "mechanism": "dyld-add-image" if sys.platform == "darwin" else "pre-post-snapshot",
+                    "checked_after_trace": True,
+                    "project_additions": [],
                 },
-                {"build-info", "llama", "ggml", "selected-backend"},
+            )
+            self.assertEqual(
+                {library["component"] for library in native["build"]["runtime_libraries"]},
+                set(components),
+            )
+            self.assertEqual(
+                len({library["role"] for library in native["build"]["runtime_libraries"]}),
+                len(components),
             )
             self.assertEqual(
                 [library["path"] for library in native["build"]["runtime_libraries"]],
@@ -2293,13 +2913,38 @@ class TraceFormatTests(unittest.TestCase):
             for library in native["build"]["runtime_libraries"]:
                 expected_revision = (
                     revision
-                    if set(library["roles"]) & {"build-info", "ggml"}
+                    if library["component"] in {"llama-common", "ggml-base"}
                     else None
                 )
                 self.assertEqual(library["revision"], expected_revision)
+            receipt = {
+                "format": "dsv41-runtime-receipt",
+                "version": 1,
+                "revision": revision,
+                "profile": native["build"]["runtime_profile"]["name"],
+                "components": sorted(
+                    [
+                        {
+                            "component": library["component"],
+                            "filename": library["filename"],
+                            "sha256": library["sha256"],
+                            "revision": library["revision"],
+                        }
+                        for library in native["build"]["runtime_libraries"]
+                    ],
+                    key=lambda item: item["component"],
+                ),
+            }
+            self.assertEqual(
+                native["build"]["runtime_receipt_sha256"],
+                trace.sha256_bytes(trace.canonical_json(receipt).encode("ascii")),
+            )
             self.assertIsInstance(native["environment"]["command"], str)
             self.assertEqual(json.loads(native["environment"]["command"]), command)
-            self.assertIs(native["config"]["flash_attention"], True)
+            self.assertIs(native["config"]["flash_attention"], False)
+            self.assertEqual(native["config"]["runtime_kind"], "native-test")
+            self.assertEqual(native["config"]["device_type"], "cpu")
+            self.assertIs(native["config"]["test_only"], True)
             self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
             attestation = fixture["candidate"]
             attestation["revision"] = revision
@@ -2313,11 +2958,20 @@ class TraceFormatTests(unittest.TestCase):
                     manifest_binary,
                     trace.sha256_file(manifest_binary),
                 )
-            with self.assertRaisesRegex(trace.TraceError, "missing candidate"):
-                trace.TraceBundle(root)
+            with self.assertRaisesRegex(trace.TraceError, "execution authorization is missing"):
+                trace.seal_bundle(
+                    root,
+                    private_key=self.signing_key,
+                    principal=self.signer_principal,
+                    expected_lane=trace.CANDIDATE_LANE,
+                    expected_challenge=TEST_CHALLENGE,
+                    expected_run_id=TEST_RUN_IDS["llama.cpp"],
+                    trusted_signers=self.test_signers,
+                    ssh_keygen=self.ssh_keygen,
+                )
 
             for protected_field in (
-                    "accelerator", "build", "candidate", "comparison", "config",
+                    "accelerator", "authorization", "build", "candidate", "comparison", "config",
                     "environment", "paths", "revision", "runtime", "storage_policy"):
                 protected_input = dict(writer_input)
                 protected_input[protected_field] = fixture.get(protected_field, {})
@@ -2357,83 +3011,183 @@ class TraceFormatTests(unittest.TestCase):
             exporter = binary_directory / "llama-deepseek-v41-trace"
             exporter.write_bytes(b"exporter")
             records = []
-            for name, roles, content in (
-                    ("libggml-hip.so", ["selected-backend"], b"backend"),
-                    ("libggml.so", ["ggml"], b"ggml"),
-                    ("libllama-common.so", ["build-info"], b"build"),
-                    ("libllama.so", ["llama"], b"llama"),
-                    ("libggml-blas.so", [], b"blas")):
+            for component, name, role, content in (
+                    ("ggml", "libggml.so", "runtime:ggml", b"ggml"),
+                    ("ggml-base", "libggml-base.so", "ggml", b"base"),
+                    ("ggml-blas", "libggml-blas.so", "runtime:ggml-blas", b"blas"),
+                    ("ggml-hip", "libggml-hip.so", "selected-backend", b"backend"),
+                    ("llama", "libllama.so", "llama", b"llama"),
+                    ("llama-common", "libllama-common.so", "build-info", b"build")):
                 path = library_directory / name
                 path.write_bytes(content)
                 records.append({
+                    "component": component,
+                    "filename": name,
                     "path": str(path.resolve()),
                     "sha256": trace.sha256_file(path),
-                    "roles": roles,
-                    "revision": "a" * 40 if set(roles) & {"build-info", "ggml"} else None,
+                    "role": role,
+                    "revision": "a" * 40 if component in {"llama-common", "ggml-base"} else None,
                 })
             records.sort(key=lambda record: record["path"])
+            components = sorted(record["component"] for record in records)
+            receipt = {
+                "format": "dsv41-runtime-receipt",
+                "version": 1,
+                "revision": "a" * 40,
+                "profile": "sibling-lib",
+                "components": sorted(
+                    [
+                        {
+                            "component": record["component"],
+                            "filename": record["filename"],
+                            "sha256": record["sha256"],
+                            "revision": record["revision"],
+                        }
+                        for record in records
+                    ],
+                    key=lambda item: item["component"],
+                ),
+            }
             build_manifest = {
                 "revision": "a" * 40,
                 "build": {
                     "path": str(exporter.resolve()),
                     "sha256": trace.sha256_file(exporter),
                     "info": "test",
+                    "runtime_profile": {
+                        "name": "sibling-lib",
+                        "components": components,
+                        "selected_backend_component": "ggml-hip",
+                    },
+                    "runtime_receipt_sha256": trace.sha256_bytes(
+                        trace.canonical_json(receipt).encode("ascii")),
                     "runtime_libraries": records,
+                    "runtime_libraries_post": copy.deepcopy(records),
+                    "runtime_module_monitor": {
+                        "mechanism": "pre-post-snapshot",
+                        "checked_after_trace": True,
+                        "project_additions": [],
+                    },
                 },
             }
-            digest = run_llama.validate_runtime_build(
+            libraries_digest, receipt_digest = run_llama.validate_runtime_build(
                 build_manifest,
                 exporter=exporter,
                 exporter_sha256=trace.sha256_file(exporter),
                 candidate_revision="a" * 40,
             )
             self.assertEqual(
-                digest,
-                trace.sha256_bytes(trace.canonical_json(records).encode("ascii")),
+                libraries_digest,
+                trace.sha256_bytes(trace.canonical_json({
+                    "pre": records,
+                    "post": records,
+                }).encode("ascii")),
             )
+            self.assertEqual(receipt_digest, build_manifest["build"]["runtime_receipt_sha256"])
 
             cases = []
             omitted = copy.deepcopy(build_manifest)
             omitted["build"]["runtime_libraries"] = [
                 library
                 for library in omitted["build"]["runtime_libraries"]
-                if "selected-backend" not in library["roles"]
+                if library["role"] != "selected-backend"
             ]
-            cases.append((omitted, "identities are incomplete"))
+            omitted["build"]["runtime_libraries_post"] = copy.deepcopy(
+                omitted["build"]["runtime_libraries"])
+            cases.append((omitted, "set differs from the runtime profile"))
 
             changed_hash = copy.deepcopy(build_manifest)
             changed_hash["build"]["runtime_libraries"][0]["sha256"] = "f" * 64
+            changed_hash["build"]["runtime_libraries_post"][0]["sha256"] = "f" * 64
             cases.append((changed_hash, "SHA-256 mismatch"))
+
+            changed_post = copy.deepcopy(build_manifest)
+            changed_post["build"]["runtime_libraries_post"][0]["sha256"] = "f" * 64
+            cases.append((changed_post, "closure changed during trace generation"))
+
+            added_module = copy.deepcopy(build_manifest)
+            added_module["build"]["runtime_module_monitor"]["project_additions"] = [
+                {"path": "lib/libggml-injected.module"}]
+            cases.append((added_module, "runtime module addition during trace generation"))
+
+            incomplete_monitor = copy.deepcopy(build_manifest)
+            incomplete_monitor["build"]["runtime_module_monitor"]["checked_after_trace"] = False
+            cases.append((incomplete_monitor, "runtime module monitor did not complete"))
 
             changed_revision = copy.deepcopy(build_manifest)
             revision_record = next(
                 library
                 for library in changed_revision["build"]["runtime_libraries"]
-                if "build-info" in library["roles"])
+                if library["role"] == "build-info")
             revision_record["revision"] = "b" * 40
+            next(
+                library
+                for library in changed_revision["build"]["runtime_libraries_post"]
+                if library["role"] == "build-info")["revision"] = "b" * 40
             cases.append((changed_revision, "revision mismatch"))
 
             duplicate_role = copy.deepcopy(build_manifest)
             role_records = duplicate_role["build"]["runtime_libraries"]
-            next(library for library in role_records if not library["roles"])["roles"] = ["llama"]
+            next(library for library in role_records if library["role"].startswith("runtime:"))["role"] = "llama"
+            duplicate_role["build"]["runtime_libraries_post"] = copy.deepcopy(role_records)
             cases.append((duplicate_role, "role is invalid"))
 
-            external = root / "external" / "libggml-injected.so"
+            duplicate_component = copy.deepcopy(build_manifest)
+            duplicate_component["build"]["runtime_libraries"][1]["component"] = (
+                duplicate_component["build"]["runtime_libraries"][0]["component"])
+            duplicate_component["build"]["runtime_libraries_post"] = copy.deepcopy(
+                duplicate_component["build"]["runtime_libraries"])
+            cases.append((duplicate_component, "component is invalid"))
+
+            selected_backend = copy.deepcopy(build_manifest)
+            selected_backend["build"]["runtime_profile"]["selected_backend_component"] = "ggml-blas"
+            cases.append((selected_backend, "selected backend component is not ggml-hip"))
+
+            filename = copy.deepcopy(build_manifest)
+            filename["build"]["runtime_libraries"][0]["filename"] = "other.so"
+            filename["build"]["runtime_libraries_post"] = copy.deepcopy(
+                filename["build"]["runtime_libraries"])
+            cases.append((filename, "path differs from the exact runtime profile"))
+
+            receipt_digest = copy.deepcopy(build_manifest)
+            receipt_digest["build"]["runtime_receipt_sha256"] = "f" * 64
+            cases.append((receipt_digest, "runtime receipt SHA-256 mismatch"))
+
+            external = root / "external" / "libggml-blas.so"
             external.parent.mkdir()
-            external.write_bytes(b"injected")
+            external.write_bytes(b"blas")
             external_manifest = copy.deepcopy(build_manifest)
-            external_manifest["build"]["runtime_libraries"].append({
-                "path": str(external.resolve()),
-                "sha256": trace.sha256_file(external),
-                "roles": [],
+            external_record = next(
+                library
+                for library in external_manifest["build"]["runtime_libraries"]
+                if library["component"] == "ggml-blas")
+            external_record["path"] = str(external.resolve())
+            external_manifest["build"]["runtime_libraries"].sort(key=lambda record: record["path"])
+            external_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+                external_manifest["build"]["runtime_libraries"])
+            cases.append((external_manifest, "path differs from the exact runtime profile"))
+
+            catalogued_not_profile = copy.deepcopy(build_manifest)
+            injected = library_directory / "libggml-injected.so"
+            injected.write_bytes(b"injected")
+            catalogued_not_profile["build"]["runtime_libraries"].append({
+                "component": "ggml-injected",
+                "filename": injected.name,
+                "path": str(injected.resolve()),
+                "sha256": trace.sha256_file(injected),
+                "role": "runtime:ggml-injected",
                 "revision": None,
             })
-            external_manifest["build"]["runtime_libraries"].sort(key=lambda record: record["path"])
-            cases.append((external_manifest, "outside the exporter runtime directory"))
+            catalogued_not_profile["build"]["runtime_libraries"].sort(key=lambda record: record["path"])
+            catalogued_not_profile["build"]["runtime_libraries_post"] = copy.deepcopy(
+                catalogued_not_profile["build"]["runtime_libraries"])
+            cases.append((catalogued_not_profile, "component is invalid"))
 
             duplicate_path = copy.deepcopy(build_manifest)
             duplicate_path["build"]["runtime_libraries"][1]["path"] = (
                 duplicate_path["build"]["runtime_libraries"][0]["path"])
+            duplicate_path["build"]["runtime_libraries_post"] = copy.deepcopy(
+                duplicate_path["build"]["runtime_libraries"])
             cases.append((duplicate_path, "duplicated or unsorted"))
 
             for candidate, message in cases:
@@ -2461,18 +3215,32 @@ class TraceFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             external = Path(temp) / injected.name
             shutil.copy2(injected, external)
-            environment = dict(os.environ)
             variable = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
-            environment[variable] = str(external)
-            rejected = subprocess.run(
-                [str(binary.resolve()), "--version"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
-            )
-            self.assertNotEqual(rejected.returncode, 0)
-            self.assertIn("outside the exporter runtime directory", rejected.stderr)
+            inside = binary.parent / "renamed-injected.module"
+            shutil.copy2(injected, inside)
+            try:
+                for name, injected_path in (("outside", external), ("renamed-inside", inside)):
+                    with self.subTest(name=name):
+                        environment = dict(os.environ)
+                        environment[variable] = str(injected_path)
+                        rejected = subprocess.run(
+                            [str(binary.resolve()), "--version"],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=environment,
+                        )
+                        self.assertNotEqual(rejected.returncode, 0)
+                        self.assertIn("forbids loader override", rejected.stderr)
+            finally:
+                inside.unlink(missing_ok=True)
+
+    def test_python_runner_rejects_loader_overrides(self) -> None:
+        for variable in trace.FORBIDDEN_LOADER_ENVIRONMENT:
+            with self.subTest(variable=variable), mock.patch.dict(
+                    os.environ, {variable: "/tmp/untrusted-runtime"}, clear=True):
+                with self.assertRaisesRegex(trace.TraceError, variable):
+                    trace.reject_loader_overrides()
 
     def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2536,7 +3304,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_rejects_cross_runtime_and_unknown_audit_envelopes(self) -> None:
         for mutation, message in (
                 (lambda value: value["audits"].update({"unknown": {}}), "audit envelope"),
-                (lambda value: value["audits"]["pre"].update({"watchdog": {}}), "audit kinds")):
+                (lambda value: value["audits"]["pre"].update({"watchdog": {}}), "audit reference")):
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp) / "trace"
                 trace_manifest = manifest("ds4")
@@ -2777,6 +3545,12 @@ class TraceFormatTests(unittest.TestCase):
                 "--corpus-name", "correctness-prose.txt",
                 "--corpus-sha256", trace.CORPUS_SHA256["correctness-prose.txt"],
                 "--prompt-provenance", str(root / "prompt.json"),
+                "--signer-principal", self.signer_principals["ds4"],
+                "--signing-key", str(self.signing_keys["ds4"]),
+                "--execution-challenge", TEST_CHALLENGE,
+                "--run-id", TEST_RUN_IDS["ds4"],
+                "--authorization-issued-unix", str(TEST_AUTH_ISSUED),
+                "--authorization-expires-unix", str(TEST_AUTH_EXPIRES),
                 "--preflight-only",
             ]
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
@@ -3109,7 +3883,9 @@ class TraceFormatTests(unittest.TestCase):
             second = Path(temp) / "second"
             with trace.TraceBundleWriter(first, manifest("llama.cpp")) as writer:
                 add_required_events(writer)
-            with trace.TraceBundleWriter(second, manifest("llama.cpp")) as writer:
+            second_manifest = manifest("llama.cpp")
+            second_manifest["authorization"]["run_id"] = "strix-llama-test-run-2"
+            with trace.TraceBundleWriter(second, second_manifest) as writer:
                 add_required_events(writer)
             result = trace.local_report(
                 trace.TraceBundle(first),
@@ -3119,6 +3895,21 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(result["status"], "BRINGUP PASS")
             self.assertNotEqual(result["status"], "TARGET PASS")
             self.assertEqual(result["cross_runtime_status"], "INCOMPLETE")
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(
+                    trace.command_compare_local(Namespace(
+                        mode="self-consistency",
+                        left=first,
+                        right=second,
+                        left_signer_principal=self.signer_principal,
+                        right_signer_principal=self.signer_principal,
+                        execution_challenge=TEST_CHALLENGE,
+                        left_run_id=TEST_RUN_IDS["llama.cpp"],
+                        right_run_id="strix-llama-test-run-2",
+                        report=None,
+                    )),
+                    0,
+                )
 
     def test_local_base_regression_requires_attested_oracle_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3128,10 +3919,36 @@ class TraceFormatTests(unittest.TestCase):
             base_manifest["revision"] = "b" * 40
             base_manifest["candidate"]["revision"] = "b" * 40
             for library in base_manifest["build"]["runtime_libraries"]:
-                if set(library["roles"]) & {"build-info", "ggml"}:
+                if library["component"] in {"llama-common", "ggml-base"}:
                     library["revision"] = "b" * 40
+            base_manifest["build"]["runtime_libraries_post"] = copy.deepcopy(
+                base_manifest["build"]["runtime_libraries"])
+            receipt = {
+                "format": "dsv41-runtime-receipt",
+                "version": 1,
+                "revision": "b" * 40,
+                "profile": base_manifest["build"]["runtime_profile"]["name"],
+                "components": sorted(
+                    [
+                        {
+                            "component": library["component"],
+                            "filename": library["filename"],
+                            "sha256": library["sha256"],
+                            "revision": library["revision"],
+                        }
+                        for library in base_manifest["build"]["runtime_libraries"]
+                    ],
+                    key=lambda item: item["component"],
+                ),
+            }
+            receipt_sha256 = trace.sha256_bytes(trace.canonical_json(receipt).encode("ascii"))
+            base_manifest["build"]["runtime_receipt_sha256"] = receipt_sha256
             base_manifest["candidate"]["runtime_libraries_sha256"] = trace.sha256_bytes(
-                trace.canonical_json(base_manifest["build"]["runtime_libraries"]).encode("ascii"))
+                trace.canonical_json({
+                    "pre": base_manifest["build"]["runtime_libraries"],
+                    "post": base_manifest["build"]["runtime_libraries_post"],
+                }).encode("ascii"))
+            base_manifest["candidate"]["runtime_receipt_sha256"] = receipt_sha256
             with trace.TraceBundleWriter(base, base_manifest) as writer:
                 add_required_events(writer)
             with trace.TraceBundleWriter(integrated, manifest("llama.cpp")) as writer:

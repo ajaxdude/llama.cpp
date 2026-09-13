@@ -12,13 +12,18 @@ from preflight import PreflightError, require_nvme_path, resolved, run_strix_pre
 from trace_format import (
     ADMITTED_BATCH,
     ADMITTED_UBATCH,
+    APPROVED_TRACE_SIGNERS,
+    CANDIDATE_LANE,
     CORPUS_SHA256,
     MODEL_SHA256,
     REQUIRED_EXPERT_CACHE_MIB,
     REQUIRED_EXPERT_SLOTS,
     TraceError,
+    execution_authorization,
+    reject_loader_overrides,
     sha256_file,
     strict_json_loads,
+    validate_signing_identity,
 )
 
 CORPORA = (
@@ -30,7 +35,12 @@ CORPORA = (
 
 
 def run(command: list[str]) -> None:
-    print("exec:", " ".join(command), file=sys.stderr)
+    displayed = list(command)
+    if "--signing-key" in displayed:
+        index = displayed.index("--signing-key")
+        if index + 1 < len(displayed):
+            displayed[index + 1] = "<redacted>"
+    print("exec:", " ".join(displayed), file=sys.stderr)
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"command failed with status {result.returncode}")
@@ -119,6 +129,12 @@ def main() -> int:
     parser.add_argument("--expert-cache-slots", type=int, default=REQUIRED_EXPERT_SLOTS)
     parser.add_argument("--expert-cache-mib", type=int, default=REQUIRED_EXPERT_CACHE_MIB)
     parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
+    parser.add_argument("--signer-principal", required=True)
+    parser.add_argument("--signing-key", type=Path, required=True)
+    parser.add_argument("--execution-challenge", required=True)
+    parser.add_argument("--run-id-prefix", required=True)
+    parser.add_argument("--authorization-issued-unix", type=int, required=True)
+    parser.add_argument("--authorization-expires-unix", type=int, required=True)
     args = parser.parse_args()
 
     try:
@@ -135,12 +151,27 @@ def main() -> int:
         if args.expert_cache_mib != REQUIRED_EXPERT_CACHE_MIB:
             raise PreflightError(
                 f"DeepSeek V4.1 correctness matrix requires {REQUIRED_EXPERT_CACHE_MIB} MiB expert cache")
+        reject_loader_overrides()
+        execution_authorization(
+            lane=CANDIDATE_LANE,
+            challenge=args.execution_challenge,
+            run_id=f"{args.run_id_prefix}-preflight",
+            issued_unix=args.authorization_issued_unix,
+            expires_unix=args.authorization_expires_unix,
+        )
+        output_candidate = resolved(args.output)
         if not args.llama_only:
             raise PreflightError(
                 "cross-runtime capture must run on separate Strix and Apple hosts; "
                 "use --llama-only here and compare completed bundles with trace_format.py")
+        validate_signing_identity(
+            args.signing_key,
+            args.signer_principal,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+            forbidden_root=output_candidate,
+        )
         repo = resolved(args.repo)
-        output = require_nvme_path(args.output, "matrix output")
+        output = require_nvme_path(output_candidate, "matrix output")
         model = require_nvme_path(args.model, "model")
         if not model.is_file():
             raise PreflightError(f"model is not a file: {model}")
@@ -222,6 +253,7 @@ def main() -> int:
                 for corpus in corpus_records:
                     stem = Path(corpus["name"]).stem
                     case = f"{stem}-c{context}-ub{ubatch}"
+                    run_id = f"{args.run_id_prefix}-{case}"
                     llama_output = output / "llama" / case
                     prompt = prepared_prompts[corpus["name"]]["path"]
                     provenance = prepared_prompts[corpus["name"]]["provenance_path"]
@@ -250,6 +282,12 @@ def main() -> int:
                         "--device", args.device,
                         "--expert-cache-slots", str(args.expert_cache_slots),
                         "--expert-cache-mib", str(args.expert_cache_mib),
+                        "--signer-principal", args.signer_principal,
+                        "--signing-key", str(resolved(args.signing_key)),
+                        "--execution-challenge", args.execution_challenge,
+                        "--run-id", run_id,
+                        "--authorization-issued-unix", str(args.authorization_issued_unix),
+                        "--authorization-expires-unix", str(args.authorization_expires_unix),
                         *common,
                     ])
                     results.append({
@@ -257,6 +295,7 @@ def main() -> int:
                         "status": "BRINGUP TRACE CAPTURED",
                         "cross_runtime_status": "INCOMPLETE",
                         "trace": str(llama_output),
+                        "run_id": run_id,
                     })
 
         summary = {
@@ -268,6 +307,9 @@ def main() -> int:
             "candidate_revision": args.candidate_revision,
             "base_revision": args.base_revision,
             "candidate_diff_sha256": args.candidate_diff_sha256,
+            "signer_principal": args.signer_principal,
+            "execution_challenge": args.execution_challenge,
+            "run_id_prefix": args.run_id_prefix,
             "corpora": corpus_records,
             "prompts": prompt_records,
             "contexts": args.contexts,

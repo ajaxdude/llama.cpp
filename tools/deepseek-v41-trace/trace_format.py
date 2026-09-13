@@ -6,16 +6,31 @@ import json
 import math
 import os
 import re
+import stat
 import struct
+import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterable
+from typing import Any, Iterable
 
 TRACE_FORMAT = "dsv41-trace"
 TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 APPROVED_EXPORTERS: dict[str, str] = {}
+APPROVED_TRACE_SIGNERS: dict[str, dict[str, str]] = {}
+SEAL_FORMAT = "dsv41-trace-bundle-signature"
+SEAL_VERSION = 1
+SEAL_NAMESPACE = "dsv41-trace-bundle-v1"
+SEAL_DOMAIN_PREFIX = b"dsv41-trace-bundle-v1\n"
+SIGNATURE_NAME = "bundle-signature.json"
+CANDIDATE_LANE = "strix-llama-candidate-v1"
+ORACLE_LANE = "apple-ds4-oracle-v1"
+AUTHORIZATION_FORMAT = "dsv41-execution-authorization"
+AUTHORIZATION_VERSION = 1
+MAX_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 MODEL_SHA256 = "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
 REPOSITORY = "halo-box/strix-llama.cpp"
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
@@ -53,6 +68,21 @@ CORPUS_SHA256 = {
 MANIFEST_NAME = "manifest.json"
 EVENTS_NAME = "events.jsonl"
 BLOBS_DIR = "blobs"
+FORBIDDEN_LOADER_ENVIRONMENT = (
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_IMAGE_SUFFIX",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_ROOT_PATH",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    "GGML_BACKEND_PATH",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+)
 
 DTYPE_SIZES = {
     "f32": 4,
@@ -95,6 +125,83 @@ DEEPSEEK41_EXPECTED_COMPONENTS = {
 
 class TraceError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TraceVerifier:
+    principal: str
+    trusted_signers: dict[str, dict[str, str]]
+    ssh_keygen: Path
+    expected_lane: str
+    expected_challenge: str
+    expected_run_id: str
+    verification_unix: int
+    seen_run_ids: set[str] | None = None
+    test_only: bool = False
+
+    @classmethod
+    def production(
+            cls,
+            principal: str,
+            *,
+            expected_lane: str,
+            expected_challenge: str,
+            expected_run_id: str,
+            verification_unix: int | None,
+            seen_run_ids: set[str] | None = None) -> "TraceVerifier":
+        return cls(
+            principal=principal,
+            trusted_signers=APPROVED_TRACE_SIGNERS,
+            ssh_keygen=trusted_ssh_keygen_path(),
+            expected_lane=expected_lane,
+            expected_challenge=expected_challenge,
+            expected_run_id=expected_run_id,
+            verification_unix=int(time.time()) if verification_unix is None else verification_unix,
+            seen_run_ids=seen_run_ids,
+        )
+
+    @classmethod
+    def for_tests(
+            cls,
+            principal: str,
+            public_key: str,
+            *,
+            lane: str,
+            runtime: str,
+            runtime_profile: str,
+            expected_challenge: str,
+            expected_run_id: str,
+            verification_unix: int | None = None,
+            ssh_keygen: Path | None = None,
+            seen_run_ids: set[str] | None = None) -> "TraceVerifier":
+        return cls(
+            principal=principal,
+            trusted_signers={
+                principal: {
+                    "public_key": public_key,
+                    "lane": lane,
+                    "runtime": runtime,
+                    "runtime_profile": runtime_profile,
+                },
+            },
+            ssh_keygen=ssh_keygen or trusted_ssh_keygen_path(),
+            expected_lane=lane,
+            expected_challenge=expected_challenge,
+            expected_run_id=expected_run_id,
+            verification_unix=verification_unix,
+            seen_run_ids=seen_run_ids,
+            test_only=True,
+        )
+
+
+@dataclass(frozen=True)
+class BundleFileReceipt:
+    device: int
+    inode: int
+    byte_count: int
+    modified_ns: int
+    changed_ns: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -144,8 +251,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def reject_loader_overrides(environment: dict[str, str] | None = None) -> None:
+    values = os.environ if environment is None else environment
+    active = sorted(name for name in FORBIDDEN_LOADER_ENVIRONMENT if values.get(name))
+    if active:
+        raise TraceError("production trace execution forbids loader overrides: " + ", ".join(active))
+
+
 def canonical_json(data: Any) -> str:
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
 
 
 def strict_json_loads(data: str) -> Any:
@@ -157,10 +271,708 @@ def strict_json_loads(data: str) -> Any:
             result[key] = value
         return result
 
+    def reject_constant(value: str) -> None:
+        raise TraceError(f"invalid JSON constant: {value}")
+
     try:
-        return json.loads(data, object_pairs_hook=reject_duplicates)
+        return json.loads(
+            data,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+        )
     except json.JSONDecodeError as error:
         raise TraceError(f"invalid JSON: {error}") from error
+
+
+def trusted_ssh_keygen_path() -> Path:
+    if sys.platform == "win32":
+        return Path(r"C:\Windows\System32\OpenSSH\ssh-keygen.exe")
+    if sys.platform in ("darwin", "linux"):
+        return Path("/usr/bin/ssh-keygen")
+    raise TraceError(f"unsupported platform for trace signature verification: {sys.platform}")
+
+
+def _validate_ssh_keygen(path: Path) -> Path:
+    if not path.is_absolute() or path.is_symlink():
+        raise TraceError("trusted ssh-keygen path must be an absolute non-symlink")
+    try:
+        mode = path.stat().st_mode
+    except OSError as error:
+        raise TraceError(f"cannot inspect trusted ssh-keygen: {error}") from error
+    if not stat.S_ISREG(mode) or not os.access(path, os.X_OK):
+        raise TraceError("trusted ssh-keygen is not an executable regular file")
+    try:
+        result = subprocess.run(
+            [str(path), "-Y", "verify"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TraceError(f"cannot probe trusted ssh-keygen: {error}") from error
+    diagnostic = (result.stdout + result.stderr).lower()
+    if result.returncode == 0 or any(
+            marker in diagnostic for marker in ("unknown option", "illegal option", "unknown operation")):
+        raise TraceError("trusted ssh-keygen lacks required -Y signature support")
+    return path
+
+
+def _ssh_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("SSH_AUTH_SOCK", None)
+    environment.pop("SSH_AGENT_PID", None)
+    return environment
+
+
+def _validate_principal(principal: str) -> None:
+    if not isinstance(principal, str) or re.fullmatch(r"[A-Za-z0-9._@+-]{1,128}", principal) is None:
+        raise TraceError("trace signer principal is invalid")
+
+
+def _signer_policy(
+        trusted_signers: dict[str, dict[str, str]],
+        principal: str) -> dict[str, str]:
+    _validate_principal(principal)
+    policy = trusted_signers.get(principal)
+    if not isinstance(policy, dict) or set(policy) != {
+            "public_key", "lane", "runtime", "runtime_profile"}:
+        raise TraceError(f"trace signer principal is not approved: {principal}")
+    expected = {
+        CANDIDATE_LANE: ("llama.cpp", "sibling-lib"),
+        ORACLE_LANE: ("ds4", "apple-metal"),
+    }.get(policy.get("lane"))
+    if expected is None or (policy.get("runtime"), policy.get("runtime_profile")) != expected:
+        raise TraceError("trace signer policy is invalid")
+    _normalize_public_key(policy.get("public_key", ""))
+    return policy
+
+
+def _normalize_public_key(public_key: str, *, allow_comment: bool = False) -> str:
+    fields = public_key.strip().split()
+    expected_fields = len(fields) >= 2 if allow_comment else len(fields) == 2
+    if not expected_fields or fields[0] != "ssh-ed25519" or re.fullmatch(
+            r"[A-Za-z0-9+/]+={0,2}", fields[1]) is None:
+        raise TraceError("trace signer public key must be an OpenSSH Ed25519 key")
+    return " ".join(fields[:2])
+
+
+def validate_execution_authorization(
+        manifest: dict[str, Any],
+        *,
+        policy: dict[str, str],
+        expected_lane: str,
+        expected_challenge: str,
+        expected_run_id: str,
+        verification_unix: int,
+        seen_run_ids: set[str] | None = None) -> None:
+    if expected_lane not in {CANDIDATE_LANE, ORACLE_LANE}:
+        raise TraceError("externally expected execution lane is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", expected_challenge) is None:
+        raise TraceError("externally expected execution challenge is invalid")
+    run_prefix = "strix-llama-" if expected_lane == CANDIDATE_LANE else "apple-ds4-"
+    if re.fullmatch(re.escape(run_prefix) + r"[A-Za-z0-9._-]{1,96}", expected_run_id) is None:
+        raise TraceError("externally expected lane run ID is invalid")
+    if type(verification_unix) is not int or verification_unix <= 0:
+        raise TraceError("trace verification time is invalid")
+    authorization = manifest.get("authorization")
+    if not isinstance(authorization, dict):
+        raise TraceError("manifest execution authorization is missing")
+    _require_exact_keys(
+        authorization,
+        {"format", "version", "lane", "challenge", "run_id", "issued_unix", "expires_unix"},
+        "manifest execution authorization",
+    )
+    if authorization.get("format") != AUTHORIZATION_FORMAT or (
+            authorization.get("version") != AUTHORIZATION_VERSION):
+        raise TraceError("manifest execution authorization version is invalid")
+    if authorization.get("lane") != expected_lane or policy["lane"] != expected_lane:
+        raise TraceError("trace signer is not approved for the expected execution lane")
+    if authorization.get("challenge") != expected_challenge:
+        raise TraceError("manifest execution challenge differs from the external challenge")
+    if authorization.get("run_id") != expected_run_id:
+        raise TraceError("manifest lane run ID differs from the external run ID")
+    issued_unix = authorization.get("issued_unix")
+    expires_unix = authorization.get("expires_unix")
+    if type(issued_unix) is not int or type(expires_unix) is not int or (
+            issued_unix <= 0 or expires_unix <= issued_unix or
+            expires_unix - issued_unix > MAX_AUTHORIZATION_LIFETIME_SECONDS):
+        raise TraceError("manifest execution authorization validity window is invalid")
+    if verification_unix < issued_unix or verification_unix > expires_unix:
+        raise TraceError("manifest execution authorization is expired or not yet valid")
+    runtime = manifest.get("runtime")
+    if runtime != policy["runtime"]:
+        raise TraceError("trace signer runtime role does not match the signed manifest")
+    runtime_profile = (
+        manifest.get("build", {}).get("runtime_profile", {}).get("name")
+        if runtime == "llama.cpp"
+        else manifest.get("accelerator", {}).get("runtime_kind")
+    )
+    if runtime_profile != policy["runtime_profile"]:
+        raise TraceError("trace signer runtime profile does not match the signed manifest")
+    if seen_run_ids is not None:
+        if expected_run_id in seen_run_ids:
+            raise TraceError("trace lane run ID was reused")
+        seen_run_ids.add(expected_run_id)
+
+
+def execution_authorization(
+        *,
+        lane: str,
+        challenge: str,
+        run_id: str,
+        issued_unix: int,
+        expires_unix: int) -> dict[str, Any]:
+    runtime, profile = {
+        CANDIDATE_LANE: ("llama.cpp", "sibling-lib"),
+        ORACLE_LANE: ("ds4", "apple-metal"),
+    }.get(lane, (None, None))
+    policy = {
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "lane": lane,
+        "runtime": runtime,
+        "runtime_profile": profile,
+    }
+    authorization = {
+        "format": AUTHORIZATION_FORMAT,
+        "version": AUTHORIZATION_VERSION,
+        "lane": lane,
+        "challenge": challenge,
+        "run_id": run_id,
+        "issued_unix": issued_unix,
+        "expires_unix": expires_unix,
+    }
+    manifest = {
+        "runtime": runtime,
+        "authorization": authorization,
+        "build": {"runtime_profile": {"name": profile}},
+        "accelerator": {"runtime_kind": profile},
+    }
+    validate_execution_authorization(
+        manifest,
+        policy=policy,
+        expected_lane=lane,
+        expected_challenge=challenge,
+        expected_run_id=run_id,
+        verification_unix=int(time.time()),
+    )
+    return authorization
+
+
+def bind_execution_authorization(root: Path, authorization: dict[str, Any]) -> None:
+    manifest_path = root / MANIFEST_NAME
+    try:
+        manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, TraceError) as error:
+        raise TraceError(f"cannot bind execution authorization: {error}") from error
+    if not isinstance(manifest, dict):
+        raise TraceError("cannot bind execution authorization to a non-object manifest")
+    if "authorization" in manifest:
+        raise TraceError("manifest execution authorization is already present")
+    manifest["authorization"] = authorization
+    temporary = manifest_path.with_suffix(".tmp")
+    temporary.write_bytes(_canonical_json_bytes(manifest))
+    os.replace(temporary, manifest_path)
+
+
+def validate_signing_identity(
+        private_key: Path,
+        principal: str,
+        *,
+        trusted_signers: dict[str, dict[str, str]] = APPROVED_TRACE_SIGNERS,
+        ssh_keygen: Path | None = None,
+        forbidden_root: Path | None = None) -> tuple[Path, str]:
+    policy = _signer_policy(trusted_signers, principal)
+    expected_key = policy["public_key"]
+    executable = _validate_ssh_keygen(ssh_keygen or trusted_ssh_keygen_path())
+    key_path = private_key.resolve()
+    if private_key.is_symlink() or not key_path.is_file():
+        raise TraceError("trace signing key must be a regular non-symlink file")
+    key_stat = key_path.stat()
+    if os.name != "nt":
+        if key_stat.st_uid != os.getuid():
+            raise TraceError("trace signing key is not owned by the current user")
+        if key_stat.st_mode & 0o077:
+            raise TraceError("trace signing key permissions are too broad")
+    if forbidden_root is not None:
+        try:
+            key_path.relative_to(forbidden_root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise TraceError("trace signing key must be outside the bundle")
+    try:
+        result = subprocess.run(
+            [str(executable), "-y", "-f", str(key_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_ssh_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TraceError(f"cannot derive trace signing public key: {error}") from error
+    if result.returncode != 0:
+        raise TraceError("cannot derive trace signing public key")
+    derived_key = _normalize_public_key(result.stdout, allow_comment=True)
+    if derived_key != _normalize_public_key(expected_key):
+        raise TraceError("trace signing key does not match the approved signer")
+    return executable, derived_key
+
+
+def _canonical_json_bytes(data: Any) -> bytes:
+    return (canonical_json(data) + "\n").encode("ascii")
+
+
+def _bundle_path_parts(relative: str) -> tuple[str, ...]:
+    if not isinstance(relative, str) or not relative or any(ord(character) > 0x7f for character in relative):
+        raise TraceError(f"trace path is not portable ASCII: {relative!r}")
+    if "\\" in relative or "%" in relative or relative.startswith("/") or relative.startswith("//") or (
+            re.match(r"^[A-Za-z]:", relative) is not None):
+        raise TraceError(f"trace path is outside the bundle: {relative}")
+    parts = relative.split("/")
+    if any(
+            not part or part in {".", ".."} or re.fullmatch(r"[A-Za-z0-9._-]+", part) is None
+            for part in parts):
+        raise TraceError(f"trace path is not canonical: {relative}")
+    if PurePosixPath(*parts).as_posix() != relative:
+        raise TraceError(f"trace path is not canonical: {relative}")
+    return tuple(parts)
+
+
+def _safe_bundle_file(root: Path, relative: str) -> Path:
+    parts = _bundle_path_parts(relative)
+    candidate = root
+    for part in parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise TraceError(f"trace path must not use symlinks: {relative}")
+    try:
+        candidate.resolve().relative_to(root)
+    except ValueError as error:
+        raise TraceError(f"trace path is outside the bundle: {relative}") from error
+    if not candidate.is_file():
+        raise TraceError(f"trace bundle file is missing or not regular: {relative}")
+    return candidate
+
+
+def _read_bundle_file(
+        root: Path,
+        relative: str,
+        *,
+        retain: bool) -> tuple[BundleFileReceipt, bytes | None]:
+    path = _safe_bundle_file(root, relative)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TraceError(f"cannot open trace bundle file {relative}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise TraceError(f"trace bundle file is not regular: {relative}")
+        if getattr(before, "st_nlink", 1) != 1:
+            raise TraceError(f"trace bundle file must not be hard linked: {relative}")
+        digest = hashlib.sha256()
+        chunks = [] if retain else None
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
+        after = os.fstat(descriptor)
+        path_stat = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise TraceError(f"cannot read trace bundle file {relative}: {error}") from error
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    identity_path = (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+        path_stat.st_ctime_ns,
+    )
+    if identity_before != identity_after or identity_after != identity_path or byte_count != after.st_size:
+        raise TraceError(f"trace bundle file changed while reading: {relative}")
+    receipt = BundleFileReceipt(
+        device=after.st_dev,
+        inode=after.st_ino,
+        byte_count=byte_count,
+        modified_ns=after.st_mtime_ns,
+        changed_ns=after.st_ctime_ns,
+        sha256=digest.hexdigest(),
+    )
+    return receipt, b"".join(chunks) if chunks is not None else None
+
+
+def _read_canonical_json(
+        root: Path,
+        relative: str) -> tuple[dict[str, Any], bytes, BundleFileReceipt]:
+    receipt, retained = _read_bundle_file(root, relative, retain=True)
+    assert retained is not None
+    try:
+        data = retained
+        text = data.decode("ascii")
+        record = strict_json_loads(text)
+    except (UnicodeError, TraceError) as error:
+        raise TraceError(f"cannot read canonical JSON {relative}: {error}") from error
+    if not isinstance(record, dict) or data != _canonical_json_bytes(record):
+        raise TraceError(f"trace JSON is not canonical: {relative}")
+    return record, data, receipt
+
+
+def _read_canonical_jsonl(
+        root: Path,
+        relative: str) -> tuple[list[dict[str, Any]], bytes, BundleFileReceipt]:
+    receipt, retained = _read_bundle_file(root, relative, retain=True)
+    assert retained is not None
+    data = retained
+    if not data or not data.endswith(b"\n"):
+        raise TraceError(f"trace JSONL is empty or truncated: {relative}")
+    records = []
+    for line_number, raw in enumerate(data.splitlines(keepends=True), 1):
+        try:
+            text = raw.decode("ascii")
+            record = strict_json_loads(text)
+        except (UnicodeError, TraceError) as error:
+            raise TraceError(f"invalid JSONL at {relative}:{line_number}: {error}") from error
+        if not isinstance(record, dict) or raw != _canonical_json_bytes(record):
+            raise TraceError(f"trace JSONL is not canonical: {relative}:{line_number}")
+        records.append(record)
+    return records, data, receipt
+
+
+def _bundle_domain(
+        root: Path,
+) -> tuple[
+        bytes,
+        dict[str, Any],
+        list[dict[str, Any]],
+        dict[str, BundleFileReceipt],
+        dict[str, bytes],
+]:
+    if root.is_symlink():
+        raise TraceError("trace root must not be a symlink")
+    try:
+        canonical_root = root.resolve(strict=True)
+    except OSError as error:
+        raise TraceError(f"cannot resolve trace root: {error}") from error
+    if not canonical_root.is_dir():
+        raise TraceError("trace root is not a directory")
+
+    manifest, manifest_bytes, manifest_receipt = _read_canonical_json(canonical_root, MANIFEST_NAME)
+    events, events_bytes, events_receipt = _read_canonical_jsonl(canonical_root, EVENTS_NAME)
+    expected_paths = {MANIFEST_NAME, EVENTS_NAME}
+    receipts = {
+        MANIFEST_NAME: manifest_receipt,
+        EVENTS_NAME: events_receipt,
+    }
+    contents = {
+        MANIFEST_NAME: manifest_bytes,
+        EVENTS_NAME: events_bytes,
+    }
+
+    for event in events:
+        blob = event.get("blob")
+        if not isinstance(blob, str):
+            raise TraceError("event blob reference is invalid")
+        expected_paths.add(blob)
+
+    prompt = manifest.get("prompt")
+    provenance = prompt.get("provenance") if isinstance(prompt, dict) else None
+    if not isinstance(provenance, dict) or not isinstance(provenance.get("path"), str):
+        raise TraceError("prompt provenance reference is missing")
+    expected_paths.add(provenance["path"])
+
+    audits = manifest.get("audits")
+    if not isinstance(audits, dict):
+        raise TraceError("manifest audit envelope is invalid")
+    audit_paths = []
+    referenced_metadata_paths = {provenance["path"]}
+    for phase in ("pre", "post"):
+        phase_audits = audits.get(phase)
+        if not isinstance(phase_audits, dict):
+            raise TraceError(f"manifest {phase} audit set is invalid")
+        for reference in phase_audits.values():
+            if not isinstance(reference, dict) or not isinstance(reference.get("path"), str):
+                raise TraceError(f"manifest {phase} audit reference is invalid")
+            if reference["path"] in referenced_metadata_paths:
+                raise TraceError(f"trace metadata path is referenced more than once: {reference['path']}")
+            referenced_metadata_paths.add(reference["path"])
+            audit_paths.append(reference["path"])
+            expected_paths.add(reference["path"])
+
+    for relative in audit_paths:
+        record, data, receipt = _read_canonical_json(canonical_root, relative)
+        receipts[relative] = receipt
+        contents[relative] = data
+        audit = record.get("data", {}).get("audit")
+        if isinstance(audit, dict) and isinstance(audit.get("path"), str):
+            audit_jsonl = audit["path"]
+            if audit_jsonl in referenced_metadata_paths:
+                raise TraceError(f"trace metadata path is referenced more than once: {audit_jsonl}")
+            referenced_metadata_paths.add(audit_jsonl)
+            expected_paths.add(audit_jsonl)
+            _records, jsonl_data, jsonl_receipt = _read_canonical_jsonl(canonical_root, audit_jsonl)
+            receipts[audit_jsonl] = jsonl_receipt
+            contents[audit_jsonl] = jsonl_data
+
+    _provenance, provenance_data, provenance_receipt = _read_canonical_json(
+        canonical_root,
+        provenance["path"],
+    )
+    receipts[provenance["path"]] = provenance_receipt
+    contents[provenance["path"]] = provenance_data
+
+    actual_paths = set()
+    try:
+        for path in canonical_root.rglob("*"):
+            relative = path.relative_to(canonical_root).as_posix()
+            if path.is_symlink():
+                raise TraceError(f"trace bundle contains a symlink: {relative}")
+            if path.is_file():
+                if relative != SIGNATURE_NAME:
+                    actual_paths.add(relative)
+            elif not path.is_dir():
+                raise TraceError(f"trace bundle contains a nonregular entry: {relative}")
+    except OSError as error:
+        raise TraceError(f"cannot enumerate trace bundle: {error}") from error
+    if actual_paths != expected_paths:
+        missing = sorted(expected_paths - actual_paths)
+        extra = sorted(actual_paths - expected_paths)
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if extra:
+            detail.append("unexpected " + ", ".join(extra))
+        raise TraceError(f"trace signed file set is invalid: {'; '.join(detail)}")
+
+    records = []
+    for relative in sorted(expected_paths, key=lambda value: value.encode("ascii")):
+        _bundle_path_parts(relative)
+        data = contents.get(relative)
+        if data is not None:
+            byte_count = len(data)
+            digest = sha256_bytes(data)
+        else:
+            receipt, _retained = _read_bundle_file(canonical_root, relative, retain=False)
+            receipts[relative] = receipt
+            byte_count = receipt.byte_count
+            digest = receipt.sha256
+        records.append({
+            "path": relative,
+            "byte_count": byte_count,
+            "sha256": digest,
+        })
+    domain = SEAL_DOMAIN_PREFIX + _canonical_json_bytes(records)
+    return domain, manifest, events, receipts, contents
+
+
+def seal_bundle(
+        root: Path,
+        *,
+        private_key: Path,
+        principal: str,
+        expected_lane: str,
+        expected_challenge: str,
+        expected_run_id: str,
+        verification_unix: int | None = None,
+        trusted_signers: dict[str, dict[str, str]] = APPROVED_TRACE_SIGNERS,
+        ssh_keygen: Path | None = None) -> str:
+    root = root.resolve()
+    executable, _public_key = validate_signing_identity(
+        private_key,
+        principal,
+        trusted_signers=trusted_signers,
+        ssh_keygen=ssh_keygen,
+        forbidden_root=root,
+    )
+    key_path = private_key.resolve()
+    signature_path = root / SIGNATURE_NAME
+    if signature_path.exists() or signature_path.is_symlink():
+        raise TraceError("trace signature envelope already exists")
+    domain, manifest, _events, _receipts, _contents = _bundle_domain(root)
+    validate_execution_authorization(
+        manifest,
+        policy=_signer_policy(trusted_signers, principal),
+        expected_lane=expected_lane,
+        expected_challenge=expected_challenge,
+        expected_run_id=expected_run_id,
+        verification_unix=int(time.time()) if verification_unix is None else verification_unix,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="dsv41-trace-sign-") as signing_temp:
+            signing_root = Path(signing_temp).resolve()
+            if os.name != "nt":
+                signing_root.chmod(0o700)
+            domain_path = signing_root / "bundle-domain"
+            signature_file = signing_root / "bundle-domain.sig"
+            with domain_path.open("xb") as stream:
+                stream.write(domain)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if os.name != "nt":
+                domain_path.chmod(0o600)
+            if signature_file.exists() or signature_file.is_symlink():
+                raise TraceError("temporary trace signature output already exists")
+            result = subprocess.run(
+                [
+                    str(executable),
+                    "-Y", "sign",
+                    "-f", str(key_path),
+                    "-n", SEAL_NAMESPACE,
+                    str(domain_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=_ssh_environment(),
+            )
+            if result.returncode != 0:
+                raise TraceError("trusted ssh-keygen failed to sign trace bundle")
+            signature_receipt, signature_bytes = _read_bundle_file(
+                signing_root,
+                signature_file.name,
+                retain=True,
+            )
+            if signature_receipt.byte_count == 0 or signature_receipt.sha256 != sha256_bytes(signature_bytes or b""):
+                raise TraceError("trusted ssh-keygen did not create a stable signature")
+            assert signature_bytes is not None
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TraceError(f"cannot sign trace bundle: {error}") from error
+    try:
+        signature = signature_bytes.decode("ascii")
+    except UnicodeError as error:
+        raise TraceError("trace signature is not ASCII") from error
+    if not signature.startswith("-----BEGIN SSH SIGNATURE-----\n") or not signature.endswith(
+            "-----END SSH SIGNATURE-----\n"):
+        raise TraceError("trusted ssh-keygen returned an invalid signature")
+    envelope = {
+        "format": SEAL_FORMAT,
+        "version": SEAL_VERSION,
+        "namespace": SEAL_NAMESPACE,
+        "principal": principal,
+        "domain_sha256": sha256_bytes(domain),
+        "signature": signature,
+    }
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=root,
+                prefix=".bundle-signature.",
+                delete=False) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(_canonical_json_bytes(envelope))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary_path, signature_path)
+    except FileExistsError as error:
+        raise TraceError("trace signature envelope already exists") from error
+    except OSError as error:
+        raise TraceError(f"cannot install trace signature envelope: {error}") from error
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return envelope["domain_sha256"]
+
+
+def verify_bundle_seal(
+        root: Path,
+        verifier: TraceVerifier,
+) -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+        str,
+        dict[str, BundleFileReceipt],
+        dict[str, bytes],
+]:
+    policy = _signer_policy(verifier.trusted_signers, verifier.principal)
+    approved_key = _normalize_public_key(policy["public_key"])
+    executable = _validate_ssh_keygen(verifier.ssh_keygen)
+    root = root.resolve()
+    envelope, _envelope_bytes, _envelope_receipt = _read_canonical_json(root, SIGNATURE_NAME)
+    _require_exact_keys(
+        envelope,
+        {"format", "version", "namespace", "principal", "domain_sha256", "signature"},
+        "trace signature envelope",
+    )
+    if envelope.get("format") != SEAL_FORMAT or envelope.get("version") != SEAL_VERSION or (
+            envelope.get("namespace") != SEAL_NAMESPACE):
+        raise TraceError("trace signature envelope version is invalid")
+    if envelope.get("principal") != verifier.principal:
+        raise TraceError("trace signature principal differs from the externally expected signer")
+    signature = envelope.get("signature")
+    if not isinstance(signature, str) or not signature.startswith("-----BEGIN SSH SIGNATURE-----\n") or (
+            not signature.endswith("-----END SSH SIGNATURE-----\n")):
+        raise TraceError("trace signature envelope contains an invalid signature")
+    domain, manifest, events, receipts, contents = _bundle_domain(root)
+    validate_execution_authorization(
+        manifest,
+        policy=policy,
+        expected_lane=verifier.expected_lane,
+        expected_challenge=verifier.expected_challenge,
+        expected_run_id=verifier.expected_run_id,
+        verification_unix=verifier.verification_unix,
+        seen_run_ids=verifier.seen_run_ids,
+    )
+    domain_sha256 = sha256_bytes(domain)
+    if envelope.get("domain_sha256") != domain_sha256:
+        raise TraceError("trace signed-domain SHA-256 mismatch")
+    with tempfile.TemporaryDirectory(prefix="dsv41-trace-verify-") as temp:
+        temporary = Path(temp)
+        allowed_signers = temporary / "allowed_signers"
+        signature_file = temporary / "signature"
+        allowed_signers.write_text(
+            f"{verifier.principal} {approved_key}\n",
+            encoding="ascii",
+        )
+        signature_file.write_text(signature, encoding="ascii")
+        try:
+            result = subprocess.run(
+                [
+                    str(executable),
+                    "-Y", "verify",
+                    "-f", str(allowed_signers),
+                    "-I", verifier.principal,
+                    "-n", SEAL_NAMESPACE,
+                    "-s", str(signature_file),
+                ],
+                input=domain,
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=_ssh_environment(),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise TraceError(f"cannot verify trace bundle signature: {error}") from error
+    if result.returncode != 0:
+        raise TraceError("trace bundle signature verification failed")
+    return manifest, events, domain_sha256, receipts, contents
 
 
 def _require_exact_keys(record: dict[str, Any], keys: set[str], label: str) -> None:
@@ -734,46 +1546,69 @@ class TraceBundleWriter:
 
 
 class TraceBundle:
-    def __init__(self, root: Path, verify_blobs: bool = True):
+    def __init__(
+            self,
+            root: Path,
+            verify_blobs: bool = True,
+            *,
+            verifier: TraceVerifier | None = None,
+            signer_principal: str | None = None,
+            expected_lane: str | None = None,
+            expected_challenge: str | None = None,
+            expected_run_id: str | None = None,
+            verification_unix: int | None = None,
+            seen_run_ids: set[str] | None = None):
         if root.is_symlink():
             raise TraceError("trace root must not be a symlink")
         self.root = root.resolve()
-        try:
-            self.manifest = strict_json_loads(self._path(MANIFEST_NAME).read_text(encoding="ascii"))
-        except (OSError, UnicodeError, TraceError) as error:
-            raise TraceError(f"cannot read manifest: {error}") from error
+        if verifier is None:
+            if None in (signer_principal, expected_lane, expected_challenge, expected_run_id):
+                raise TraceError(
+                    "external signer, lane, challenge, and run ID expectations are required")
+            verifier = TraceVerifier.production(
+                signer_principal,
+                expected_lane=expected_lane,
+                expected_challenge=expected_challenge,
+                expected_run_id=expected_run_id,
+                verification_unix=verification_unix,
+                seen_run_ids=seen_run_ids,
+            )
+        elif any(value is not None for value in (
+                signer_principal, expected_lane, expected_challenge, expected_run_id,
+                verification_unix, seen_run_ids)):
+            raise TraceError("trace verifier cannot be combined with separate verification inputs")
+        self.signer_principal = verifier.principal
+        (
+            self.manifest,
+            sealed_events,
+            self.seal_sha256,
+            self._file_receipts,
+            self._retained_files,
+        ) = verify_bundle_seal(self.root, verifier)
         if self.manifest.get("trace_format") != TRACE_FORMAT:
             raise TraceError("manifest trace_format mismatch")
         if self.manifest.get("trace_version") != TRACE_VERSION:
             raise TraceError("manifest trace_version mismatch")
         self._validate_manifest()
-        self.events = self._read_events(verify_blobs)
+        self.events = self._validate_sealed_events(sealed_events, verify_blobs)
         if self.manifest.get("event_count") != len(self.events):
             raise TraceError("manifest event_count mismatch")
         self._validate_coverage()
 
-    def _read_events(self, verify_blobs: bool) -> list[dict[str, Any]]:
+    def _validate_sealed_events(
+            self,
+            sealed_events: list[dict[str, Any]],
+            verify_blobs: bool) -> list[dict[str, Any]]:
         result = []
-        try:
-            stream: BinaryIO
-            with self._path(EVENTS_NAME).open("rb") as stream:
-                for line_number, raw in enumerate(stream, 1):
-                    if not raw.endswith(b"\n"):
-                        raise TraceError(f"events.jsonl is truncated at line {line_number}")
-                    try:
-                        event = strict_json_loads(raw.decode("ascii"))
-                    except (UnicodeError, TraceError) as error:
-                        raise TraceError(f"invalid event at line {line_number}: {error}") from error
-                    validate_event(event)
-                    if verify_blobs:
-                        data = self.read_blob(event)
-                        if len(data) != event["byte_count"]:
-                            raise TraceError(f"truncated blob for event line {line_number}")
-                        if sha256_bytes(data) != event["sha256"]:
-                            raise TraceError(f"corrupt blob for event line {line_number}")
-                    result.append(event)
-        except OSError as error:
-            raise TraceError(f"cannot read events: {error}") from error
+        for line_number, event in enumerate(sealed_events, 1):
+            validate_event(event)
+            if verify_blobs:
+                data = self.read_blob(event)
+                if len(data) != event["byte_count"]:
+                    raise TraceError(f"truncated blob for event line {line_number}")
+                if sha256_bytes(data) != event["sha256"]:
+                    raise TraceError(f"corrupt blob for event line {line_number}")
+            result.append(event)
         return result
 
     def _validate_manifest(self) -> None:
@@ -796,6 +1631,7 @@ class TraceBundle:
             "environment",
             "paths",
             "storage_policy",
+            "authorization",
             "audits",
             "expected",
         }
@@ -811,7 +1647,11 @@ class TraceBundle:
         if not isinstance(self.manifest["build"], dict):
             raise TraceError("manifest build is invalid")
         build_keys = (
-            {"number", "info", "compiler", "target", "path", "sha256", "runtime_libraries"}
+            {
+                "number", "info", "compiler", "target", "path", "sha256",
+                "runtime_profile", "runtime_receipt_sha256",
+                "runtime_libraries", "runtime_libraries_post", "runtime_module_monitor",
+            }
             if self.manifest["runtime"] == "llama.cpp"
             else {"compiler", "target", "path", "sha256"}
         )
@@ -822,7 +1662,9 @@ class TraceBundle:
         if self.manifest["runtime"] == "ds4" and (
                 APPROVED_EXPORTERS.get(build_sha256) != DS4_REVISION):
             raise TraceError("ds4 exporter is not approved for the pinned ds4 revision")
-        for key in build_keys - {"sha256", "number", "runtime_libraries"}:
+        for key in build_keys - {
+                "sha256", "number", "runtime_profile", "runtime_receipt_sha256",
+                "runtime_libraries", "runtime_libraries_post", "runtime_module_monitor"}:
             value = self.manifest["build"].get(key)
             if not isinstance(value, str) or not value:
                 raise TraceError(f"manifest build {key} is invalid")
@@ -836,35 +1678,81 @@ class TraceBundle:
             libraries = self.manifest["build"]["runtime_libraries"]
             if not isinstance(libraries, list) or not libraries:
                 raise TraceError("manifest runtime library identities are invalid")
+            post_libraries = self.manifest["build"]["runtime_libraries_post"]
+            if post_libraries != libraries:
+                raise TraceError("manifest runtime library closure changed during trace generation")
+            module_monitor = self.manifest["build"]["runtime_module_monitor"]
+            if not isinstance(module_monitor, dict):
+                raise TraceError("manifest runtime module monitor is invalid")
+            _require_exact_keys(
+                module_monitor,
+                {"mechanism", "checked_after_trace", "project_additions"},
+                "manifest runtime module monitor",
+            )
+            if module_monitor["mechanism"] not in {"dyld-add-image", "pre-post-snapshot"}:
+                raise TraceError("manifest runtime module monitor mechanism is invalid")
+            if module_monitor["checked_after_trace"] is not True:
+                raise TraceError("manifest runtime module monitor did not complete")
+            if module_monitor["project_additions"] != []:
+                raise TraceError("manifest records a runtime module addition during trace generation")
+            profile = self.manifest["build"]["runtime_profile"]
+            if not isinstance(profile, dict):
+                raise TraceError("manifest runtime profile is invalid")
+            _require_exact_keys(
+                profile,
+                {"name", "components", "selected_backend_component"},
+                "manifest runtime profile",
+            )
+            profile_name = profile.get("name")
+            components = profile.get("components")
+            selected_backend_component = profile.get("selected_backend_component")
+            if profile_name not in {"co-located", "sibling-lib"}:
+                raise TraceError("manifest runtime profile name is invalid")
+            if not isinstance(components, list) or components != sorted(components) or (
+                    len(components) != len(set(components))) or any(
+                        not isinstance(component, str) or re.fullmatch(r"[a-z0-9-]+", component) is None
+                        for component in components):
+                raise TraceError("manifest runtime profile components are invalid")
+            if not {"llama-common", "llama", "ggml", "ggml-base"}.issubset(set(components)):
+                raise TraceError("manifest runtime profile is missing core components")
+            if not isinstance(selected_backend_component, str) or (
+                    selected_backend_component not in components or
+                    selected_backend_component in {"ggml", "ggml-base"} or
+                    not selected_backend_component.startswith("ggml-")):
+                raise TraceError("manifest selected backend component is invalid")
             roles = set()
             paths = set()
+            library_components = set()
             previous_path = None
-            expected_roles = {"build-info", "llama", "ggml", "selected-backend"}
             executable_path = PurePosixPath(build_path)
             binary_directory = executable_path.parent
             library_directory = binary_directory.parent / "lib"
             for library in libraries:
                 _require_exact_keys(
                     library,
-                    {"path", "sha256", "roles", "revision"},
+                    {"component", "filename", "path", "sha256", "role", "revision"},
                     "manifest runtime library",
                 )
+                component = library.get("component")
+                filename = library.get("filename")
                 path = library.get("path")
                 digest = library.get("sha256")
-                library_roles = library.get("roles")
+                role = library.get("role")
                 revision = library.get("revision")
-                if not isinstance(library_roles, list) or any(
-                        not isinstance(role, str) or role not in expected_roles
-                        for role in library_roles):
-                    raise TraceError("manifest runtime library roles are invalid")
-                if len(library_roles) != len(set(library_roles)):
-                    raise TraceError("manifest runtime library role is duplicated")
-                if library_roles != sorted(library_roles):
-                    raise TraceError("manifest runtime library roles are not sorted")
-                for role in library_roles:
-                    if role in roles:
-                        raise TraceError("manifest runtime library role is duplicated")
-                    roles.add(role)
+                if component not in components or component in library_components:
+                    raise TraceError("manifest runtime library component is invalid")
+                library_components.add(component)
+                if not isinstance(filename, str) or PurePosixPath(filename).name != filename:
+                    raise TraceError("manifest runtime library filename is invalid")
+                expected_role = {
+                    "llama-common": "build-info",
+                    "llama": "llama",
+                    "ggml-base": "ggml",
+                    selected_backend_component: "selected-backend",
+                }.get(component, f"runtime:{component}")
+                if role != expected_role or role in roles:
+                    raise TraceError("manifest runtime library role is invalid")
+                roles.add(role)
                 if not isinstance(path, str) or not path.startswith("/") or ".." in PurePosixPath(path).parts or (
                         str(PurePosixPath(path)) != path):
                     raise TraceError("manifest runtime library path is not canonical")
@@ -885,13 +1773,38 @@ class TraceBundle:
                 previous_path = path
                 if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                     raise TraceError("manifest runtime library SHA-256 is invalid")
-                if set(library_roles) & {"build-info", "ggml"}:
+                if component in {"llama-common", "ggml-base"}:
                     if revision != self.manifest["revision"]:
                         raise TraceError("manifest runtime library revision is invalid")
                 elif revision is not None:
                     raise TraceError("manifest runtime library revision is unexpected")
-            if roles != expected_roles:
-                raise TraceError("manifest runtime library identities are incomplete")
+                expected_directory = binary_directory if profile_name == "co-located" else library_directory
+                if runtime_path.parent != expected_directory or runtime_path.name != filename:
+                    raise TraceError("manifest runtime library path differs from the runtime profile")
+            if library_components != set(components):
+                raise TraceError("manifest runtime library set differs from the runtime profile")
+            receipt = {
+                "format": "dsv41-runtime-receipt",
+                "version": 1,
+                "revision": self.manifest["revision"],
+                "profile": profile_name,
+                "components": sorted(
+                    [
+                        {
+                            "component": library["component"],
+                            "filename": library["filename"],
+                            "sha256": library["sha256"],
+                            "revision": library["revision"],
+                        }
+                        for library in libraries
+                    ],
+                    key=lambda item: item["component"],
+                ),
+            }
+            receipt_sha256 = self.manifest["build"].get("runtime_receipt_sha256")
+            if not isinstance(receipt_sha256, str) or receipt_sha256 != sha256_bytes(
+                    canonical_json(receipt).encode("ascii")):
+                raise TraceError("manifest runtime receipt SHA-256 is invalid")
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
@@ -987,7 +1900,7 @@ class TraceBundle:
         if provenance.get("path") != f"provenance/{provenance_sha256}.json":
             raise TraceError("prompt provenance path is not content addressed")
         try:
-            provenance_bytes = self._path(provenance["path"]).read_bytes()
+            provenance_bytes = self._read_verified_file(provenance["path"])
             provenance_record = strict_json_loads(provenance_bytes.decode("ascii"))
         except (OSError, UnicodeError, TraceError) as error:
             raise TraceError(f"cannot read prompt provenance: {error}") from error
@@ -1031,6 +1944,7 @@ class TraceBundle:
                     "executable_path",
                     "executable_sha256",
                     "runtime_libraries_sha256",
+                    "runtime_receipt_sha256",
                 },
                 "llama.cpp candidate attestation",
             )
@@ -1041,7 +1955,8 @@ class TraceBundle:
                     "base_revision",
                     "diff_sha256",
                     "executable_sha256",
-                    "runtime_libraries_sha256"):
+                    "runtime_libraries_sha256",
+                    "runtime_receipt_sha256"):
                 value = candidate.get(key, "")
                 if not isinstance(value, str) or re.fullmatch(
                         r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}", value) is None:
@@ -1058,9 +1973,14 @@ class TraceBundle:
             if candidate["executable_sha256"] != self.manifest["build"]["sha256"]:
                 raise TraceError("candidate executable SHA-256 does not match the trace build")
             runtime_libraries_sha256 = sha256_bytes(
-                canonical_json(self.manifest["build"]["runtime_libraries"]).encode("ascii"))
+                canonical_json({
+                    "pre": self.manifest["build"]["runtime_libraries"],
+                    "post": self.manifest["build"]["runtime_libraries_post"],
+                }).encode("ascii"))
             if candidate["runtime_libraries_sha256"] != runtime_libraries_sha256:
                 raise TraceError("candidate runtime library identities do not match the trace build")
+            if candidate["runtime_receipt_sha256"] != self.manifest["build"]["runtime_receipt_sha256"]:
+                raise TraceError("candidate runtime receipt does not match the trace build")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
@@ -1180,10 +2100,9 @@ class TraceBundle:
         expected_path = f"audits/{phase}/{digest}.json"
         if audit_path != expected_path:
             raise TraceError(f"manifest {phase} {kind} audit path is not content addressed")
-        evidence_path = self._path(audit_path)
         try:
-            evidence = evidence_path.read_bytes()
-        except OSError as error:
+            evidence = self._read_verified_file(audit_path)
+        except TraceError as error:
             raise TraceError(f"cannot read {phase} {kind} audit evidence: {error}") from error
         if sha256_bytes(evidence) != digest:
             raise TraceError(f"{phase} {kind} audit evidence SHA-256 mismatch")
@@ -1439,10 +2358,9 @@ class TraceBundle:
                 raise TraceError(f"{phase} watchdog JSONL path is invalid")
             if type(audit_jsonl.get("event_count")) is not int or audit_jsonl["event_count"] < 2:
                 raise TraceError(f"{phase} watchdog JSONL event count is invalid")
-            jsonl_path = self._path(audit_jsonl["path"])
             try:
-                jsonl_bytes = jsonl_path.read_bytes()
-            except OSError as error:
+                jsonl_bytes = self._read_verified_file(audit_jsonl["path"])
+            except TraceError as error:
                 raise TraceError(f"cannot read {phase} watchdog JSONL audit: {error}") from error
             if sha256_bytes(jsonl_bytes) != jsonl_digest:
                 raise TraceError(f"{phase} watchdog JSONL SHA-256 mismatch")
@@ -1458,17 +2376,25 @@ class TraceBundle:
                 raise TraceError(f"{phase} watchdog JSONL lacks startup evidence")
 
     def read_blob(self, event: dict[str, Any]) -> bytes:
-        try:
-            return self._path(event["blob"]).read_bytes()
-        except OSError as error:
-            raise TraceError(f"cannot read blob {event['blob']}: {error}") from error
+        return self._read_verified_file(event["blob"])
+
+    def _read_verified_file(self, relative: str) -> bytes:
+        retained = self._retained_files.get(relative)
+        if retained is not None:
+            return retained
+        expected = self._file_receipts.get(relative)
+        if expected is None:
+            raise TraceError(f"trace file is outside the signed domain: {relative}")
+        receipt, data = _read_bundle_file(self.root, relative, retain=True)
+        if receipt != expected:
+            raise TraceError(f"trace bundle file changed after signature verification: {relative}")
+        assert data is not None
+        return data
 
     def _path(self, relative: str) -> Path:
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise TraceError(f"trace path is outside the bundle: {relative}")
+        parts = _bundle_path_parts(relative)
         candidate = self.root
-        for part in relative_path.parts:
+        for part in parts:
             candidate = candidate / part
             if candidate.is_symlink():
                 raise TraceError(f"trace path must not use symlinks: {relative}")
@@ -1852,6 +2778,10 @@ def report(
             "left_runtime": left.manifest.get("runtime"),
             "right_runtime": right.manifest.get("runtime"),
             "events_compared": len(left.events),
+            "left_seal_sha256": left.seal_sha256,
+            "right_seal_sha256": right.seal_sha256,
+            "left_signer_principal": left.signer_principal,
+            "right_signer_principal": right.signer_principal,
             "first_divergence": None,
         }
     return {
@@ -1860,12 +2790,22 @@ def report(
         "left_runtime": left.manifest.get("runtime"),
         "right_runtime": right.manifest.get("runtime"),
         "events_compared": 0,
+        "left_seal_sha256": left.seal_sha256,
+        "right_seal_sha256": right.seal_sha256,
+        "left_signer_principal": left.signer_principal,
+        "right_signer_principal": right.signer_principal,
         "first_divergence": mismatch.as_dict(),
     }
 
 
 def command_validate(args: argparse.Namespace) -> int:
-    bundle = TraceBundle(args.bundle)
+    bundle = TraceBundle(
+        args.bundle,
+        signer_principal=getattr(args, "signer_principal", None),
+        expected_lane=getattr(args, "lane", None),
+        expected_challenge=getattr(args, "execution_challenge", None),
+        expected_run_id=getattr(args, "run_id", None),
+    )
     print(canonical_json({
         "status": "valid",
         "runtime": bundle.manifest.get("runtime"),
@@ -1875,7 +2815,30 @@ def command_validate(args: argparse.Namespace) -> int:
 
 
 def command_compare(args: argparse.Namespace) -> int:
-    result = report(TraceBundle(args.left), TraceBundle(args.right))
+    left_principal = getattr(args, "left_signer_principal", None)
+    right_principal = getattr(args, "right_signer_principal", None)
+    challenge = getattr(args, "execution_challenge", None)
+    left_run_id = getattr(args, "left_run_id", None)
+    right_run_id = getattr(args, "right_run_id", None)
+    seen_run_ids: set[str] = set()
+    result = report(
+        TraceBundle(
+            args.left,
+            signer_principal=left_principal,
+            expected_lane=ORACLE_LANE,
+            expected_challenge=challenge,
+            expected_run_id=left_run_id,
+            seen_run_ids=seen_run_ids,
+        ),
+        TraceBundle(
+            args.right,
+            signer_principal=right_principal,
+            expected_lane=CANDIDATE_LANE,
+            expected_challenge=challenge,
+            expected_run_id=right_run_id,
+            seen_run_ids=seen_run_ids,
+        ),
+    )
     text = canonical_json(result) + "\n"
     if args.report:
         args.report.write_text(text, encoding="ascii")
@@ -1930,7 +2893,31 @@ def local_report(left: TraceBundle, right: TraceBundle, mode: str) -> dict[str, 
 
 
 def command_compare_local(args: argparse.Namespace) -> int:
-    result = local_report(TraceBundle(args.left), TraceBundle(args.right), args.mode)
+    left_principal = getattr(args, "left_signer_principal", None)
+    right_principal = getattr(args, "right_signer_principal", None)
+    challenge = getattr(args, "execution_challenge", None)
+    left_run_id = getattr(args, "left_run_id", None)
+    right_run_id = getattr(args, "right_run_id", None)
+    seen_run_ids: set[str] = set()
+    result = local_report(
+        TraceBundle(
+            args.left,
+            signer_principal=left_principal,
+            expected_lane=CANDIDATE_LANE,
+            expected_challenge=challenge,
+            expected_run_id=left_run_id,
+            seen_run_ids=seen_run_ids,
+        ),
+        TraceBundle(
+            args.right,
+            signer_principal=right_principal,
+            expected_lane=CANDIDATE_LANE,
+            expected_challenge=challenge,
+            expected_run_id=right_run_id,
+            seen_run_ids=seen_run_ids,
+        ),
+        args.mode,
+    )
     text = canonical_json(result) + "\n"
     if args.report:
         args.report.write_text(text, encoding="ascii")
@@ -1943,16 +2930,30 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("bundle", type=Path)
+    validate_parser.add_argument("--signer-principal", required=True)
+    validate_parser.add_argument("--lane", choices=(CANDIDATE_LANE, ORACLE_LANE), required=True)
+    validate_parser.add_argument("--execution-challenge", required=True)
+    validate_parser.add_argument("--run-id", required=True)
     validate_parser.set_defaults(func=command_validate)
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("left", type=Path)
     compare_parser.add_argument("right", type=Path)
+    compare_parser.add_argument("--left-signer-principal", required=True)
+    compare_parser.add_argument("--right-signer-principal", required=True)
+    compare_parser.add_argument("--execution-challenge", required=True)
+    compare_parser.add_argument("--left-run-id", required=True)
+    compare_parser.add_argument("--right-run-id", required=True)
     compare_parser.add_argument("--report", type=Path)
     compare_parser.set_defaults(func=command_compare)
     local_parser = subparsers.add_parser("compare-local")
     local_parser.add_argument("mode", choices=("self-consistency", "base-regression"))
     local_parser.add_argument("left", type=Path)
     local_parser.add_argument("right", type=Path)
+    local_parser.add_argument("--left-signer-principal", required=True)
+    local_parser.add_argument("--right-signer-principal", required=True)
+    local_parser.add_argument("--execution-challenge", required=True)
+    local_parser.add_argument("--left-run-id", required=True)
+    local_parser.add_argument("--right-run-id", required=True)
     local_parser.add_argument("--report", type=Path)
     local_parser.set_defaults(func=command_compare_local)
     return parser

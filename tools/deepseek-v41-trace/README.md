@@ -9,6 +9,11 @@ Each trace is a directory:
 - `blobs/<sha256>.bin` stores canonical little-endian tensor bytes. This keeps complete logits and per-token state exact without embedding large numeric arrays in JSON.
 - `audits/pre/<sha256>.json` and `audits/post/<sha256>.json` store immutable safety evidence from both sides of execution.
 - `provenance/<sha256>.json` binds the exact prompt to its fixed corpus, published model, target token count, and prompt-builder executable.
+- `bundle-signature.json` contains the detached OpenSSH signature envelope for the exact bundle file set.
+
+Seal v1 signs `dsv41-trace-bundle-v1\n` followed by canonical JSON records for `manifest.json`, `events.jsonl`, every referenced event blob, every embedded audit, and prompt provenance. Each record binds its canonical relative path, byte count, and SHA-256. Validation rejects missing or added files, symlinks, hard links, nonregular files, path traversal, duplicate metadata references, noncanonical JSON or JSONL, duplicate JSON keys, truncation, concurrent replacement, and every post-seal mutation.
+
+Signer trust is external to the bundle. `APPROVED_TRACE_SIGNERS` maps one restricted ASCII principal to one exact OpenSSH Ed25519 public key, runtime lane, and runtime profile, and is intentionally empty until a separately authorized run. Candidate and oracle signers are not interchangeable. Every signed manifest also binds an externally supplied 256-bit challenge, lane-specific run ID, and bounded validity window. Validation requires those expected values from outside the bundle and rejects missing, mismatched, reused within a comparison, cross-lane, not-yet-valid, or expired authorization. The bundle cannot provide a public key, authoritative principal, verifier path, or allowed-signers file. Validation uses only `/usr/bin/ssh-keygen` on macOS and Linux or `C:\Windows\System32\OpenSSH\ssh-keygen.exe` on Windows, rejects symlinks and unsupported `-Y` implementations, clears SSH-agent influence, and never searches `PATH`. The private signing key must be an owned restrictive regular file outside the bundle and is never copied or logged. Tests use explicit test-only verifiers with ephemeral lane-specific keys; production validation does not trust those keys.
 
 Every manifest and memory audit declares that the expert cache and KV cache are memory-resident and that there are no external cache or state paths. Missing, substituted, or additional file-backed cache/state declarations fail closed.
 
@@ -21,8 +26,14 @@ Internal tensors use raw ggml dimension order, and every dimension must be posit
 Validate or compare bundles:
 
 ```sh
-python3 tools/deepseek-v41-trace/trace_format.py validate TRACE
-python3 tools/deepseek-v41-trace/trace_format.py compare DS4_TRACE LLAMA_TRACE --report report.json
+python3 tools/deepseek-v41-trace/trace_format.py validate TRACE \
+  --signer-principal PRINCIPAL --lane strix-llama-candidate-v1 \
+  --execution-challenge "$CHALLENGE" --run-id "$RUN_ID"
+python3 tools/deepseek-v41-trace/trace_format.py compare DS4_TRACE LLAMA_TRACE \
+  --left-signer-principal DS4_PRINCIPAL --right-signer-principal LLAMA_PRINCIPAL \
+  --execution-challenge "$CHALLENGE" \
+  --left-run-id "$DS4_RUN_ID" --right-run-id "$LLAMA_RUN_ID" \
+  --report report.json
 ```
 
 The first mismatch is reported by phase, decode step, exact token, layer, component, byte offset, flat element index, and per-token component element index. All required components use exact byte comparison. There is no tolerance mode. A ds4 bundle is invalid unless it reports revision `bd66c402070042bf0a79ad6ece8242de4c93680c`.
@@ -51,6 +62,16 @@ ROCm on `gfx1151` is the primary acceptance backend:
 ```sh
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
   cmake -S . -B build-dsv41-trace-rocm \
+    -DBUILD_SHARED_LIBS=ON \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_SERVER=OFF \
+    -DLLAMA_BUILD_APP=OFF \
+    -DLLAMA_BUILD_UI=OFF \
+    -DLLAMA_USE_PREBUILT_UI=OFF \
+    -DLLAMA_OPENSSL=OFF \
+    -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DGGML_HIP=ON \
     -DGPU_TARGETS=gfx1151 \
     -DGGML_NATIVE=ON \
@@ -76,6 +97,8 @@ build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o CPY
 ```
 
 Do not change host ROCm packages for this run. Vulkan can provide secondary coverage, but it cannot replace the required ROCm low-level and oracle evidence. The llama runner selects `ROCm0` explicitly, invokes the exact exporter for a pre-allocation device attestation, and rejects the run unless the backend PCI identity maps to exactly one KFD node reporting `gfx1151`. The native exporter repeats the query before model allocation and verifies that the loaded model still uses the same device.
+
+Static repository builds skip this shared-library trace component instead of failing configuration.
 
 Set `HIP_LAUNCH_BLOCKING=1` on the canonical watchdog command that owns the complete Strix matrix process group. The llama.cpp wrapper fails closed if this variable is absent or different, and every embedded Strix memory, swap, and watchdog audit records it. This Linux/ROCm setting is not an Apple Metal oracle requirement.
 
@@ -119,9 +142,11 @@ The exporter is intentionally external to the canonical ds4 checkout. It must be
 
 The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the normal model, context, batch, ubatch, KV, Flash Attention, offload, and expert-cache arguments. `-bf` supplies the exact prompt bytes, `-n` is the number of greedy decode steps, and `-o` is the trace directory. It also requires `DSV41_TRACE_MEMORY_AUDIT`, `DSV41_TRACE_SWAP_AUDIT`, and `DSV41_TRACE_WATCHDOG_AUDIT` so every run points to its safety evidence. The content-addressed memory audit binds the preflight accelerator and storage attestations; the manifest binds the independently repeated native accelerator attestation.
 
-Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, and repository path. The native exporter embeds the full 40-character candidate revision independently of dynamically loaded build-info, resolves its actual executable path, and enumerates every loaded `llama` and `ggml` project library through the platform loader. It canonicalizes, sorts, and hashes the complete closure, records exact revision evidence for revision-bearing modules, and rejects injected or loader-substituted project libraries outside the exporter `bin` and sibling `lib` roots. The launcher reopens and hashes every recorded module and rejects tracked or untracked checkout changes, prefix-only revision matches, omitted or duplicated roles, substituted executable or runtime-library paths, changed runtime-library bytes, test-only writer output, and any accelerator or loaded-model device mismatch.
+Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, repository path, externally approved signer principal, and matching private signing key. The private key is never copied or logged. Its public half is derived with the fixed trusted `ssh-keygen` executable and must exactly match the source-controlled signer map before model execution.
 
-Production installs no manifest-writing or runtime-path probe option. With `LLAMA_BUILD_TESTS`, CMake builds the non-installed `test-deepseek41-trace-manifest` harness from the same native writer implementation. Its input accepts only model, prompt, audit, expected-coverage, and event-count data; protected runtime, accelerator, path, configuration, build, and environment fields are fixed internally, and the output carries a test-only build marker that `run_llama.py` refuses to bind as a candidate.
+The native exporter embeds the full 40-character candidate revision independently of dynamically loaded build-info, resolves its actual executable path, and validates every loaded `llama`, `ggml`, and enabled backend project library against the build-generated component receipt and selected runtime profile. Component name, filename, canonical path, SHA-256, role, and exact revision-bearing identity must match, and the measured loaded set must equal the predeclared profile set both immediately before protected trace generation and after it completes. Both snapshots and the completed loader-monitor receipt are signed. macOS also monitors loader additions during the protected interval. Missing, duplicated, unclassified, outside-root, renamed inside-root injected, catalogued-but-not-profile, changed, or late-loaded project libraries fail closed. Linux enumerates loaded ELF objects rather than arbitrary memory mappings and accepts non-project ROCm dependencies only from a root-owned, non-writable `/opt/rocm` installation. Production launchers and the native exporter reject dynamic-loader and `GGML_BACKEND_PATH` overrides. The executable hash is bound separately by the signed manifest to avoid link-time hash circularity.
+
+Production installs no manifest-writing or runtime-path probe option. With `LLAMA_BUILD_TESTS`, CMake builds the non-installed `test-deepseek41-trace-manifest` harness from the same native writer implementation. Its input accepts only model, prompt, audit, expected-coverage, and event-count data. Runtime, accelerator, path, configuration, build, and environment evidence comes from measured local state, and CPU or Darwin output is explicitly test-only and cannot satisfy production candidate or signer requirements. The trace install component places the exact receipt libraries beside the tools and sets `@loader_path/../lib` on macOS or `$ORIGIN/../lib` on ELF so installed `--version` needs no loader override. The install test also hashes every installed component and requires exact equality with the receipt embedded after the original library link; install-time rewriting or re-signing fails.
 
 `run_matrix.py --llama-only` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, and captures the llama.cpp side. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the final integration revision, immutable oracle revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass later contexts only after the 32K target passes. The Apple oracle is captured separately with `run_ds4.py`; compare completed per-case bundles with `trace_format.py compare`.
 
@@ -151,6 +176,9 @@ CASE_ROOT="$RUN_ROOT/c32768"
 CANDIDATE_REV="$(git -C "$REPO" rev-parse HEAD)"
 BASE_REV=<full-immutable-oracle-revision>
 DIFF_SHA256="$(git -C "$REPO" diff --binary --no-ext-diff "$BASE_REV" "$CANDIDATE_REV" -- | sha256sum | awk '{print $1}')"
+CHALLENGE=<64-lowercase-hex-execution-challenge>
+AUTH_ISSUED=<unix-seconds>
+AUTH_EXPIRES=<unix-seconds-no-more-than-24h-after-issued>
 
 mkdir -p "$CASE_ROOT/watchdog"
 cd "$REPO"
@@ -175,6 +203,12 @@ HIP_LAUNCH_BLOCKING=1 python3 scripts/strix_memory_watchdog.py \
     --candidate-revision "$CANDIDATE_REV" \
     --base-revision "$BASE_REV" \
     --candidate-diff-sha256 "$DIFF_SHA256" \
+    --signer-principal "$LLAMA_SIGNER_PRINCIPAL" \
+    --signing-key "$LLAMA_SIGNING_KEY" \
+    --execution-challenge "$CHALLENGE" \
+    --run-id-prefix "strix-llama-c32768" \
+    --authorization-issued-unix "$AUTH_ISSUED" \
+    --authorization-expires-unix "$AUTH_EXPIRES" \
     --llama-only \
     --contexts 32768 \
     --ubatches 32 \
@@ -210,7 +244,13 @@ python3 tools/deepseek-v41-trace/run_ds4.py \
   --context 32768 \
   --decode-steps 8 \
   --prefill-chunk 32 \
-  --device Metal0
+  --device Metal0 \
+  --signer-principal "$DS4_SIGNER_PRINCIPAL" \
+  --signing-key "$DS4_SIGNING_KEY" \
+  --execution-challenge "$CHALLENGE" \
+  --run-id "apple-ds4-prose-c32768-ub32" \
+  --authorization-issued-unix "$AUTH_ISSUED" \
+  --authorization-expires-unix "$AUTH_EXPIRES"
 ```
 
 Compare the completed bundle with the matching Strix bundle using `trace_format.py compare`. Repeat for all four corpora before expanding the context matrix.
@@ -253,10 +293,18 @@ For each case (`correctness-prose-c32768-ub32`, `correctness-code-c32768-ub32`, 
 ```sh
 python3 tools/deepseek-v41-trace/trace_format.py compare-local self-consistency \
   "$RUN_A/llama/$CASE" "$RUN_B/llama/$CASE" \
+  --left-signer-principal "$SIGNER_PRINCIPAL" \
+  --right-signer-principal "$SIGNER_PRINCIPAL" \
+  --execution-challenge "$CHALLENGE" \
+  --left-run-id "$RUN_A_ID" --right-run-id "$RUN_B_ID" \
   --report "$REPORTS/$CASE-self.json"
 
 python3 tools/deepseek-v41-trace/trace_format.py compare-local base-regression \
   "$BASE_RUN/llama/$CASE" "$RUN_A/llama/$CASE" \
+  --left-signer-principal "$SIGNER_PRINCIPAL" \
+  --right-signer-principal "$SIGNER_PRINCIPAL" \
+  --execution-challenge "$CHALLENGE" \
+  --left-run-id "$BASE_RUN_ID" --right-run-id "$RUN_A_ID" \
   --report "$REPORTS/$CASE-base.json"
 ```
 
