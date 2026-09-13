@@ -60,6 +60,10 @@ from trace_format import (
     verify_approved_runtime_file_identities,
 )
 
+EXPORTER_ATTESTATION_TIMEOUT_SECONDS = 60
+EXPORTER_TRACE_TIMEOUT_SECONDS = 24 * 60 * 60
+
+
 def git_output(checkout: Path, *args: str) -> str:
     try:
         return subprocess.check_output(
@@ -133,7 +137,10 @@ def run_exporter_command(
         exporter: Path,
         exporter_identity: ExecutableFileReceipt,
         exporter_policy: dict[str, Any],
+        timeout_seconds: int | None = None,
         **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    if type(timeout_seconds) is not int or timeout_seconds <= 0 or "timeout" in kwargs:
+        raise PreflightError("ds4 exporter timeout is invalid")
     result, executed_identity = run_approved_executable(
         command,
         path=exporter,
@@ -141,6 +148,7 @@ def run_exporter_command(
         expected_path=exporter_policy["executable_path"],
         expected_sha256=exporter_policy["executable_sha256"],
         label="ds4 exporter",
+        timeout=timeout_seconds,
         **kwargs,
     )
     if executed_identity != exporter_identity:
@@ -158,6 +166,7 @@ def query_runtime_build_attestation(
         exporter=exporter,
         exporter_identity=exporter_identity,
         exporter_policy=exporter_policy,
+        timeout_seconds=EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
         check=False,
         capture_output=True,
         text=True,
@@ -171,6 +180,61 @@ def query_runtime_build_attestation(
         raise PreflightError(f"ds4 exporter build attestation is invalid: {error}") from error
 
 
+def run_exporter_with_post_attestation(
+        command: list[str],
+        *,
+        operation: str,
+        exporter: Path,
+        exporter_identity: ExecutableFileReceipt,
+        exporter_policy: dict[str, Any],
+        expected_runtime_build: dict[str, Any],
+        timeout_seconds: int,
+        **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    result = None
+    primary_error = None
+    try:
+        result = run_exporter_command(
+            command,
+            exporter=exporter,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
+    except (OSError, subprocess.SubprocessError, TraceError, PreflightError) as error:
+        primary_error = error
+    nonzero_error = None
+    if result is not None and result.returncode != 0:
+        detail = result.stderr.strip() if isinstance(result.stderr, str) else ""
+        nonzero_error = PreflightError(
+            f"{operation} failed: {detail or f'exit {result.returncode}'}")
+    secondary_error = None
+    try:
+        post_runtime_build = query_runtime_build_attestation(
+            exporter,
+            exporter_identity=exporter_identity,
+            exporter_policy=exporter_policy,
+        )
+        if post_runtime_build != expected_runtime_build:
+            raise PreflightError(f"ds4 exporter build identity changed during {operation}")
+    except (OSError, subprocess.SubprocessError, TraceError, PreflightError) as error:
+        secondary_error = error
+    reported_primary = primary_error or nonzero_error
+    if reported_primary is not None:
+        if secondary_error is not None:
+            raise PreflightError(
+                f"{operation} primary failure [{type(reported_primary).__name__}: {reported_primary}]; "
+                f"secondary post-invocation runtime-build attestation failure "
+                f"[{type(secondary_error).__name__}: {secondary_error}]") from reported_primary
+        if primary_error is not None:
+            raise primary_error
+    if secondary_error is not None:
+        raise secondary_error
+    if result is None:
+        raise PreflightError(f"{operation} did not return a result")
+    return result
+
+
 def query_accelerator_attestation(
         exporter: Path,
         device: str,
@@ -178,11 +242,14 @@ def query_accelerator_attestation(
         exporter_identity: ExecutableFileReceipt,
         exporter_policy: dict[str, Any],
         expected_runtime_build: dict[str, Any]) -> dict[str, object]:
-    result = run_exporter_command(
+    result = run_exporter_with_post_attestation(
         [str(exporter), "--dsv41-attest-device", device],
+        operation="selected accelerator query",
         exporter=exporter,
         exporter_identity=exporter_identity,
         exporter_policy=exporter_policy,
+        expected_runtime_build=expected_runtime_build,
+        timeout_seconds=EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
         check=False,
         capture_output=True,
         text=True,
@@ -199,13 +266,6 @@ def query_accelerator_attestation(
         except (TraceError, PreflightError) as error:
             validation_error = PreflightError(
                 f"selected accelerator query returned invalid attestation: {error}")
-    post_runtime_build = query_runtime_build_attestation(
-        exporter,
-        exporter_identity=exporter_identity,
-        exporter_policy=exporter_policy,
-    )
-    if post_runtime_build != expected_runtime_build:
-        raise PreflightError("ds4 exporter build identity changed during accelerator query")
     if validation_error is not None:
         raise validation_error
     if attestation is None:
@@ -593,11 +653,14 @@ def main() -> int:
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
         pre_audit_digests = seal_audits(pre_audits)
         print("exec:", shlex.join(command), file=sys.stderr)
-        result = run_exporter_command(
+        result = run_exporter_with_post_attestation(
             command,
+            operation="ds4 trace execution",
             exporter=exporter,
             exporter_identity=exporter_identity,
             exporter_policy=exporter_policy,
+            expected_runtime_build=pre_runtime_build,
+            timeout_seconds=EXPORTER_TRACE_TIMEOUT_SECONDS,
             cwd=checkout,
             check=False,
         )
@@ -605,13 +668,6 @@ def main() -> int:
             exporter, exporter_identity, label="ds4 exporter")
         verify_approved_runtime_file_identities(
             runtime_identities, label="ds4 exporter")
-        post_trace_runtime_build = query_runtime_build_attestation(
-            exporter,
-            exporter_identity=exporter_identity,
-            exporter_policy=exporter_policy,
-        )
-        if post_trace_runtime_build != pre_runtime_build:
-            raise PreflightError("ds4 exporter build identity changed during trace execution")
         if result.returncode != 0:
             return result.returncode
         verify_sealed_audits(pre_audits, pre_audit_digests)

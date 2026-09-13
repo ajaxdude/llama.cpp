@@ -2117,6 +2117,7 @@ class TraceFormatTests(unittest.TestCase):
                     exporter=exporter,
                     exporter_identity=identity,
                     exporter_policy=policy,
+                    timeout_seconds=30,
                     check=True,
                     capture_output=True,
                     text=True,
@@ -2134,6 +2135,7 @@ class TraceFormatTests(unittest.TestCase):
                         exporter=exporter,
                         exporter_identity=identity,
                         exporter_policy=policy,
+                        timeout_seconds=30,
                         check=True,
                         capture_output=True,
                         text=True,
@@ -2173,6 +2175,7 @@ class TraceFormatTests(unittest.TestCase):
                         exporter=exporter,
                         exporter_identity=identity,
                         exporter_policy=policy,
+                        timeout_seconds=30,
                         check=True,
                         capture_output=True,
                         text=True,
@@ -2211,6 +2214,7 @@ class TraceFormatTests(unittest.TestCase):
                         exporter=exporter,
                         exporter_identity=identity,
                         exporter_policy=policy,
+                        timeout_seconds=30,
                         check=True,
                         capture_output=True,
                         text=True,
@@ -2237,6 +2241,7 @@ class TraceFormatTests(unittest.TestCase):
                         exporter=exporter,
                         exporter_identity=identity,
                         exporter_policy=policy,
+                        timeout_seconds=30,
                     )
                 execute.assert_not_called()
             finally:
@@ -3127,6 +3132,150 @@ class TraceFormatTests(unittest.TestCase):
                     expected_runtime_build=DS4_RUNTIME_BUILD,
                 )
         self.assertEqual(execute.call_count, 2)
+
+    def test_ds4_accelerator_query_attests_after_launch_exceptions(self) -> None:
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+        for primary_error in (
+                OSError("device launch failed"),
+                subprocess.TimeoutExpired(["exporter"], 7),
+        ):
+            with self.subTest(error=type(primary_error).__name__), mock.patch.object(
+                    run_ds4,
+                    "run_exporter_command",
+                    side_effect=[primary_error, build_result],
+            ) as execute, self.assertRaisesRegex(type(primary_error), "device launch failed|timed out"):
+                run_ds4.query_accelerator_attestation(
+                    Path("/approved/exporter"),
+                    "Metal0",
+                    exporter_identity=object(),
+                    exporter_policy=DS4_EXPORTER_POLICY,
+                    expected_runtime_build=DS4_RUNTIME_BUILD,
+                )
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual(
+                execute.call_args_list[0].args[0],
+                ["/approved/exporter", "--dsv41-attest-device", "Metal0"],
+            )
+            self.assertEqual(
+                execute.call_args_list[1].args[0],
+                ["/approved/exporter", "--dsv41-attest-build"],
+            )
+            self.assertEqual(
+                execute.call_args_list[0].kwargs["timeout_seconds"],
+                run_ds4.EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                execute.call_args_list[1].kwargs["timeout_seconds"],
+                run_ds4.EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
+            )
+
+    def test_ds4_accelerator_query_attests_after_nonzero_exit(self) -> None:
+        device_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 9, "", "device failed")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[device_result, build_result],
+        ) as execute, self.assertRaisesRegex(preflight.PreflightError, "device failed"):
+            run_ds4.query_accelerator_attestation(
+                Path("/approved/exporter"),
+                "Metal0",
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+            )
+        self.assertEqual(execute.call_count, 2)
+
+    def test_ds4_invocation_reports_primary_and_post_attestation_failures(self) -> None:
+        primary_failures = (
+            subprocess.TimeoutExpired(["exporter"], 7),
+            run_ds4.subprocess.CompletedProcess(["exporter"], 9, "", "device failed"),
+        )
+        for primary_failure in primary_failures:
+            secondary_error = OSError("post-build launch failed")
+            with self.subTest(primary=type(primary_failure).__name__), mock.patch.object(
+                    run_ds4,
+                    "run_exporter_command",
+                    side_effect=[primary_failure, secondary_error],
+            ) as execute, self.assertRaisesRegex(
+                    preflight.PreflightError,
+                    "primary failure \\[(TimeoutExpired|PreflightError):.*secondary post-invocation.*"
+                    "OSError: post-build launch failed"):
+                run_ds4.run_exporter_with_post_attestation(
+                    ["/approved/exporter", "--dsv41-attest-device", "Metal0"],
+                    operation="selected accelerator query",
+                    exporter=Path("/approved/exporter"),
+                    exporter_identity=object(),
+                    exporter_policy=DS4_EXPORTER_POLICY,
+                    expected_runtime_build=DS4_RUNTIME_BUILD,
+                    timeout_seconds=7,
+                    check=False,
+                )
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual(
+                execute.call_args_list[1].args[0],
+                ["/approved/exporter", "--dsv41-attest-build"],
+            )
+
+    def test_ds4_main_trace_result_waits_for_post_attestation(self) -> None:
+        trace_result = run_ds4.subprocess.CompletedProcess(["exporter"], 11, "", "trace failed")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[trace_result, build_result],
+        ) as execute:
+            result = run_ds4.run_exporter_with_post_attestation(
+                ["/approved/exporter", "--model", "/model.gguf"],
+                operation="ds4 trace execution",
+                exporter=Path("/approved/exporter"),
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+                timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 11)
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(
+            execute.call_args_list[1].args[0],
+            ["/approved/exporter", "--dsv41-attest-build"],
+        )
+        self.assertEqual(
+            execute.call_args_list[0].kwargs["timeout_seconds"],
+            run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+        )
+
+    def test_ds4_exporter_command_requires_bounded_timeout(self) -> None:
+        completed = run_ds4.subprocess.CompletedProcess(["exporter"], 0, "", "")
+        identity = object()
+        with mock.patch.object(
+                run_ds4, "run_approved_executable", return_value=(completed, identity)) as execute:
+            result = run_ds4.run_exporter_command(
+                ["/approved/exporter"],
+                exporter=Path("/approved/exporter"),
+                exporter_identity=identity,
+                exporter_policy=DS4_EXPORTER_POLICY,
+                timeout_seconds=17,
+                check=False,
+            )
+        self.assertIs(result, completed)
+        self.assertEqual(execute.call_args.kwargs["timeout"], 17)
+        for timeout in (None, 0, -1, True):
+            kwargs = {} if timeout is None else {"timeout_seconds": timeout}
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(
+                    preflight.PreflightError, "timeout is invalid"):
+                run_ds4.run_exporter_command(
+                    ["/approved/exporter"],
+                    exporter=Path("/approved/exporter"),
+                    exporter_identity=identity,
+                    exporter_policy=DS4_EXPORTER_POLICY,
+                    **kwargs,
+                )
 
     def test_nvme_attestation_uses_mount_and_block_ancestry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
