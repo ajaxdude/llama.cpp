@@ -1491,6 +1491,7 @@ def _emit_final(
     child_returncode: int | None = None,
     process_group_status: str = "not_created",
     error: str | None = None,
+    preserve_primary_on_artifact_error: bool = False,
 ) -> int:
     fields = _state_fields(
         snapshot,
@@ -1503,31 +1504,52 @@ def _emit_final(
     fields.update(classification=classification, exit_code=exit_code)
     if error:
         fields["error"] = error
-    previous_mask = signal.pthread_sigmask(
-        signal.SIG_BLOCK, PARENT_SIGNALS
-    )
-    try:
-        try:
-            record = audit.emit("final", **fields)
-            audit.finalize(record)
-        except ArtifactError as exc:
-            audit.disable_component(exc.component)
+
+    def record_artifact_error(exc: ArtifactError) -> None:
+        nonlocal exit_code
+        detail = {
+            "component": exc.component,
+            "detail": str(exc),
+        }
+        if preserve_primary_on_artifact_error:
+            secondary_errors = fields.setdefault(
+                "secondary_errors", []
+            )
+            assert isinstance(secondary_errors, list)
+            secondary_errors.append(detail)
+        else:
             fields.update(
                 classification="lease_error",
                 exit_code=EXIT_LEASE_ERROR,
                 threshold_reason="watchdog artifact finalization failed",
                 error=f"{exc.component}: {exc}",
             )
-            try:
-                record = audit.emit("final", **fields)
-            except ArtifactError as nested_exc:
-                audit.disable_component(nested_exc.component)
-                record = audit.emit("final", **fields)
-            try:
-                audit.finalize(record)
-            except ArtifactError as nested_exc:
-                audit.disable_component(nested_exc.component)
             exit_code = EXIT_LEASE_ERROR
+
+    def emit_final_record() -> dict[str, object]:
+        try:
+            return audit.emit("final", **fields)
+        except ArtifactError as exc:
+            audit.disable_component(exc.component)
+            record_artifact_error(exc)
+        try:
+            return audit.emit("final", **fields)
+        except ArtifactError as exc:
+            audit.disable_component(exc.component)
+            record_artifact_error(exc)
+        return audit.emit("final", **fields)
+
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, PARENT_SIGNALS
+    )
+    try:
+        record = emit_final_record()
+        try:
+            audit.finalize(record)
+        except ArtifactError as exc:
+            audit.disable_component(exc.component)
+            record_artifact_error(exc)
+            emit_final_record()
         audit.mark_final(exit_code)
         return exit_code
     finally:
@@ -1843,6 +1865,9 @@ def _graceful_cleanup(
         child_returncode,
         process_group_status,
         error,
+        preserve_primary_on_artifact_error=(
+            guardian_control_error is not None
+        ),
     )
 
 

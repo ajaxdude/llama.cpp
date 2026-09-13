@@ -73,7 +73,7 @@ These checks reject accidental or helper-process substitution and make regular-f
 
 The guardian controls only the process group. A payload that deliberately calls `setsid()` can escape it. The correctness harness must not do that. If arbitrary payload code is in scope, launch the watchdog in a service/cgroup configured to kill every member when the unit stops.
 
-Exit classifications are authoritative in the final JSON record. Operational failures use these exit codes:
+Exit classifications are authoritative in the last final JSON record. If final artifact persistence fails after a primary safety failure, the primary classification and exit code remain unchanged and the artifact failure is listed in `secondary_errors`. Operational failures use these exit codes:
 
 | Exit code | Classification |
 | ---: | --- |
