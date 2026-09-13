@@ -15,6 +15,7 @@ from typing import Any, BinaryIO, Iterable
 TRACE_FORMAT = "dsv41-trace"
 TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
+APPROVED_EXPORTERS: dict[str, str] = {}
 MODEL_SHA256 = "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
 REPOSITORY = "halo-box/strix-llama.cpp"
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
@@ -507,6 +508,8 @@ def validate_watchdog_event(event: Any) -> dict[str, Any]:
             raise TraceError("watchdog JSONL error is invalid")
         secondary_errors = event.get("secondary_errors")
         if secondary_errors is not None:
+            if classification != "signal_error" or "error" not in event:
+                raise TraceError("watchdog JSONL secondary errors require a primary signal error")
             if not isinstance(secondary_errors, list) or not secondary_errors:
                 raise TraceError("watchdog JSONL secondary errors are invalid")
             for secondary_error in secondary_errors:
@@ -813,6 +816,9 @@ class TraceBundle:
         build_sha256 = self.manifest["build"].get("sha256", "")
         if not isinstance(build_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", build_sha256) is None:
             raise TraceError("manifest build SHA-256 is invalid")
+        if self.manifest["runtime"] == "ds4" and (
+                APPROVED_EXPORTERS.get(build_sha256) != DS4_REVISION):
+            raise TraceError("ds4 exporter is not approved for the pinned ds4 revision")
         for key in build_keys - {"sha256", "number"}:
             value = self.manifest["build"].get(key)
             if not isinstance(value, str) or not value:

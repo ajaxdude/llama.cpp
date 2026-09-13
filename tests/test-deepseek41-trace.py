@@ -29,6 +29,9 @@ import preflight
 import verify_ds4_anchors
 
 trace.APPROVED_WATCHDOGS[trace.WATCHDOG_SCRIPT_SHA256] = trace.WATCHDOG_REVISION
+FIXTURE_DS4_EXPORTER_SHA256 = "3" * 64
+trace.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
+run_ds4.APPROVED_EXPORTERS[FIXTURE_DS4_EXPORTER_SHA256] = trace.DS4_REVISION
 
 WATCHDOG_EVENTS = [
     {
@@ -195,7 +198,7 @@ DS4_RUNNER_ATTESTATION = {
     "runner_script": "/Users/oracle/repo/tools/deepseek-v41-trace/run_ds4.py",
     "runner_script_sha256": "2" * 64,
     "exporter_path": "/Users/oracle/bin/ds4-trace",
-    "exporter_sha256": "3" * 64,
+    "exporter_sha256": FIXTURE_DS4_EXPORTER_SHA256,
     "checkout_path": "/Users/oracle/ds4",
     "checkout_revision": trace.DS4_REVISION,
     "command_sha256": "4" * 64,
@@ -380,7 +383,7 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "compiler": "clang",
                 "target": "arm64-apple-darwin",
                 "path": "/Users/oracle/bin/ds4-trace",
-                "sha256": "3" * 64,
+                "sha256": FIXTURE_DS4_EXPORTER_SHA256,
             }
             if is_ds4
             else {
@@ -1689,6 +1692,49 @@ class TraceFormatTests(unittest.TestCase):
                 trace.validate_watchdog_event(final_event)
                 canonical_finals[classification] = final_event
 
+            def fail_signal(_pid: int, _signal: int) -> str:
+                raise watchdog.ProcessGroupError("test signal failure")
+
+            signal_stream = io.StringIO()
+            signal_logger = watchdog.AuditLogger(signal_stream, wall_clock=lambda: now)
+            with mock.patch.object(watchdog.signal, "pthread_sigmask", return_value=set()):
+                watchdog._kill_and_finish(
+                    signal_logger,
+                    guardian,
+                    snapshot,
+                    snapshot.used_bytes,
+                    "procfs_error",
+                    watchdog.EXIT_PROCFS_ERROR,
+                    "test signal failure",
+                    fail_signal,
+                )
+            signal_final = trace.strict_json_loads(signal_stream.getvalue().splitlines()[-1])
+            self.assertEqual(signal_final["classification"], "signal_error")
+            self.assertIsInstance(signal_final["error"], str)
+            trace.validate_watchdog_event(signal_final)
+            canonical_finals["signal-error-detail"] = signal_final
+
+            secondary_stream = io.StringIO()
+            secondary_logger = watchdog.AuditLogger(secondary_stream, wall_clock=lambda: now)
+            with mock.patch.object(watchdog.signal, "pthread_sigmask", return_value=set()):
+                watchdog._emit_final(
+                    secondary_logger,
+                    "signal_error",
+                    watchdog.EXIT_SIGNAL_ERROR,
+                    "test secondary error",
+                    snapshot,
+                    snapshot.used_bytes,
+                    guardian,
+                    0,
+                    "signal_error",
+                    "primary signal failure",
+                    preserve_primary_on_artifact_error=True,
+                    secondary_errors=[{"component": "audit", "detail": "secondary audit failure"}],
+                )
+            secondary_final = trace.strict_json_loads(secondary_stream.getvalue().splitlines()[-1])
+            trace.validate_watchdog_event(secondary_final)
+            canonical_finals["signal-error-secondary"] = secondary_final
+
             class TimeoutProcess(FakeProcess):
                 @staticmethod
                 def wait(timeout: float | None = None) -> int:
@@ -2270,6 +2316,30 @@ class TraceFormatTests(unittest.TestCase):
                 trace.TraceBundle(root)
 
         for classification, error in (
+                ("internal_error", "internal failure"),
+                ("signal_error", None)):
+            with self.subTest(
+                    classification=classification,
+                    secondary=True), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                candidate = copy.deepcopy(terminal)
+                candidate["classification"] = classification
+                candidate["secondary_errors"] = [{
+                    "component": "audit",
+                    "detail": "secondary audit failure",
+                }]
+                if error is None:
+                    candidate.pop("error")
+                else:
+                    candidate["error"] = error
+                for phase in ("pre", "post"):
+                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
+                with self.assertRaisesRegex(trace.TraceError, "require a primary signal error"):
+                    trace.TraceBundle(root)
+
+        for classification, error in (
                 ("internal_error", None),
                 ("child_exit", "fabricated error")):
             with self.subTest(classification=classification), tempfile.TemporaryDirectory() as temp:
@@ -2581,6 +2651,28 @@ class TraceFormatTests(unittest.TestCase):
     def test_rejects_unapproved_ds4_exporter(self) -> None:
         with self.assertRaisesRegex(preflight.PreflightError, "not approved"):
             run_ds4.verify_exporter_approval("a" * 64)
+
+    def test_bundle_validation_and_comparison_reject_unapproved_ds4_exporter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ds4_root = root / "ds4"
+            llama_root = root / "llama"
+            with trace.TraceBundleWriter(ds4_root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            with trace.TraceBundleWriter(llama_root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            approved = dict(trace.APPROVED_EXPORTERS)
+            try:
+                trace.APPROVED_EXPORTERS.clear()
+                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
+                    trace.TraceBundle(ds4_root)
+                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
+                    trace.command_validate(Namespace(bundle=ds4_root))
+                with self.assertRaisesRegex(trace.TraceError, "exporter is not approved"):
+                    trace.command_compare(Namespace(left=ds4_root, right=llama_root, report=None))
+            finally:
+                trace.APPROVED_EXPORTERS.clear()
+                trace.APPROVED_EXPORTERS.update(approved)
 
     def test_rejects_preflight_audit_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

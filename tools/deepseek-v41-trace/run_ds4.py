@@ -22,7 +22,9 @@ from preflight import (
 )
 from trace_format import (
     ADMITTED_UBATCH,
+    APPROVED_EXPORTERS,
     CORPUS_SHA256,
+    DS4_REVISION,
     MODEL_SHA256,
     NO_EXTERNAL_STATE_STORAGE,
     TraceBundle,
@@ -32,10 +34,6 @@ from trace_format import (
     sha256_file,
     strict_json_loads,
 )
-
-DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
-APPROVED_EXPORTERS: dict[str, str] = {}
-
 
 def git_output(checkout: Path, *args: str) -> str:
     try:
