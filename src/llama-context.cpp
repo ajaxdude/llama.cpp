@@ -1188,7 +1188,8 @@ void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
-        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support embedding outputs");
+        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support embedding outputs\n", __func__);
+        return;
     }
     cparams.embeddings = value;
 
@@ -1200,7 +1201,8 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
     if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
-        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support next-token embedding outputs");
+        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support next-token embedding outputs\n", __func__);
+        return;
     }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
@@ -1212,7 +1214,8 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
     if (enable && model.arch == LLM_ARCH_DEEPSEEK41) {
-        throw std::runtime_error("DeepSeek V4.1 bounded admission does not support layer embedding outputs");
+        LLAMA_LOG_ERROR("%s: DeepSeek V4.1 bounded admission does not support layer embedding outputs\n", __func__);
+        return;
     }
     cparams.embeddings_layer_inp[lid] = enable;
 
