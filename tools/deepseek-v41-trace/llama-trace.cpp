@@ -33,12 +33,21 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 #endif
 
 #if !defined(_WIN32)
@@ -49,6 +58,7 @@ namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 
 static constexpr int TRACE_VERSION = 2;
+static constexpr const char * BUILD_REVISION = DSV41_BUILD_REVISION;
 #if defined(__linux__)
 static constexpr const char * WATCHDOG_SCRIPT_SHA256 =
     "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f";
@@ -109,6 +119,138 @@ static std::vector<uint8_t> read_file(const fs::path & path) {
         throw std::runtime_error("cannot read: " + path.string());
     }
     return result;
+}
+
+static fs::path canonical_path(const fs::path & path, const char * label) {
+    try {
+        return fs::canonical(path);
+    } catch (const fs::filesystem_error & error) {
+        throw std::runtime_error(std::string("cannot resolve ") + label + ": " + error.what());
+    }
+}
+
+static fs::path current_executable_path() {
+#if defined(_WIN32)
+    std::vector<wchar_t> buffer(32768);
+    const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size == 0 || size >= buffer.size()) {
+        throw std::runtime_error("cannot query current executable path");
+    }
+    return canonical_path(fs::path(std::wstring(buffer.data(), size)), "current executable");
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    if (_NSGetExecutablePath(nullptr, &size) != -1 || size == 0) {
+        throw std::runtime_error("cannot query current executable path size");
+    }
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+        throw std::runtime_error("cannot query current executable path");
+    }
+    return canonical_path(buffer.data(), "current executable");
+#elif defined(__linux__)
+    return canonical_path("/proc/self/exe", "current executable");
+#else
+#error unsupported platform
+#endif
+}
+
+static fs::path module_path(const void * address) {
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address),
+            &module)) {
+        throw std::runtime_error("cannot identify loaded runtime module");
+    }
+    std::vector<wchar_t> buffer(32768);
+    const DWORD size = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size == 0 || size >= buffer.size()) {
+        throw std::runtime_error("cannot query loaded runtime module path");
+    }
+    return canonical_path(fs::path(std::wstring(buffer.data(), size)), "loaded runtime module");
+#else
+    Dl_info info = {};
+    if (dladdr(address, &info) == 0 || info.dli_fname == nullptr || info.dli_fname[0] == '\0') {
+        throw std::runtime_error("cannot identify loaded runtime module");
+    }
+    return canonical_path(info.dli_fname, "loaded runtime module");
+#endif
+}
+
+template <typename T>
+static const void * function_address(T function) {
+    return reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(function));
+}
+
+static bool path_is_within(const fs::path & path, const fs::path & root) {
+    const fs::path relative = path.lexically_relative(root);
+    return !relative.empty() && *relative.begin() != "..";
+}
+
+static void require_runtime_module_location(const fs::path & executable, const fs::path & module) {
+    const fs::path binary_directory = executable.parent_path();
+    const fs::path library_directory = binary_directory.parent_path() / "lib";
+    if (module != executable && module.parent_path() != binary_directory &&
+            !path_is_within(module, library_directory)) {
+        throw std::runtime_error("loaded runtime module is outside the exporter runtime directory: " + module.string());
+    }
+}
+
+static json runtime_module_json(
+        const std::string & role,
+        const fs::path & executable,
+        const void * address) {
+    const fs::path path = module_path(address);
+    require_runtime_module_location(executable, path);
+    return {
+        {"role", role},
+        {"path", path.string()},
+        {"sha256", sha256_file(path)},
+    };
+}
+
+static json runtime_build_json(
+        const fs::path & executable,
+        ggml_backend_dev_t selected_device,
+        char ** argv) {
+    const fs::path invoked_path = canonical_path(fs::absolute(argv[0]), "invoked exporter");
+    if (invoked_path != executable) {
+        throw std::runtime_error("invoked exporter path does not match the running executable");
+    }
+    const std::string revision = BUILD_REVISION;
+    if (revision.size() != 40 || !std::all_of(revision.begin(), revision.end(), [](unsigned char value) {
+            return std::isdigit(value) || (value >= 'a' && value <= 'f');
+        })) {
+        throw std::runtime_error("embedded exporter revision is invalid");
+    }
+    const std::string linked_revision = llama_commit();
+    const std::string ggml_revision = ggml_commit();
+    if (linked_revision.empty() || revision.compare(0, linked_revision.size(), linked_revision) != 0 ||
+            ggml_revision.empty() || revision.compare(0, ggml_revision.size(), ggml_revision) != 0) {
+        throw std::runtime_error("loaded runtime library revision differs from the exporter revision");
+    }
+    if (selected_device == nullptr) {
+        throw std::runtime_error("cannot bind a null selected backend device");
+    }
+    ggml_backend_reg_t selected_backend = ggml_backend_dev_backend_reg(selected_device);
+    if (selected_backend == nullptr) {
+        throw std::runtime_error("selected backend device has no runtime registry");
+    }
+    return {
+        {"number", llama_build_number()},
+        {"info", llama_build_info()},
+        {"compiler", llama_compiler()},
+        {"target", llama_build_target()},
+        {"path", executable.string()},
+        {"sha256", sha256_file(executable)},
+        {"runtime_libraries", {
+            runtime_module_json("build-info", executable, function_address(&llama_commit)),
+            runtime_module_json("llama", executable, function_address(&llama_model_load_from_file)),
+            runtime_module_json("ggml", executable, function_address(&ggml_init)),
+            runtime_module_json("selected-backend", executable, selected_backend),
+        }},
+    };
 }
 
 static std::string required_environment(const char * name) {
@@ -416,6 +558,8 @@ static std::vector<int64_t> tensor_shape(const ggml_tensor * tensor) {
     return result;
 }
 
+static void write_manifest_file(const fs::path & path, const json & manifest);
+
 class trace_writer {
 public:
     trace_writer(fs::path root, json manifest) :
@@ -528,16 +672,7 @@ public:
         }
         events.close();
         manifest["event_count"] = event_count;
-        const fs::path output = root / "manifest.json";
-        const fs::path temp = output.string() + ".tmp";
-        {
-            std::ofstream stream(temp, std::ios::binary | std::ios::trunc);
-            stream << manifest.dump() << '\n';
-            if (!stream) {
-                throw std::runtime_error("cannot write trace manifest");
-            }
-        }
-        fs::rename(temp, output);
+        write_manifest_file(root / "manifest.json", manifest);
     }
 
 private:
@@ -700,40 +835,137 @@ static json storage_policy_json() {
     };
 }
 
-static void write_manifest_type_probe(const fs::path & path, int argc, char ** argv) {
-    const std::vector<uint8_t> bytes = read_file(path);
-    json manifest = json::parse(bytes.begin(), bytes.end());
-    if (!manifest.is_object()) {
-        throw std::runtime_error("manifest type probe input is not a JSON object");
+static json complete_manifest(
+        json input,
+        const fs::path & executable,
+        ggml_backend_dev_t selected_device,
+        const std::string & system_info,
+        int argc,
+        char ** argv) {
+    static const std::array<const char *, 8> required = {
+        "model", "prompt", "accelerator", "paths", "config", "audits", "expected", "event_count",
+    };
+    if (!input.is_object()) {
+        throw std::runtime_error("manifest writer input is not a JSON object");
     }
-    common_params params;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-#if defined(__linux__)
-    manifest["environment"]["system_info"] = runtime_system_info(params);
-#endif
-    manifest["environment"]["command"] = command_line_json(argc, argv);
-    manifest["config"]["flash_attention"] = flash_attention_enabled(params.flash_attn_type);
-    manifest["storage_policy"] = storage_policy_json();
+    for (const char * key : required) {
+        if (!input.contains(key) && std::string(key) != "event_count") {
+            throw std::runtime_error(std::string("manifest writer input is missing ") + key);
+        }
+    }
+    for (const auto & item : input.items()) {
+        if (std::find_if(required.begin(), required.end(), [&](const char * key) {
+                return item.key() == key;
+            }) == required.end()) {
+            throw std::runtime_error("manifest writer input has unexpected field: " + item.key());
+        }
+    }
+    json manifest = {
+        {"trace_format", "dsv41-trace"},
+        {"trace_version", TRACE_VERSION},
+        {"runtime", "llama.cpp"},
+        {"revision", BUILD_REVISION},
+        {"build", runtime_build_json(executable, selected_device, argv)},
+        {"model", std::move(input["model"])},
+        {"prompt", std::move(input["prompt"])},
+        {"accelerator", std::move(input["accelerator"])},
+        {"paths", std::move(input["paths"])},
+        {"storage_policy", storage_policy_json()},
+        {"config", std::move(input["config"])},
+        {"comparison", {
+            {"tokens", "exact"},
+            {"engram_rows", "exact"},
+            {"expert_ids", "exact-original-id-space"},
+            {"expert_weights", "byte-identical-f32"},
+            {"attention_candidates", "exact"},
+            {"logits", "byte-identical-f32"},
+        }},
+        {"environment", {
+            {"system_info", system_info},
+            {"command", command_line_json(argc, argv)},
+        }},
+        {"audits", std::move(input["audits"])},
+        {"expected", std::move(input["expected"])},
+    };
+    if (input.contains("event_count")) {
+        manifest["event_count"] = std::move(input["event_count"]);
+    }
+    return manifest;
+}
 
+static void write_manifest_file(const fs::path & path, const json & manifest) {
     const fs::path temp = path.string() + ".tmp";
     {
         std::ofstream stream(temp, std::ios::binary | std::ios::trunc);
         stream << manifest.dump() << '\n';
         if (!stream) {
-            throw std::runtime_error("cannot write manifest type probe");
+            throw std::runtime_error("cannot write trace manifest");
         }
     }
     fs::rename(temp, path);
 }
 
+static void write_manifest_probe(
+        const fs::path & input_path,
+        const fs::path & output_path,
+        int argc,
+        char ** argv) {
+    const std::vector<uint8_t> bytes = read_file(input_path);
+    json input = json::parse(bytes.begin(), bytes.end());
+    if (!input.is_object() || !input.contains("system_info") || !input["system_info"].is_string() ||
+            input["system_info"].get<std::string>().empty()) {
+        throw std::runtime_error("manifest writer probe system_info is invalid");
+    }
+    const std::string system_info = input["system_info"];
+    input.erase("system_info");
+    common_params params;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    input["config"]["flash_attention"] = flash_attention_enabled(params.flash_attn_type);
+    common_init();
+    ggml_backend_load_all();
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    write_manifest_file(
+        output_path,
+        complete_manifest(
+            std::move(input),
+            current_executable_path(),
+            device,
+            system_info,
+            argc,
+            argv));
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
-        if (argc >= 2 && std::string(argv[1]) == "--dsv41-manifest-type-probe") {
+        if (argc == 2 && std::string(argv[1]) == "--version") {
+            common_init();
+            ggml_backend_load_all();
+            const json build = runtime_build_json(
+                current_executable_path(),
+                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU),
+                argv);
+            std::cout << "version: deepseek-v41-trace (build " << build["number"]
+                      << ", commit " << BUILD_REVISION << ")\n";
+            std::cout << "built with " << build["compiler"].get<std::string>()
+                      << " for " << build["target"].get<std::string>() << '\n';
+            return 0;
+        }
+        if (argc >= 2 && std::string(argv[1]) == "--dsv41-runtime-module-path-probe") {
             if (argc != 3) {
-                throw std::runtime_error("--dsv41-manifest-type-probe requires a manifest path");
+                throw std::runtime_error("--dsv41-runtime-module-path-probe requires a module path");
             }
-            write_manifest_type_probe(argv[2], argc, argv);
+            require_runtime_module_location(
+                current_executable_path(),
+                canonical_path(argv[2], "runtime module probe"));
+            return 0;
+        }
+        if (argc >= 2 && std::string(argv[1]) == "--dsv41-manifest-writer-probe") {
+            if (argc != 4) {
+                throw std::runtime_error(
+                    "--dsv41-manifest-writer-probe requires input and output paths");
+            }
+            write_manifest_probe(argv[2], argv[3], argc, argv);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {
@@ -764,6 +996,7 @@ int main(int argc, char ** argv) {
         if (params.n_predict < 1) {
             throw std::runtime_error("-n must request at least one deterministic decode step");
         }
+        const fs::path executable_path = current_executable_path();
 
         const dsv41::storage_attestation model_storage =
             dsv41::require_nvme_path(params.model.path, "model");
@@ -851,17 +1084,7 @@ int main(int argc, char ** argv) {
             all_layers[layer] = layer;
         }
 
-        json manifest = {
-            {"runtime", "llama.cpp"},
-            {"revision", llama_commit()},
-            {"build", {
-                {"number", llama_build_number()},
-                {"info", llama_build_info()},
-                {"compiler", llama_compiler()},
-                {"target", llama_build_target()},
-                {"path", fs::absolute(argv[0]).lexically_normal().string()},
-                {"sha256", sha256_file(fs::absolute(argv[0]).lexically_normal())},
-            }},
+        json manifest_input = {
             {"model", {
                 {"path", model_path.string()},
                 {"architecture", "deepseek41"},
@@ -881,7 +1104,6 @@ int main(int argc, char ** argv) {
                 {"repository", audited_storage["repository"].value("resolved_path", "")},
                 {"temporary_directory", temporary_storage.resolved_path.string()},
             }},
-            {"storage_policy", storage_policy_json()},
             {"config", {
                 {"context", llama_n_ctx(ctx)},
                 {"batch", params.n_batch},
@@ -915,18 +1137,6 @@ int main(int argc, char ** argv) {
                     {"candidate_propagation_layers", {24, 28, 32, 36}},
                 }},
             }},
-            {"comparison", {
-                {"tokens", "exact"},
-                {"engram_rows", "exact"},
-                {"expert_ids", "exact-original-id-space"},
-                {"expert_weights", "byte-identical-f32"},
-                {"attention_candidates", "exact"},
-                {"logits", "byte-identical-f32"},
-            }},
-            {"environment", {
-                {"system_info", runtime_system_info(params)},
-                {"command", command_line_json(argc, argv)},
-            }},
             {"audits", {
                 {"memory", memory_audit},
                 {"swap", swap_audit},
@@ -950,6 +1160,13 @@ int main(int argc, char ** argv) {
                 }},
             }},
         };
+        json manifest = complete_manifest(
+            std::move(manifest_input),
+            executable_path,
+            params.devices[0],
+            runtime_system_info(params),
+            argc,
+            argv);
 
         trace_writer writer(output_path, std::move(manifest));
         llama_set_eval_callback(ctx, trace_callback, &writer);

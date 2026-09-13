@@ -33,6 +33,8 @@ from trace_format import (
     REQUIRED_EXPERT_SLOTS,
     TraceBundle,
     TraceError,
+    canonical_json,
+    sha256_bytes,
     sha256_file,
     strict_json_loads,
 )
@@ -45,8 +47,12 @@ def git_output(repo: Path, *args: str) -> bytes:
         raise PreflightError(f"git {' '.join(args)} failed: {error}") from error
 
 
-def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dict[str, str]:
+def candidate_attestation(
+        args: argparse.Namespace,
+        exporter: Path,
+        exporter_sha256: str) -> dict[str, str]:
     repo = resolved(args.repo)
+    exporter = resolved(exporter)
     revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
     base_revision = git_output(repo, "rev-parse", args.base_revision).decode("ascii").strip()
     if revision != args.candidate_revision:
@@ -89,14 +95,71 @@ def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dic
         "revision": revision,
         "base_revision": base_revision,
         "diff_sha256": diff_sha256,
+        "executable_path": str(exporter),
         "executable_sha256": exporter_sha256,
     }
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_runtime_build(
+        manifest: dict[str, object],
+        *,
+        exporter: Path,
+        exporter_sha256: str,
+        candidate_revision: str) -> str:
+    build = manifest.get("build")
+    if not isinstance(build, dict):
+        raise PreflightError("llama trace build identity is missing")
+    exporter = resolved(exporter)
+    if build.get("path") != str(exporter):
+        raise PreflightError("llama trace build path does not match the executed exporter")
+    if build.get("sha256") != exporter_sha256:
+        raise PreflightError("llama trace build SHA-256 does not match the executed exporter")
+    if manifest.get("revision") != candidate_revision:
+        raise PreflightError("llama trace build revision does not match the exact candidate revision")
+    libraries = build.get("runtime_libraries")
+    if not isinstance(libraries, list):
+        raise PreflightError("llama trace runtime library identities are missing")
+    expected_roles = {"build-info", "llama", "ggml", "selected-backend"}
+    roles = set()
+    binary_directory = exporter.parent
+    library_directory = binary_directory.parent / "lib"
+    for library in libraries:
+        if not isinstance(library, dict):
+            raise PreflightError("llama trace runtime library identity is invalid")
+        role = library.get("role")
+        path_value = library.get("path")
+        digest = library.get("sha256")
+        if role not in expected_roles or role in roles:
+            raise PreflightError("llama trace runtime library role is invalid")
+        roles.add(role)
+        if not isinstance(path_value, str):
+            raise PreflightError("llama trace runtime library path is invalid")
+        path = resolved(Path(path_value))
+        if path_value != str(path):
+            raise PreflightError("llama trace runtime library path is not canonical")
+        if path != exporter and path.parent != binary_directory and not _path_is_within(path, library_directory):
+            raise PreflightError("llama trace runtime library is outside the exporter runtime directory")
+        if not path.is_file() or not isinstance(digest, str) or sha256_file(path) != digest:
+            raise PreflightError("llama trace runtime library SHA-256 mismatch")
+    if roles != expected_roles:
+        raise PreflightError("llama trace runtime library identities are incomplete")
+    return sha256_bytes(canonical_json(libraries).encode("ascii"))
 
 
 def bind_candidate_attestation(
         output: Path,
         attestation: dict[str, str],
-        accelerator: dict[str, object]) -> None:
+        accelerator: dict[str, object],
+        exporter: Path,
+        exporter_sha256: str) -> None:
     manifest_path = safe_trace_path(output, "manifest.json")
     try:
         manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
@@ -104,7 +167,14 @@ def bind_candidate_attestation(
         raise PreflightError(f"cannot bind candidate attestation: {error}") from error
     if manifest.get("accelerator") != accelerator:
         raise PreflightError("llama trace accelerator attestation differs from the preflight query")
-    manifest["candidate"] = attestation
+    bound_attestation = dict(attestation)
+    bound_attestation["runtime_libraries_sha256"] = validate_runtime_build(
+        manifest,
+        exporter=exporter,
+        exporter_sha256=exporter_sha256,
+        candidate_revision=attestation["revision"],
+    )
+    manifest["candidate"] = bound_attestation
     temp = manifest_path.with_suffix(".tmp")
     temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     os.replace(temp, manifest_path)
@@ -279,7 +349,7 @@ def main() -> int:
             model_sha256=model_sha256,
             target_tokens=args.context - args.decode_steps,
         )
-        attestation = candidate_attestation(args, exporter_sha256)
+        attestation = candidate_attestation(args, exporter, exporter_sha256)
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
@@ -331,7 +401,7 @@ def main() -> int:
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
-        bind_candidate_attestation(output, attestation, accelerator)
+        bind_candidate_attestation(output, attestation, accelerator, exporter, exporter_sha256)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "llama.cpp":
             raise PreflightError("llama exporter wrote a non-llama.cpp trace")

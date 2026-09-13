@@ -1,8 +1,22 @@
 set(TARGET llama-deepseek-v41-trace)
+find_package(Git REQUIRED)
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE DSV41_BUILD_REVISION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE DSV41_BUILD_REVISION_RESULT)
+string(LENGTH "${DSV41_BUILD_REVISION}" DSV41_BUILD_REVISION_LENGTH)
+if(NOT DSV41_BUILD_REVISION_RESULT EQUAL 0 OR
+        NOT DSV41_BUILD_REVISION_LENGTH EQUAL 40 OR
+        NOT DSV41_BUILD_REVISION MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "DeepSeek V4.1 trace exporter requires the exact Git revision")
+endif()
 add_executable(${TARGET} llama-trace.cpp)
-target_link_libraries(${TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+target_compile_definitions(${TARGET} PRIVATE DSV41_BUILD_REVISION="${DSV41_BUILD_REVISION}")
 
 set(PROMPT_TARGET llama-deepseek-v41-prompt-builder)
 add_executable(${PROMPT_TARGET} prompt-builder.cpp)

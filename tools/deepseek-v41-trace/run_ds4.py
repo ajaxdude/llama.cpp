@@ -184,6 +184,12 @@ def bind_oracle_attestation(
     if "paths" in manifest and manifest["paths"] != paths:
         raise PreflightError("ds4 trace execution paths differ from preflight")
     manifest["paths"] = paths
+    build = manifest.get("build")
+    if not isinstance(build, dict) or build.get("path") != paths["exporter"]:
+        raise PreflightError("ds4 trace build path differs from the executed exporter")
+    runner = audit.get("runner")
+    if not isinstance(runner, dict) or build.get("sha256") != runner.get("exporter_sha256"):
+        raise PreflightError("ds4 trace build SHA-256 differs from the executed exporter")
     storage_policy = audit.get("storage_policy")
     if storage_policy != NO_EXTERNAL_STATE_STORAGE:
         raise PreflightError("ds4 external cache/state storage policy is invalid")

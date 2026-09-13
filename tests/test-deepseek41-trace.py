@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import struct
 import sys
@@ -393,6 +394,19 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "target": "arm64-apple-darwin",
                 "path": "/home/repo/build/bin/llama-deepseek-v41-trace",
                 "sha256": "3" * 64,
+                "runtime_libraries": [
+                    {
+                        "role": role,
+                        "path": f"/home/repo/build/bin/{name}",
+                        "sha256": digest * 64,
+                    }
+                    for role, name, digest in (
+                        ("build-info", "libllama-common.so", "4"),
+                        ("llama", "libllama.so", "5"),
+                        ("ggml", "libggml.so", "6"),
+                        ("selected-backend", "libggml-hip.so", "7"),
+                    )
+                ],
             }
         ),
         "model": {
@@ -501,7 +515,10 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "revision": "a" * 40,
             "base_revision": "b" * 40,
             "diff_sha256": "c" * 64,
+            "executable_path": result["build"]["path"],
             "executable_sha256": "3" * 64,
+            "runtime_libraries_sha256": trace.sha256_bytes(
+                trace.canonical_json(result["build"]["runtime_libraries"]).encode("ascii")),
         }
     else:
         result["host"] = dict(DS4_HOST_ATTESTATION)
@@ -1595,18 +1612,19 @@ class TraceFormatTests(unittest.TestCase):
     def test_canonical_watchdog_artifacts_embed_and_validate(self) -> None:
         revision = preflight.WATCHDOG_REVISION
         repository = Path(__file__).parents[1]
-        source = subprocess.check_output(
-            ["git", "show", f"{revision}:scripts/strix_memory_watchdog.py"],
-            cwd=repository,
-        )
+        script = repository / "scripts" / "strix_memory_watchdog.py"
+        self.assertTrue(script.is_file())
+        source = script.read_bytes()
         self.assertEqual(preflight.sha256_bytes(source), preflight.WATCHDOG_SCRIPT_SHA256)
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", revision, "HEAD"],
+            cwd=repository,
+            check=True,
+        )
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
-            repo = root / "repo"
-            script = repo / "scripts" / "strix_memory_watchdog.py"
-            script.parent.mkdir(parents=True)
-            script.write_bytes(source)
+            repo = repository
             watchdog = preflight._load_watchdog_module(script)
 
             lease_path = root / "watchdog.lease"
@@ -1941,6 +1959,43 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(trace.TraceError, "ds4 revision"):
                 trace.TraceBundle(root)
 
+    def test_rejects_unbound_runtime_build_identity(self) -> None:
+        cases = []
+
+        ds4_manifest = manifest("ds4")
+        ds4_manifest["build"]["path"] = "/Users/attacker/unrelated-exporter"
+        cases.append((ds4_manifest, "ds4 build path"))
+
+        short_revision_manifest = manifest()
+        short_revision_manifest["revision"] = "a" * 9
+        short_revision_manifest["candidate"]["revision"] = "a" * 9
+        cases.append((short_revision_manifest, "exact full Git revision"))
+
+        revision_manifest = manifest()
+        revision_manifest["candidate"]["revision"] = "d" * 40
+        cases.append((revision_manifest, "candidate revision"))
+
+        executable_manifest = manifest()
+        executable_manifest["candidate"]["executable_path"] = "/home/repo/build/bin/other-exporter"
+        cases.append((executable_manifest, "candidate executable path"))
+
+        library_manifest = manifest()
+        library_manifest["build"]["runtime_libraries"][0]["sha256"] = "e" * 64
+        cases.append((library_manifest, "candidate runtime library identities"))
+
+        library_path_manifest = manifest()
+        library_path_manifest["build"]["runtime_libraries"][0]["path"] = (
+            "/home/repo/build/bin/../substituted/libllama-common.so")
+        cases.append((library_path_manifest, "runtime library path is not canonical"))
+
+        for trace_manifest, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
     def test_rejects_unattested_accelerator_identity(self) -> None:
         for key, value, message in (
                 ("architecture", "gfx1100", "architecture mismatch"),
@@ -2128,7 +2183,7 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(trace.TraceError, "environment is not macOS"):
                 trace.TraceBundle(root)
 
-    def test_native_exporter_manifest_field_types_validate(self) -> None:
+    def test_native_complete_manifest_writer_validates(self) -> None:
         binary = Path(os.environ.get(
             "DSV41_NATIVE_TRACE_BINARY",
             Path(__file__).parents[1] / "build-harness" / "bin" / "llama-deepseek-v41-trace",
@@ -2140,14 +2195,80 @@ class TraceFormatTests(unittest.TestCase):
             with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
                 add_required_events(writer)
             manifest_path = root / trace.MANIFEST_NAME
-            command = [str(binary), "--dsv41-manifest-type-probe", str(manifest_path)]
+            fixture = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            writer_input = {
+                key: fixture[key]
+                for key in ("model", "prompt", "accelerator", "paths", "config", "audits", "expected", "event_count")
+            }
+            writer_input["system_info"] = "Linux model-free manifest writer test"
+            input_path = Path(temp) / "manifest-input.json"
+            input_path.write_text(
+                json.dumps(writer_input, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="ascii",
+            )
+            manifest_path.unlink()
+            command = [
+                str(binary.resolve()),
+                "--dsv41-manifest-writer-probe",
+                str(input_path),
+                str(manifest_path),
+            ]
             subprocess.run(command, check=True)
             native = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parents[1],
+                text=True,
+            ).strip()
+            version = subprocess.run(
+                [str(binary.resolve()), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn(f"commit {revision}", version.stdout)
+            self.assertEqual(native["revision"], revision)
+            self.assertEqual(native["build"]["path"], str(binary.resolve()))
+            self.assertEqual(
+                {library["role"] for library in native["build"]["runtime_libraries"]},
+                {"build-info", "llama", "ggml", "selected-backend"},
+            )
             self.assertIsInstance(native["environment"]["command"], str)
             self.assertEqual(json.loads(native["environment"]["command"]), command)
             self.assertIs(native["config"]["flash_attention"], True)
             self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
+            attestation = fixture["candidate"]
+            attestation["revision"] = revision
+            attestation["executable_path"] = str(binary.resolve())
+            attestation["executable_sha256"] = trace.sha256_file(binary)
+            run_llama.bind_candidate_attestation(
+                root,
+                attestation,
+                native["accelerator"],
+                binary,
+                trace.sha256_file(binary),
+            )
             trace.TraceBundle(root)
+
+            library = next(
+                item for item in native["build"]["runtime_libraries"]
+                if item["role"] == "build-info")
+            substituted = Path(temp) / "substituted"
+            substituted.mkdir()
+            substituted_library = substituted / Path(library["path"]).name
+            shutil.copy2(library["path"], substituted_library)
+            rejected = subprocess.run(
+                [
+                    str(binary.resolve()),
+                    "--dsv41-runtime-module-path-probe",
+                    str(substituted_library),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("outside the exporter runtime directory", rejected.stderr)
 
     def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

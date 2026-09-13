@@ -9,7 +9,7 @@ import re
 import struct
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable
 
 TRACE_FORMAT = "dsv41-trace"
@@ -805,10 +805,13 @@ class TraceBundle:
             raise TraceError("manifest revision is invalid")
         if self.manifest["runtime"] == "ds4" and self.manifest["revision"] != DS4_REVISION:
             raise TraceError(f"ds4 revision must be {DS4_REVISION}")
+        if self.manifest["runtime"] == "llama.cpp" and re.fullmatch(
+                r"[0-9a-f]{40}", self.manifest["revision"]) is None:
+            raise TraceError("llama.cpp revision must be the exact full Git revision")
         if not isinstance(self.manifest["build"], dict):
             raise TraceError("manifest build is invalid")
         build_keys = (
-            {"number", "info", "compiler", "target", "path", "sha256"}
+            {"number", "info", "compiler", "target", "path", "sha256", "runtime_libraries"}
             if self.manifest["runtime"] == "llama.cpp"
             else {"compiler", "target", "path", "sha256"}
         )
@@ -819,14 +822,38 @@ class TraceBundle:
         if self.manifest["runtime"] == "ds4" and (
                 APPROVED_EXPORTERS.get(build_sha256) != DS4_REVISION):
             raise TraceError("ds4 exporter is not approved for the pinned ds4 revision")
-        for key in build_keys - {"sha256", "number"}:
+        for key in build_keys - {"sha256", "number", "runtime_libraries"}:
             value = self.manifest["build"].get(key)
             if not isinstance(value, str) or not value:
                 raise TraceError(f"manifest build {key} is invalid")
         if "number" in build_keys and type(self.manifest["build"]["number"]) is not int:
             raise TraceError("manifest build number is invalid")
-        if not self.manifest["build"]["path"].startswith("/"):
-            raise TraceError("manifest build path is not absolute")
+        build_path = self.manifest["build"]["path"]
+        if not build_path.startswith("/") or ".." in PurePosixPath(build_path).parts or (
+                str(PurePosixPath(build_path)) != build_path):
+            raise TraceError("manifest build path is not canonical")
+        if self.manifest["runtime"] == "llama.cpp":
+            libraries = self.manifest["build"]["runtime_libraries"]
+            if not isinstance(libraries, list) or len(libraries) != 4:
+                raise TraceError("manifest runtime library identities are invalid")
+            roles = set()
+            for library in libraries:
+                _require_exact_keys(library, {"role", "path", "sha256"}, "manifest runtime library")
+                role = library.get("role")
+                path = library.get("path")
+                digest = library.get("sha256")
+                if role not in {"build-info", "llama", "ggml", "selected-backend"}:
+                    raise TraceError("manifest runtime library role is invalid")
+                if role in roles:
+                    raise TraceError("manifest runtime library role is duplicated")
+                roles.add(role)
+                if not isinstance(path, str) or not path.startswith("/") or ".." in PurePosixPath(path).parts or (
+                        str(PurePosixPath(path)) != path):
+                    raise TraceError("manifest runtime library path is not canonical")
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise TraceError("manifest runtime library SHA-256 is invalid")
+            if roles != {"build-info", "llama", "ggml", "selected-backend"}:
+                raise TraceError("manifest runtime library identities are incomplete")
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
@@ -904,6 +931,8 @@ class TraceBundle:
             raise TraceError("manifest model path is not bound to execution paths")
         if self.manifest["prompt"].get("path") != paths["prompt"]:
             raise TraceError("manifest prompt path is not bound to execution paths")
+        if self.manifest["runtime"] == "ds4" and self.manifest["build"]["path"] != paths["exporter"]:
+            raise TraceError("ds4 build path is not bound to the executed exporter")
         corpus_name = self.manifest["prompt"].get("corpus_name")
         if corpus_name not in CORPUS_SHA256:
             raise TraceError("prompt corpus is not in the fixed correctness corpus set")
@@ -956,20 +985,44 @@ class TraceBundle:
                 raise TraceError("llama.cpp candidate attestation is missing")
             _require_exact_keys(
                 candidate,
-                {"repository", "revision", "base_revision", "diff_sha256", "executable_sha256"},
+                {
+                    "repository",
+                    "revision",
+                    "base_revision",
+                    "diff_sha256",
+                    "executable_path",
+                    "executable_sha256",
+                    "runtime_libraries_sha256",
+                },
                 "llama.cpp candidate attestation",
             )
             if candidate.get("repository") != REPOSITORY:
                 raise TraceError(f"candidate repository must be {REPOSITORY}")
-            for key in ("revision", "base_revision", "diff_sha256", "executable_sha256"):
+            for key in (
+                    "revision",
+                    "base_revision",
+                    "diff_sha256",
+                    "executable_sha256",
+                    "runtime_libraries_sha256"):
                 value = candidate.get(key, "")
                 if not isinstance(value, str) or re.fullmatch(
                         r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}", value) is None:
                     raise TraceError(f"candidate {key} is invalid")
-            if not candidate["revision"].startswith(self.manifest["revision"]):
+            executable_path = candidate.get("executable_path")
+            if not isinstance(executable_path, str) or not executable_path.startswith("/") or (
+                    ".." in PurePosixPath(executable_path).parts or
+                    str(PurePosixPath(executable_path)) != executable_path):
+                raise TraceError("candidate executable path is invalid")
+            if candidate["revision"] != self.manifest["revision"]:
                 raise TraceError("candidate revision does not match the exporter build revision")
+            if candidate.get("executable_path") != self.manifest["build"]["path"]:
+                raise TraceError("candidate executable path does not match the trace build")
             if candidate["executable_sha256"] != self.manifest["build"]["sha256"]:
                 raise TraceError("candidate executable SHA-256 does not match the trace build")
+            runtime_libraries_sha256 = sha256_bytes(
+                canonical_json(self.manifest["build"]["runtime_libraries"]).encode("ascii"))
+            if candidate["runtime_libraries_sha256"] != runtime_libraries_sha256:
+                raise TraceError("candidate runtime library identities do not match the trace build")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
