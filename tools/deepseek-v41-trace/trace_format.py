@@ -377,7 +377,8 @@ class TraceBundle:
             raise TraceError(f"ds4 revision must be {DS4_REVISION}")
         if not isinstance(self.manifest["build"], dict):
             raise TraceError("manifest build is invalid")
-        if re.fullmatch(r"[0-9a-f]{64}", self.manifest["build"].get("sha256", "")) is None:
+        build_sha256 = self.manifest["build"].get("sha256", "")
+        if not isinstance(build_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", build_sha256) is None:
             raise TraceError("manifest build SHA-256 is invalid")
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):
@@ -385,8 +386,11 @@ class TraceBundle:
             digest = self.manifest[section].get("sha256")
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise TraceError(f"manifest {section} SHA-256 is invalid")
-            if not isinstance(self.manifest[section].get("byte_count"), int):
+            if not isinstance(self.manifest[section].get("byte_count"), int) or self.manifest[section]["byte_count"] <= 0:
                 raise TraceError(f"manifest {section} byte_count is invalid")
+        for section in ("config", "comparison", "environment", "audits"):
+            if not isinstance(self.manifest[section], dict):
+                raise TraceError(f"manifest {section} is invalid")
         if self.manifest["model"]["sha256"] != MODEL_SHA256:
             raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
         if self.manifest["model"].get("architecture") != "deepseek41":
@@ -396,6 +400,41 @@ class TraceBundle:
             raise TraceError("prompt corpus is not in the fixed correctness corpus set")
         if self.manifest["prompt"].get("corpus_sha256") != CORPUS_SHA256[corpus_name]:
             raise TraceError(f"prompt corpus SHA-256 is invalid for {corpus_name}")
+        provenance = self.manifest["prompt"].get("provenance")
+        if not isinstance(provenance, dict):
+            raise TraceError("prompt provenance reference is missing")
+        provenance_sha256 = provenance.get("sha256", "")
+        if not isinstance(provenance_sha256, str) or re.fullmatch(
+                r"[0-9a-f]{64}", provenance_sha256) is None:
+            raise TraceError("prompt provenance SHA-256 is invalid")
+        if provenance.get("path") != f"provenance/{provenance_sha256}.json":
+            raise TraceError("prompt provenance path is not content addressed")
+        try:
+            provenance_bytes = (self.root / provenance["path"]).read_bytes()
+            provenance_record = json.loads(provenance_bytes.decode("ascii"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise TraceError(f"cannot read prompt provenance: {error}") from error
+        if sha256_bytes(provenance_bytes) != provenance_sha256:
+            raise TraceError("prompt provenance SHA-256 mismatch")
+        expected_target = self.manifest["config"].get("context", 0) - self.manifest["config"].get("decode_steps", 0)
+        provenance_checks = {
+            "format": "dsv41-prompt-provenance",
+            "version": 1,
+            "corpus_name": corpus_name,
+            "corpus_sha256": self.manifest["prompt"]["corpus_sha256"],
+            "model_sha256": self.manifest["model"]["sha256"],
+            "prompt_sha256": self.manifest["prompt"]["sha256"],
+            "prompt_byte_count": self.manifest["prompt"]["byte_count"],
+            "target_tokens": expected_target,
+            "actual_tokens": expected_target,
+        }
+        for key, value in provenance_checks.items():
+            if provenance_record.get(key) != value:
+                raise TraceError(f"prompt provenance {key} mismatch")
+        if re.fullmatch(r"[0-9a-f]{64}", provenance_record.get("builder_sha256", "")) is None:
+            raise TraceError("prompt provenance builder SHA-256 is invalid")
+        if self.manifest["prompt"].get("target_tokens") != expected_target:
+            raise TraceError("prompt target token count does not fill the configured context")
         if self.manifest["runtime"] == "llama.cpp":
             candidate = self.manifest.get("candidate")
             if not isinstance(candidate, dict):
@@ -403,21 +442,19 @@ class TraceBundle:
             if candidate.get("repository") != REPOSITORY:
                 raise TraceError(f"candidate repository must be {REPOSITORY}")
             for key in ("revision", "base_revision", "diff_sha256", "executable_sha256"):
-                if re.fullmatch(r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}",
-                        candidate.get(key, "")) is None:
+                value = candidate.get(key, "")
+                if not isinstance(value, str) or re.fullmatch(
+                        r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}", value) is None:
                     raise TraceError(f"candidate {key} is invalid")
             if not candidate["revision"].startswith(self.manifest["revision"]):
                 raise TraceError("candidate revision does not match the exporter build revision")
             if candidate["executable_sha256"] != self.manifest["build"]["sha256"]:
                 raise TraceError("candidate executable SHA-256 does not match the trace build")
-        for section in ("config", "comparison", "environment", "audits"):
-            if not isinstance(self.manifest[section], dict):
-                raise TraceError(f"manifest {section} is invalid")
         expected_config = {
             "layer_count": 40,
             "vocab_size": 129280,
             "engram_layers": [1, 14],
-            "engram_rows_per_token": 4,
+            "engram_rows_per_token": 24,
             "expert_count": 384,
             "experts_used": 6,
             "candidate_source_layer": 20,
@@ -430,65 +467,71 @@ class TraceBundle:
             raise TraceError("DeepSeek V4.1 configuration is invalid")
         if self.manifest["comparison"].get("logits") != "byte-identical-f32":
             raise TraceError("logit comparison policy must be byte-identical-f32")
-        for kind in ("memory", "swap", "watchdog"):
-            audit = self.manifest["audits"].get(kind)
-            if not isinstance(audit, dict):
-                raise TraceError(f"manifest {kind} audit reference is invalid")
-            audit_path = audit.get("path")
-            if not isinstance(audit_path, str) or not audit_path:
-                raise TraceError(f"manifest {kind} audit path is invalid")
-            digest = audit.get("sha256", "")
-            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-                raise TraceError(f"manifest {kind} audit SHA-256 is invalid")
-            if not isinstance(audit.get("created_unix"), int) or audit["created_unix"] <= 0:
-                raise TraceError(f"manifest {kind} audit timestamp is invalid")
-            expected_path = f"audits/{digest}.json"
-            if audit_path != expected_path:
-                raise TraceError(f"manifest {kind} audit path is not content addressed")
-            evidence_path = self.root / audit_path
-            try:
-                evidence = evidence_path.read_bytes()
-            except OSError as error:
-                raise TraceError(f"cannot read {kind} audit evidence: {error}") from error
-            if sha256_bytes(evidence) != digest:
-                raise TraceError(f"{kind} audit evidence SHA-256 mismatch")
-            try:
-                record = json.loads(evidence.decode("ascii"))
-            except (UnicodeError, json.JSONDecodeError) as error:
-                raise TraceError(f"{kind} audit evidence is invalid: {error}") from error
-            if record.get("kind") != kind or record.get("created_unix") != audit["created_unix"]:
-                raise TraceError(f"{kind} audit evidence metadata mismatch")
-            if not isinstance(record.get("data"), dict):
-                raise TraceError(f"{kind} audit evidence data is invalid")
-            if kind == "memory":
-                used = record["data"].get("mem_used_bytes")
-                if not isinstance(used, int) or used < 0 or used >= SOFT_MEMORY_LIMIT:
-                    raise TraceError("memory audit evidence is invalid")
-            if kind == "swap":
-                if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
-                    raise TraceError("swap audit evidence does not report zero configured swap")
-            if kind == "watchdog":
-                required = ("pid", "start_time_ticks", "command_sha256", "heartbeat_path", "heartbeat_unix")
-                if any(key not in record["data"] for key in required):
-                    raise TraceError("watchdog audit evidence is incomplete")
-                data = record["data"]
-                if not isinstance(data["pid"], int) or data["pid"] <= 1:
-                    raise TraceError("watchdog audit PID is invalid")
-                if not isinstance(data["start_time_ticks"], int) or data["start_time_ticks"] <= 0:
-                    raise TraceError("watchdog audit start time is invalid")
-                if not isinstance(data["command_sha256"], str) or re.fullmatch(
-                        r"[0-9a-f]{64}", data["command_sha256"]) is None:
-                    raise TraceError("watchdog audit command SHA-256 is invalid")
-                if not isinstance(data["heartbeat_path"], str) or not data["heartbeat_path"]:
-                    raise TraceError("watchdog audit heartbeat path is invalid")
-                if not isinstance(data["heartbeat_unix"], int) or data["heartbeat_unix"] <= 0:
-                    raise TraceError("watchdog audit heartbeat timestamp is invalid")
-                max_age = data.get("max_heartbeat_age_seconds")
-                if not isinstance(max_age, int) or max_age <= 0 or max_age > 30:
-                    raise TraceError("watchdog audit heartbeat age is invalid")
-                if data["heartbeat_unix"] > record["created_unix"] or (
-                        record["created_unix"] - data["heartbeat_unix"] > max_age):
-                    raise TraceError("watchdog audit heartbeat was stale when captured")
+        for audit_phase in ("pre", "post"):
+            phase_audits = self.manifest["audits"].get(audit_phase)
+            if not isinstance(phase_audits, dict):
+                raise TraceError(f"manifest {audit_phase} audit set is invalid")
+            for kind in ("memory", "swap", "watchdog"):
+                self._validate_audit_reference(audit_phase, kind, phase_audits.get(kind))
+
+    def _validate_audit_reference(self, phase: str, kind: str, audit: Any) -> None:
+        if not isinstance(audit, dict):
+            raise TraceError(f"manifest {phase} {kind} audit reference is invalid")
+        audit_path = audit.get("path")
+        if not isinstance(audit_path, str) or not audit_path:
+            raise TraceError(f"manifest {phase} {kind} audit path is invalid")
+        digest = audit.get("sha256", "")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise TraceError(f"manifest {phase} {kind} audit SHA-256 is invalid")
+        if not isinstance(audit.get("created_unix"), int) or audit["created_unix"] <= 0:
+            raise TraceError(f"manifest {phase} {kind} audit timestamp is invalid")
+        expected_path = f"audits/{phase}/{digest}.json"
+        if audit_path != expected_path:
+            raise TraceError(f"manifest {phase} {kind} audit path is not content addressed")
+        evidence_path = self.root / audit_path
+        try:
+            evidence = evidence_path.read_bytes()
+        except OSError as error:
+            raise TraceError(f"cannot read {phase} {kind} audit evidence: {error}") from error
+        if sha256_bytes(evidence) != digest:
+            raise TraceError(f"{phase} {kind} audit evidence SHA-256 mismatch")
+        try:
+            record = json.loads(evidence.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise TraceError(f"{phase} {kind} audit evidence is invalid: {error}") from error
+        if record.get("kind") != kind or record.get("created_unix") != audit["created_unix"]:
+            raise TraceError(f"{phase} {kind} audit evidence metadata mismatch")
+        if not isinstance(record.get("data"), dict):
+            raise TraceError(f"{phase} {kind} audit evidence data is invalid")
+        if kind == "memory":
+            used = record["data"].get("mem_used_bytes")
+            if not isinstance(used, int) or used < 0 or used >= SOFT_MEMORY_LIMIT:
+                raise TraceError(f"{phase} memory audit evidence is invalid")
+        if kind == "swap":
+            if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
+                raise TraceError(f"{phase} swap audit evidence does not report zero configured swap")
+        if kind == "watchdog":
+            required = ("pid", "start_time_ticks", "command_sha256", "heartbeat_path", "heartbeat_unix")
+            if any(key not in record["data"] for key in required):
+                raise TraceError(f"{phase} watchdog audit evidence is incomplete")
+            data = record["data"]
+            if not isinstance(data["pid"], int) or data["pid"] <= 1:
+                raise TraceError(f"{phase} watchdog audit PID is invalid")
+            if not isinstance(data["start_time_ticks"], int) or data["start_time_ticks"] <= 0:
+                raise TraceError(f"{phase} watchdog audit start time is invalid")
+            if not isinstance(data["command_sha256"], str) or re.fullmatch(
+                    r"[0-9a-f]{64}", data["command_sha256"]) is None:
+                raise TraceError(f"{phase} watchdog audit command SHA-256 is invalid")
+            if not isinstance(data["heartbeat_path"], str) or not data["heartbeat_path"]:
+                raise TraceError(f"{phase} watchdog audit heartbeat path is invalid")
+            if not isinstance(data["heartbeat_unix"], int) or data["heartbeat_unix"] <= 0:
+                raise TraceError(f"{phase} watchdog audit heartbeat timestamp is invalid")
+            max_age = data.get("max_heartbeat_age_seconds")
+            if not isinstance(max_age, int) or max_age <= 0 or max_age > 30:
+                raise TraceError(f"{phase} watchdog audit heartbeat age is invalid")
+            if data["heartbeat_unix"] > record["created_unix"] or (
+                    record["created_unix"] - data["heartbeat_unix"] > max_age):
+                raise TraceError(f"{phase} watchdog audit heartbeat was stale when captured")
 
     def read_blob(self, event: dict[str, Any]) -> bytes:
         try:
@@ -615,7 +658,7 @@ class TraceBundle:
             "expert.weights": ("f32", config.get("experts_used")),
             "attn.source": ("i32", None),
             "attn.candidate_blocks": ("i32", None),
-            "attn.candidates": ("i32", config.get("index_top_k")),
+            "attn.candidates": ("i32", None),
         }
         if component not in widths:
             raise TraceError(f"unsupported trace component: {component}")
@@ -626,6 +669,8 @@ class TraceBundle:
             raise TraceError(f"{component} shape must be [{width},token_count]")
         if component == "attn.candidate_blocks" and shape[0] > config.get("candidate_topk_blocks", 0):
             raise TraceError("attn.candidate_blocks width exceeds candidate_topk_blocks")
+        if component in ("attn.source", "attn.candidates") and shape[0] > config.get("index_top_k", 0):
+            raise TraceError(f"{component} width exceeds index_top_k")
         if component == "expert.ids":
             values = struct.iter_unpack("<i", self.read_blob(event))
             if any(value < 0 or value >= config.get("expert_count", 0) for value, in values):
@@ -723,6 +768,7 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             None,
             "a trace contains duplicate phase/step/token/layer/component coordinates",
         )
+    mismatches = []
     all_keys = sorted(set(left_map) | set(right_map), key=event_order)
     for key in all_keys:
         left_event = left_map.get(key)
@@ -730,7 +776,7 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
         template = left_event or right_event
         assert template is not None
         if left_event is None or right_event is None:
-            return Mismatch(
+            mismatches.append(Mismatch(
                 "artifact_missing",
                 template["component"],
                 template["phase"],
@@ -738,10 +784,13 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
                 template["token_start"],
                 template["layer"],
                 "event is missing from " + ("left" if left_event is None else "right") + " trace",
-            )
+                token_index=template["token_start"],
+            ))
+            continue
+        shape_mismatch = False
         for field in ("dtype", "shape", "token_count", "semantic_id_space"):
             if left_event.get(field) != right_event.get(field):
-                return Mismatch(
+                mismatches.append(Mismatch(
                     "artifact_shape",
                     template["component"],
                     template["phase"],
@@ -749,7 +798,12 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
                     template["token_start"],
                     template["layer"],
                     f"{field} differs: {left_event.get(field)!r} != {right_event.get(field)!r}",
-                )
+                    token_index=template["token_start"],
+                ))
+                shape_mismatch = True
+                break
+        if shape_mismatch:
+            continue
         if left_event["sha256"] == right_event["sha256"]:
             continue
         left_data = left.read_blob(left_event)
@@ -772,7 +826,7 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             left_item = left_data[item_offset:item_offset + item_size]
             right_item = right_data[item_offset:item_offset + item_size]
             detail += f"; left=0x{left_item.hex()} right=0x{right_item.hex()}"
-        return Mismatch(
+        mismatches.append(Mismatch(
             classify(template["component"]),
             template["component"],
             template["phase"],
@@ -784,8 +838,19 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             byte_offset=byte_offset,
             token_index=token_index,
             component_element_index=component_element_index,
-        )
-    return None
+        ))
+    if not mismatches:
+        return None
+    phase_order = {"input": 0, "prefill": 1, "decode": 2, "metadata": -1}
+    component_order = {component: index for index, component in enumerate(HARD_FAILURE_COMPONENTS)}
+    return min(mismatches, key=lambda item: (
+        phase_order.get(item.phase, 99),
+        item.token_index if item.token_index is not None else item.token_start,
+        item.step,
+        -1 if item.layer is None else item.layer,
+        component_order.get(item.component, 99),
+        item.component,
+    ))
 
 
 def report(left: TraceBundle, right: TraceBundle) -> dict[str, Any]:

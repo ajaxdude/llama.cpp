@@ -7,11 +7,12 @@ Each trace is a directory:
 - `manifest.json` records the model and prompt SHA-256 values, exact runtime revision/build, inference configuration, environment, and content-addressed memory/swap/watchdog audit references.
 - `events.jsonl` is an ordered stream of content-addressed event records.
 - `blobs/<sha256>.bin` stores canonical little-endian tensor bytes. This keeps complete logits and per-token state exact without embedding large numeric arrays in JSON.
-- `audits/<sha256>.json` stores the immutable safety evidence referenced by the manifest.
+- `audits/pre/<sha256>.json` and `audits/post/<sha256>.json` store immutable safety evidence from both sides of execution.
+- `provenance/<sha256>.json` binds the exact prompt to its fixed corpus, published model, target token count, and prompt-builder executable.
 
 The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected.
 
-Internal tensors use raw ggml dimension order. The validator requires Engram rows as i32 `[4, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, attention-source IDs as nonempty rank-2 i32 with `token_count` in the second dimension, layer-20 candidate blocks as rank-2 i32 with width at most 2048, propagated candidates as i32 `[512, token_count]`, and complete f32 logits as `[129280]`. Original expert IDs must be within `0..383`.
+Internal tensors use raw ggml dimension order. The validator requires Engram rows as i32 `[24, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, attention-source IDs as nonempty rank-2 i32 with width at most 512 and `token_count` in the second dimension, layer-20 candidate blocks as rank-2 i32 with width at most 2048, propagated candidates as rank-2 i32 with width at most 512, and complete f32 logits as `[129280]`. Original expert IDs must be within `0..383`.
 
 Validate or compare bundles:
 
@@ -55,6 +56,7 @@ python3 tools/deepseek-v41-trace/run_ds4.py \
   --prompt /path/on/nvme/correctness-prose-32768.txt \
   --corpus-name correctness-prose.txt \
   --corpus-sha256 2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2 \
+  --prompt-provenance /path/on/nvme/correctness-prose-32768.txt.provenance.json \
   --output /path/on/nvme/traces/ds4-prose-32768 \
   --watchdog-pid-file /run/user/$(id -u)/dsv41-watchdog.pid \
   --exporter /path/to/pinned-ds4-trace-exporter \
@@ -65,6 +67,6 @@ The exporter is intentionally external to the canonical ds4 checkout. It must be
 
 The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the normal model, context, batch, ubatch, KV, Flash Attention, offload, and expert-cache arguments. `-bf` supplies the exact prompt bytes, `-n` is the number of greedy decode steps, and `-o` is the trace directory. It also requires `DSV41_TRACE_MEMORY_AUDIT`, `DSV41_TRACE_SWAP_AUDIT`, and `DSV41_TRACE_WATCHDOG_AUDIT` so every run points to its safety evidence.
 
-Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, and NVMe gates and embeds content-addressed audit evidence in the trace. It requires the exact candidate revision, full-graph base revision, expected base-to-candidate binary diff SHA-256, and repository path. It rejects a dirty checkout or an exporter whose embedded build revision or executable hash does not match that attestation.
+Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, and NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact candidate revision, full-graph base revision, expected base-to-candidate binary diff SHA-256, and repository path. It rejects tracked or untracked checkout changes and rejects an exporter whose embedded build revision or executable hash does not match that attestation.
 
-`run_matrix.py` copies the four repository corpora byte-for-byte into the NVMe result directory, records their hashes, builds exact-length prompt artifacts, runs ds4 and llama.cpp with matched context/decode settings, compares each bundle immediately, and stops at the first divergence. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build. Its default context matrix is 32768. Pass `--contexts 32768 65536 98304 131072` only after the 32K target passes.
+`run_matrix.py` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, runs ds4 and llama.cpp with matched context/decode settings, compares each bundle immediately, and stops at the first divergence. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the candidate revision, full-graph base revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass `--contexts 32768 65536 98304 131072` only after the 32K target passes.

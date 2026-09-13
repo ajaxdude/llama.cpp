@@ -8,7 +8,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, bind_embedded_audits, bind_prompt_provenance, resolved, run_preflight, write_audits
+from preflight import (
+    PreflightError,
+    bind_embedded_audits,
+    bind_prompt_provenance,
+    resolved,
+    run_preflight,
+    validate_prompt_provenance,
+    write_audits,
+)
 from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, sha256_file
 
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
@@ -62,6 +70,7 @@ def main() -> int:
     parser.add_argument("--exporter-sha256", required=True)
     parser.add_argument("--corpus-name", choices=sorted(CORPUS_SHA256), required=True)
     parser.add_argument("--corpus-sha256", required=True)
+    parser.add_argument("--prompt-provenance", type=Path, required=True)
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--prefill-chunk", type=int, default=512)
@@ -71,8 +80,8 @@ def main() -> int:
     try:
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
-        audit = preflight(args)
         if args.preflight_only:
+            audit = preflight(args)
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
@@ -86,11 +95,20 @@ def main() -> int:
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
-        audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
+        provenance = validate_prompt_provenance(
+            args.prompt_provenance,
+            prompt=args.prompt,
+            corpus_name=args.corpus_name,
+            corpus_sha256=args.corpus_sha256,
+            model_sha256=model_sha256,
+            target_tokens=args.context - args.decode_steps,
+        )
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
-        audits = write_audits(Path(str(output) + ".audit"), audit)
+        preflight_audit = preflight(args)
+        preflight_audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
+        pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
         command = [
             str(exporter),
             "--model", str(resolved(args.model)),
@@ -99,17 +117,18 @@ def main() -> int:
             "--context", str(args.context),
             "--decode-steps", str(args.decode_steps),
             "--prefill-chunk", str(args.prefill_chunk),
-            "--memory-audit", audits["memory"],
-            "--swap-audit", audits["swap"],
-            "--watchdog-audit", audits["watchdog"],
+            "--memory-audit", pre_audits["memory"],
+            "--swap-audit", pre_audits["swap"],
+            "--watchdog-audit", pre_audits["watchdog"],
         ]
         print("exec:", shlex.join(command), file=sys.stderr)
         result = subprocess.run(command, cwd=resolved(args.checkout), check=False)
         if result.returncode != 0:
             return result.returncode
-        preflight(args)
-        bind_embedded_audits(output, audits)
-        bind_prompt_provenance(output, args.corpus_name, args.corpus_sha256)
+        postflight_audit = preflight(args)
+        post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
+        bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
+        bind_prompt_provenance(output, provenance)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "ds4":
             raise PreflightError("ds4 exporter wrote a non-ds4 trace")

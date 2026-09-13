@@ -209,7 +209,7 @@ static std::string tensor_dtype(const ggml_tensor * tensor) {
 
 static std::vector<int64_t> tensor_shape(const ggml_tensor * tensor) {
     int rank = GGML_MAX_DIMS;
-    while (rank > 1 && tensor->ne[rank - 1] == 1) {
+    while (rank > 2 && tensor->ne[rank - 1] == 1) {
         --rank;
     }
     std::vector<int64_t> result;
@@ -562,7 +562,7 @@ int main(int argc, char ** argv) {
                     {"layer_count", 40},
                     {"vocab_size", n_vocab},
                     {"engram_layers", {1, 14}},
-                    {"engram_rows_per_token", 4},
+                    {"engram_rows_per_token", 24},
                     {"expert_count", 384},
                     {"experts_used", 6},
                     {"candidate_source_layer", 20},

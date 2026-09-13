@@ -215,9 +215,9 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
     return result
 
 
-def embed_audits(trace_root: Path, audits: dict[str, str]) -> dict[str, dict[str, object]]:
+def embed_audits(trace_root: Path, phase: str, audits: dict[str, str]) -> dict[str, dict[str, object]]:
     trace_root = resolved(trace_root)
-    embedded_root = trace_root / "audits"
+    embedded_root = trace_root / "audits" / phase
     embedded_root.mkdir(parents=True, exist_ok=True)
     result = {}
     for kind in ("memory", "swap", "watchdog"):
@@ -235,27 +235,72 @@ def embed_audits(trace_root: Path, audits: dict[str, str]) -> dict[str, dict[str
         except (UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             raise PreflightError(f"cannot embed {kind} audit: {error}") from error
         result[kind] = {
-            "path": f"audits/{digest}.json",
+            "path": f"audits/{phase}/{digest}.json",
             "sha256": digest,
             "created_unix": created,
         }
     return result
 
 
-def bind_embedded_audits(trace_root: Path, audits: dict[str, str]) -> None:
+def bind_embedded_audits(trace_root: Path, audit_sets: dict[str, dict[str, str]]) -> None:
     trace_root = resolved(trace_root)
     manifest_path = trace_root / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"cannot bind trace audits: {error}") from error
-    manifest["audits"] = embed_audits(trace_root, audits)
+    if set(audit_sets) != {"pre", "post"}:
+        raise PreflightError("trace requires pre and post audit sets")
+    manifest["audits"] = {
+        phase: embed_audits(trace_root, phase, audits)
+        for phase, audits in audit_sets.items()
+    }
     temp = manifest_path.with_suffix(".tmp")
     temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     os.replace(temp, manifest_path)
 
 
-def bind_prompt_provenance(trace_root: Path, corpus_name: str, corpus_sha256: str) -> None:
+def validate_prompt_provenance(
+    path: Path,
+    *,
+    prompt: Path,
+    corpus_name: str,
+    corpus_sha256: str,
+    model_sha256: str,
+    target_tokens: int,
+) -> dict[str, object]:
+    path = require_nvme_path(path, "prompt provenance")
+    try:
+        data = path.read_bytes()
+        record = json.loads(data.decode("ascii"))
+        prompt_path = resolved(prompt)
+        prompt_bytes = prompt_path.read_bytes()
+        prompt_size = prompt_path.stat().st_size
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"prompt provenance is invalid: {error}") from error
+    if not isinstance(record, dict):
+        raise PreflightError("prompt provenance must be a JSON object")
+    expected = {
+        "format": "dsv41-prompt-provenance",
+        "version": 1,
+        "corpus_name": corpus_name,
+        "corpus_sha256": corpus_sha256,
+        "model_sha256": model_sha256,
+        "prompt_sha256": sha256_bytes(prompt_bytes),
+        "prompt_byte_count": prompt_size,
+        "target_tokens": target_tokens,
+        "actual_tokens": target_tokens,
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise PreflightError(f"prompt provenance {key} mismatch")
+    builder_sha256 = record.get("builder_sha256", "")
+    if not isinstance(builder_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", builder_sha256) is None:
+        raise PreflightError("prompt provenance builder SHA-256 is invalid")
+    return {"path": str(path), "bytes": data, "record": record}
+
+
+def bind_prompt_provenance(trace_root: Path, provenance: dict[str, object]) -> None:
     trace_root = resolved(trace_root)
     manifest_path = trace_root / "manifest.json"
     try:
@@ -265,8 +310,25 @@ def bind_prompt_provenance(trace_root: Path, corpus_name: str, corpus_sha256: st
     prompt = manifest.get("prompt")
     if not isinstance(prompt, dict):
         raise PreflightError("trace manifest prompt is invalid")
-    prompt["corpus_name"] = corpus_name
-    prompt["corpus_sha256"] = corpus_sha256
+    record = provenance["record"]
+    data = provenance["bytes"]
+    if not isinstance(record, dict) or not isinstance(data, bytes):
+        raise PreflightError("validated prompt provenance is invalid")
+    digest = sha256_bytes(data)
+    provenance_root = trace_root / "provenance"
+    provenance_root.mkdir(parents=True, exist_ok=True)
+    destination = provenance_root / f"{digest}.json"
+    if destination.exists() and destination.read_bytes() != data:
+        raise PreflightError(f"content-addressed provenance collision: {destination}")
+    if not destination.exists():
+        destination.write_bytes(data)
+    prompt["corpus_name"] = record["corpus_name"]
+    prompt["corpus_sha256"] = record["corpus_sha256"]
+    prompt["target_tokens"] = record["target_tokens"]
+    prompt["provenance"] = {
+        "path": f"provenance/{digest}.json",
+        "sha256": digest,
+    }
     temp = manifest_path.with_suffix(".tmp")
     temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     os.replace(temp, manifest_path)

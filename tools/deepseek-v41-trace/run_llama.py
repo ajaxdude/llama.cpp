@@ -9,7 +9,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, bind_embedded_audits, bind_prompt_provenance, resolved, run_preflight, write_audits
+from preflight import (
+    PreflightError,
+    bind_embedded_audits,
+    bind_prompt_provenance,
+    resolved,
+    run_preflight,
+    validate_prompt_provenance,
+    write_audits,
+)
 from trace_format import CORPUS_SHA256, MODEL_SHA256, REPOSITORY, TraceBundle, TraceError, sha256_file
 
 
@@ -51,6 +59,9 @@ def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dic
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise PreflightError(f"candidate repository is not cleanly based on {base_revision}: {error}") from error
+    status = git_output(repo, "status", "--porcelain", "--untracked-files=all")
+    if status:
+        raise PreflightError("candidate repository has tracked or untracked changes")
     diff = git_output(repo, "diff", "--binary", "--no-ext-diff", base_revision, revision, "--")
     diff_sha256 = hashlib.sha256(diff).hexdigest()
     if diff_sha256 != args.candidate_diff_sha256:
@@ -105,6 +116,7 @@ def main() -> int:
     parser.add_argument("--candidate-diff-sha256", required=True)
     parser.add_argument("--corpus-name", choices=sorted(CORPUS_SHA256), required=True)
     parser.add_argument("--corpus-sha256", required=True)
+    parser.add_argument("--prompt-provenance", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -123,24 +135,14 @@ def main() -> int:
     try:
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
-        audit = run_preflight(
-            model=args.model,
-            prompt=args.prompt,
-            output=args.output,
-            watchdog_pid_file=args.watchdog_pid_file,
-            busy_patterns=args.busy_pattern,
-        )
-        audit["runtime"] = "llama.cpp"
-        audit["config"] = {
-            "context": args.context,
-            "decode_steps": args.decode_steps,
-            "batch": args.batch,
-            "ubatch": args.ubatch,
-            "expert_cache_slots": args.expert_cache_slots,
-            "expert_cache_mib": args.expert_cache_mib,
-            "gpu_layers": args.gpu_layers,
-        }
         if args.preflight_only:
+            audit = run_preflight(
+                model=args.model,
+                prompt=args.prompt,
+                output=args.output,
+                watchdog_pid_file=args.watchdog_pid_file,
+                busy_patterns=args.busy_pattern,
+            )
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
@@ -151,29 +153,56 @@ def main() -> int:
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        provenance = validate_prompt_provenance(
+            args.prompt_provenance,
+            prompt=args.prompt,
+            corpus_name=args.corpus_name,
+            corpus_sha256=args.corpus_sha256,
+            model_sha256=model_sha256,
+            target_tokens=args.context - args.decode_steps,
+        )
         attestation = candidate_attestation(args, exporter_sha256)
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
-        audits = write_audits(Path(str(output) + ".audit"), audit)
-        environment = os.environ.copy()
-        environment["DSV41_TRACE_MEMORY_AUDIT"] = audits["memory"]
-        environment["DSV41_TRACE_SWAP_AUDIT"] = audits["swap"]
-        environment["DSV41_TRACE_WATCHDOG_AUDIT"] = audits["watchdog"]
-        command = build_command(args, exporter, output)
-        print("exec:", shlex.join(command), file=sys.stderr)
-        result = subprocess.run(command, env=environment, check=False)
-        if result.returncode != 0:
-            return result.returncode
-        run_preflight(
+        preflight_audit = run_preflight(
             model=args.model,
             prompt=args.prompt,
             output=args.output,
             watchdog_pid_file=args.watchdog_pid_file,
             busy_patterns=args.busy_pattern,
         )
-        bind_embedded_audits(output, audits)
-        bind_prompt_provenance(output, args.corpus_name, args.corpus_sha256)
+        preflight_audit["runtime"] = "llama.cpp"
+        preflight_audit["config"] = {
+            "context": args.context,
+            "decode_steps": args.decode_steps,
+            "batch": args.batch,
+            "ubatch": args.ubatch,
+            "expert_cache_slots": args.expert_cache_slots,
+            "expert_cache_mib": args.expert_cache_mib,
+            "gpu_layers": args.gpu_layers,
+        }
+        pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
+        environment = os.environ.copy()
+        environment["DSV41_TRACE_MEMORY_AUDIT"] = pre_audits["memory"]
+        environment["DSV41_TRACE_SWAP_AUDIT"] = pre_audits["swap"]
+        environment["DSV41_TRACE_WATCHDOG_AUDIT"] = pre_audits["watchdog"]
+        command = build_command(args, exporter, output)
+        print("exec:", shlex.join(command), file=sys.stderr)
+        result = subprocess.run(command, env=environment, check=False)
+        if result.returncode != 0:
+            return result.returncode
+        postflight_audit = run_preflight(
+            model=args.model,
+            prompt=args.prompt,
+            output=args.output,
+            watchdog_pid_file=args.watchdog_pid_file,
+            busy_patterns=args.busy_pattern,
+        )
+        postflight_audit["runtime"] = "llama.cpp"
+        post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
+        bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
+        bind_prompt_provenance(output, provenance)
         bind_candidate_attestation(output, attestation)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "llama.cpp":

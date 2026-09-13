@@ -31,6 +31,8 @@ def prepare_prompt(
     builder: Path,
     model: Path,
     corpus: Path,
+    corpus_name: str,
+    corpus_sha256: str,
     output: Path,
     target_tokens: int,
 ) -> dict[str, object]:
@@ -52,9 +54,24 @@ def prepare_prompt(
     if record.get("actual_tokens") != target_tokens:
         raise RuntimeError("prompt builder did not produce the requested token count")
     record.update({
-        "path": str(output),
-        "sha256": sha256_file(output),
+        "format": "dsv41-prompt-provenance",
+        "version": 1,
+        "corpus_name": corpus_name,
+        "corpus_sha256": corpus_sha256,
+        "model_sha256": MODEL_SHA256,
+        "prompt_sha256": sha256_file(output),
+        "prompt_byte_count": output.stat().st_size,
         "builder_sha256": sha256_file(builder),
+    })
+    provenance_path = output.with_suffix(output.suffix + ".provenance.json")
+    provenance_path.write_text(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+    record.update({
+        "path": str(output),
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": sha256_file(provenance_path),
     })
     return record
 
@@ -145,6 +162,8 @@ def main() -> int:
                     builder=resolved(args.llama_prompt_builder),
                     model=model,
                     corpus=Path(corpus["path"]),
+                    corpus_name=corpus["name"],
+                    corpus_sha256=corpus["sha256"],
                     output=prompt,
                     target_tokens=target_tokens,
                 )
@@ -158,9 +177,11 @@ def main() -> int:
                     llama_output = output / "llama" / case
                     ds4_output = output / "ds4" / case
                     prompt = prepared_prompts[corpus["name"]]["path"]
+                    provenance = prepared_prompts[corpus["name"]]["provenance_path"]
                     common = [
                         "--model", str(model),
                         "--prompt", prompt,
+                        "--prompt-provenance", provenance,
                         "--corpus-name", corpus["name"],
                         "--corpus-sha256", corpus["sha256"],
                         "--watchdog-pid-file", str(resolved(args.watchdog_pid_file)),

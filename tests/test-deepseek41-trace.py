@@ -50,20 +50,42 @@ def audit_bytes(kind: str) -> bytes:
     return (json.dumps(AUDIT_RECORDS[kind], sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
 
-def manifest(runtime: str = "llama.cpp") -> dict:
+def provenance_bytes(prompt: bytes = b"abc") -> bytes:
+    record = {
+        "format": "dsv41-prompt-provenance",
+        "version": 1,
+        "corpus_name": "correctness-prose.txt",
+        "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
+        "model_sha256": trace.MODEL_SHA256,
+        "prompt_sha256": trace.sha256_bytes(prompt),
+        "prompt_byte_count": len(prompt),
+        "target_tokens": 2,
+        "actual_tokens": 2,
+        "builder_sha256": "8" * 64,
+    }
+    return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
+    provenance_sha256 = trace.sha256_bytes(provenance_bytes(prompt))
     result = {
         "runtime": runtime,
         "revision": trace.DS4_REVISION if runtime == "ds4" else "a" * 40,
         "build": {"sha256": "3" * 64},
         "model": {"sha256": trace.MODEL_SHA256, "byte_count": 123, "architecture": "deepseek41"},
         "prompt": {
-            "sha256": trace.sha256_bytes(b"abc"),
-            "byte_count": 3,
+            "sha256": trace.sha256_bytes(prompt),
+            "byte_count": len(prompt),
             "corpus_name": "correctness-prose.txt",
             "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
+            "target_tokens": 2,
+            "provenance": {
+                "path": f"provenance/{provenance_sha256}.json",
+                "sha256": provenance_sha256,
+            },
         },
         "config": {
-            "context": 32768,
+            "context": 3,
             "decode_steps": 1,
             "batch": 512,
             "ubatch": 128,
@@ -76,7 +98,7 @@ def manifest(runtime: str = "llama.cpp") -> dict:
                 "layer_count": 40,
                 "vocab_size": 129280,
                 "engram_layers": [1, 14],
-                "engram_rows_per_token": 4,
+                "engram_rows_per_token": 24,
                 "expert_count": 384,
                 "experts_used": 6,
                 "candidate_source_layer": 20,
@@ -106,12 +128,15 @@ def manifest(runtime: str = "llama.cpp") -> dict:
         },
         "environment": {},
         "audits": {
-            kind: {
-                "path": f"audits/{trace.sha256_bytes(audit_bytes(kind))}.json",
-                "sha256": trace.sha256_bytes(audit_bytes(kind)),
-                "created_unix": 1,
+            phase: {
+                kind: {
+                    "path": f"audits/{phase}/{trace.sha256_bytes(audit_bytes(kind))}.json",
+                    "sha256": trace.sha256_bytes(audit_bytes(kind)),
+                    "created_unix": 1,
+                }
+                for kind in ("memory", "swap", "watchdog")
             }
-            for kind in ("memory", "swap", "watchdog")
+            for phase in ("pre", "post")
         },
     }
     if runtime == "llama.cpp":
@@ -125,12 +150,17 @@ def manifest(runtime: str = "llama.cpp") -> dict:
     return result
 
 
-def add_required_events(writer: object, logits: bytes | None = None) -> None:
-    audit_root = writer.root / "audits"
-    audit_root.mkdir(exist_ok=True)
-    for kind in ("memory", "swap", "watchdog"):
-        data = audit_bytes(kind)
-        (audit_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
+def add_required_events(writer: object, logits: bytes | None = None, prompt: bytes = b"abc") -> None:
+    for phase in ("pre", "post"):
+        audit_root = writer.root / "audits" / phase
+        audit_root.mkdir(parents=True, exist_ok=True)
+        for kind in ("memory", "swap", "watchdog"):
+            data = audit_bytes(kind)
+            (audit_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
+    provenance_root = writer.root / "provenance"
+    provenance_root.mkdir(exist_ok=True)
+    data = provenance_bytes(prompt)
+    (provenance_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
     writer.add_event(
         component="prompt.bytes",
         phase="input",
@@ -139,8 +169,8 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=None,
         dtype="bytes",
-        shape=[3],
-        data=b"abc",
+        shape=[len(prompt)],
+        data=prompt,
     )
     writer.add_event(
         component="prompt.tokens",
@@ -161,8 +191,8 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=1,
         dtype="i32",
-        shape=[4, 2],
-        data=struct.pack("<iiiiiiii", 1, 2, 3, 4, 5, 6, 7, 8),
+        shape=[24, 2],
+        data=struct.pack("<" + "i" * 48, *range(48)),
     )
     writer.add_event(
         component="expert.ids",
@@ -244,7 +274,7 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
     )
     writer.add_event(
         component="engram.row_ids", phase="decode", step=0, token_start=2, token_count=1,
-        layer=1, dtype="i32", shape=[4, 1], data=struct.pack("<iiii", 9, 10, 11, 12))
+        layer=1, dtype="i32", shape=[24, 1], data=struct.pack("<" + "i" * 24, *range(24)))
     writer.add_event(
         component="expert.ids", phase="decode", step=0, token_start=2, token_count=1,
         layer=0, dtype="i32", shape=[6, 1], data=struct.pack("<iiiiii", 1, 2, 3, 4, 5, 6),
@@ -275,10 +305,10 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
     )
     writer.add_event(
         component="engram.row_ids", phase="prefill", step=0, token_start=0, token_count=2,
-        layer=14, dtype="i32", shape=[4, 2], data=struct.pack("<iiiiiiii", 1, 2, 3, 4, 5, 6, 7, 8))
+        layer=14, dtype="i32", shape=[24, 2], data=struct.pack("<" + "i" * 48, *range(48)))
     writer.add_event(
         component="engram.row_ids", phase="decode", step=0, token_start=2, token_count=1,
-        layer=14, dtype="i32", shape=[4, 1], data=struct.pack("<iiii", 9, 10, 11, 12))
+        layer=14, dtype="i32", shape=[24, 1], data=struct.pack("<" + "i" * 24, *range(24)))
     for layer in range(1, 40):
         writer.add_event(
             component="expert.ids", phase="prefill", step=0, token_start=0, token_count=2,
@@ -360,6 +390,37 @@ class TraceFormatTests(unittest.TestCase):
             self.assertEqual(divergence["token_index"], 1)
             self.assertEqual(divergence["component_element_index"], 2)
 
+    def test_compare_selects_global_first_token_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            left = Path(temp) / "left"
+            right = Path(temp) / "right"
+            with trace.TraceBundleWriter(left, manifest("ds4")) as writer:
+                add_required_events(writer)
+            with trace.TraceBundleWriter(right, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            events_path = right / trace.EVENTS_NAME
+            events = [json.loads(line) for line in events_path.read_text(encoding="ascii").splitlines()]
+            for layer, element in ((0, 8), (1, 2)):
+                event = next(item for item in events if (
+                    item["component"] == "expert.ids" and
+                    item["phase"] == "prefill" and
+                    item["layer"] == layer
+                ))
+                values = list(struct.unpack("<iiiiiiiiiiii", (right / event["blob"]).read_bytes()))
+                values[element] = 9
+                data = struct.pack("<iiiiiiiiiiii", *values)
+                event["sha256"] = trace.sha256_bytes(data)
+                event["blob"] = f"blobs/{event['sha256']}.bin"
+                (right / event["blob"]).write_bytes(data)
+            events_path.write_text(
+                "".join(trace.canonical_json(event) + "\n" for event in events),
+                encoding="ascii",
+            )
+            result = trace.report(trace.TraceBundle(left), trace.TraceBundle(right))
+            divergence = result["first_divergence"]
+            self.assertEqual(divergence["token_index"], 0)
+            self.assertEqual(divergence["layer"], 1)
+
     def test_llama_runner_preserves_binary_prompt_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -418,7 +479,7 @@ class TraceFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
             bad_manifest = manifest()
-            bad_manifest["audits"]["watchdog"] = "watchdog.json"
+            bad_manifest["audits"]["pre"]["watchdog"] = "watchdog.json"
             with trace.TraceBundleWriter(root, bad_manifest) as writer:
                 add_required_events(writer)
             with self.assertRaisesRegex(trace.TraceError, "watchdog audit reference"):
@@ -429,8 +490,17 @@ class TraceFormatTests(unittest.TestCase):
             trace_manifest = manifest()
             with trace.TraceBundleWriter(root, trace_manifest) as writer:
                 add_required_events(writer)
-            (root / trace_manifest["audits"]["memory"]["path"]).unlink()
-            with self.assertRaisesRegex(trace.TraceError, "memory audit evidence"):
+            (root / trace_manifest["audits"]["pre"]["memory"]["path"]).unlink()
+            with self.assertRaisesRegex(trace.TraceError, "pre memory audit evidence"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest()
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            (root / trace_manifest["audits"]["post"]["watchdog"]["path"]).unlink()
+            with self.assertRaisesRegex(trace.TraceError, "post watchdog audit evidence"):
                 trace.TraceBundle(root)
 
     def test_rejects_unpinned_ds4_revision(self) -> None:
@@ -510,23 +580,12 @@ class TraceFormatTests(unittest.TestCase):
             left = Path(temp) / "left"
             right = Path(temp) / "right"
             left_manifest = manifest("ds4")
-            right_manifest = manifest("llama.cpp")
             right_prompt = b"abd"
-            right_manifest["prompt"]["sha256"] = trace.sha256_bytes(right_prompt)
+            right_manifest = manifest("llama.cpp", right_prompt)
             with trace.TraceBundleWriter(left, left_manifest) as writer:
                 add_required_events(writer)
             with trace.TraceBundleWriter(right, right_manifest) as writer:
-                add_required_events(writer)
-            events_path = right / trace.EVENTS_NAME
-            events = [json.loads(line) for line in events_path.read_text(encoding="ascii").splitlines()]
-            prompt_event = next(event for event in events if event["component"] == "prompt.bytes")
-            prompt_event["sha256"] = trace.sha256_bytes(right_prompt)
-            prompt_event["blob"] = f"blobs/{prompt_event['sha256']}.bin"
-            (right / prompt_event["blob"]).write_bytes(right_prompt)
-            events_path.write_text(
-                "".join(trace.canonical_json(event) + "\n" for event in events),
-                encoding="ascii",
-            )
+                add_required_events(writer, prompt=right_prompt)
             result = trace.report(trace.TraceBundle(left), trace.TraceBundle(right))
             self.assertEqual(result["first_divergence"]["classification"], "prompt_identity")
 
@@ -534,6 +593,7 @@ class TraceFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
             incomplete = manifest()
+            incomplete["config"]["context"] = 4
             incomplete["config"]["decode_steps"] = 2
             incomplete["expected"]["decode_steps"] = 2
             with trace.TraceBundleWriter(root, incomplete) as writer:
