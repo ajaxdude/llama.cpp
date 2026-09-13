@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 struct dsv41_trace_descriptor {
@@ -48,17 +49,24 @@ inline std::optional<dsv41_trace_descriptor> dsv41_trace_parse_name(const std::s
         for (size_t index = prefix.size(); index < name.size(); ++index) {
             const char value = name[index];
             if (value < '0' || value > '9') {
-                return std::nullopt;
+                throw std::runtime_error("malformed reserved trace tensor name: " + name);
             }
             layer = 10*layer + value - '0';
             if (layer >= 40) {
-                return std::nullopt;
+                throw std::runtime_error("unexpected reserved trace tensor layer: " + name);
             }
         }
         if (!dsv41_trace_expected_layer(entry.component, layer)) {
-            return std::nullopt;
+            throw std::runtime_error("unexpected reserved trace tensor layer: " + name);
         }
         return dsv41_trace_descriptor{entry.component, layer, entry.semantic_id_space};
     }
+    if (name.rfind("dsv41.trace.", 0) == 0) {
+        throw std::runtime_error("malformed reserved trace tensor name: " + name);
+    }
     return std::nullopt;
+}
+
+inline bool dsv41_trace_select_name(const std::string & name) {
+    return dsv41_trace_parse_name(name).has_value();
 }

@@ -359,10 +359,10 @@ private:
 
 static bool trace_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * writer = static_cast<trace_writer *>(user_data);
-    if (ask) {
-        return dsv41_trace_parse_name(tensor->name).has_value();
-    }
     try {
+        if (ask) {
+            return dsv41_trace_select_name(tensor->name);
+        }
         writer->add_tensor(tensor);
         return !writer->has_error();
     } catch (const std::exception & error) {

@@ -378,8 +378,23 @@ static void test_graph_contract() {
                 engram->layer == (int) layer,
                 "exporter does not recognize Engram row trace");
     }
-    check(!dsv41_trace_parse_name("dsv41.trace.attn.candidates.l20"),
+    expect_throw(
+            [] {
+                dsv41_trace_select_name("dsv41.trace.attn.candidates.l20");
+            },
             "exporter accepted an unexpected candidate trace layer");
+    expect_throw(
+            [] {
+                dsv41_trace_select_name("dsv41.trace.attn.candidates.layer24");
+            },
+            "exporter accepted a malformed trace layer suffix");
+    expect_throw(
+            [] {
+                dsv41_trace_select_name("dsv41.trace.unknown.l24");
+            },
+            "exporter accepted an unknown reserved trace tensor name");
+    check(!dsv41_trace_select_name("dsv41_attn_candidates_l24"),
+            "exporter treated an ordinary graph tensor as reserved");
     check(llama_dsv41_build_layer_plan(39, { 39 }, 1024).collapses_output,
             "final layer must preserve streams for carried-pre output collapse");
 }
