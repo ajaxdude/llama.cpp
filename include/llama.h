@@ -363,6 +363,7 @@ extern "C" {
         uint32_t dsv41_admission_ubatch;
         uint32_t dsv41_admission_outputs;
         uint32_t dsv41_admission_outputs_per_seq;
+        enum ggml_type dsv41_admission_type_k;
         const char * dsv41_procfs_root;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
@@ -389,6 +390,7 @@ extern "C" {
         bool ple_on_disk;     // keep the n-gram hash-embedding table (per_layer_token_embd) on disk: never
                               // mapped or loaded, the rows a batch needs are read from the file (qwen4exp)
         bool ple_direct_io;   // read those rows with O_DIRECT, bypassing the page cache
+        bool dsv41_admission_offload_kqv;
     };
 
     struct llama_sampler_seq_config {

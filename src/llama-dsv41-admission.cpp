@@ -333,14 +333,10 @@ llama_dsv41_admission_result llama_dsv41_admit(
     if (params.configured_cache_bytes != 0) {
         slot_cap = std::min(slot_cap, bytes_slots);
     }
-    const auto state = llama_dsv41_account_memory(
-            params.n_ctx,
-            params.n_seq,
-            params.n_ubatch,
-            params.kv_element_size,
-            params.index_element_size,
-            0);
-    result.state_bytes = state.total();
+    if (params.state_bytes == 0) {
+        reject("state", result, "exact no-allocation state size is missing");
+    }
+    result.state_bytes = params.state_bytes;
     result.graph_workspace_bytes = llama_dsv41_estimate_graph_workspace(params.n_ctx, params.n_ubatch);
     result.engram_staging_bytes = llama_dsv41_engram_staging_bytes(params.n_ubatch);
     result.output_bytes = llama_dsv41_output_bytes(
@@ -393,6 +389,43 @@ llama_dsv41_admission_result llama_dsv41_admit(
         reject("hard", result, "projected startup is not strictly below the hard limit");
     }
     result.category = "accepted";
+    return result;
+}
+
+llama_dsv41_admission_result llama_dsv41_validate_runtime_memory(
+        const llama_dsv41_admission_result & admitted,
+        uint64_t state_bytes,
+        uint64_t graph_workspace_bytes) {
+    if (admitted.category != "accepted" || state_bytes == 0 || graph_workspace_bytes == 0 ||
+            admitted.fixed_bytes < admitted.state_bytes ||
+            admitted.fixed_bytes - admitted.state_bytes < admitted.graph_workspace_bytes ||
+            admitted.projected_bytes < admitted.state_bytes ||
+            admitted.projected_bytes - admitted.state_bytes < admitted.graph_workspace_bytes) {
+        reject("runtime", admitted, "runtime memory accounting inputs are invalid");
+    }
+
+    llama_dsv41_admission_result result = admitted;
+    result.fixed_bytes -= result.state_bytes;
+    result.fixed_bytes -= result.graph_workspace_bytes;
+    result.projected_bytes -= result.state_bytes;
+    result.projected_bytes -= result.graph_workspace_bytes;
+    result.state_bytes = state_bytes;
+    result.graph_workspace_bytes = graph_workspace_bytes;
+    result.fixed_bytes = checked_add(result.fixed_bytes, state_bytes, "runtime fixed bytes");
+    result.fixed_bytes = checked_add(result.fixed_bytes, graph_workspace_bytes, "runtime fixed bytes");
+    result.projected_bytes = checked_add(result.projected_bytes, state_bytes, "runtime projected bytes");
+    result.projected_bytes = checked_add(
+            result.projected_bytes, graph_workspace_bytes, "runtime projected bytes");
+
+    if (result.projected_bytes > result.soft_bytes) {
+        reject("runtime_workspace", result, "measured runtime memory exceeds the admitted soft limit");
+    }
+    if (result.projected_bytes > result.host_total) {
+        reject("runtime_workspace", result, "measured runtime memory exceeds physical host memory");
+    }
+    if (result.projected_bytes >= result.hard_bytes) {
+        reject("runtime_workspace", result, "measured runtime memory is not strictly below the hard limit");
+    }
     return result;
 }
 

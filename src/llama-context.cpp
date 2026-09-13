@@ -694,17 +694,30 @@ void llama_context::sched_reserve() {
         }
     }
 
+    size_t graph_workspace_size = 0;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
+        graph_workspace_size += backend_buf_exp_size[i];
         if (backend_buf_exp_size[i] > 1) {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
+    }
+    if (memory) {
+        memory->set_graph_workspace_size(graph_workspace_size);
+        uint64_t state_bytes = 0;
+        for (const auto & entry : memory->memory_breakdown()) {
+            if (entry.second > std::numeric_limits<uint64_t>::max() - state_bytes) {
+                throw std::runtime_error("memory state allocation byte count overflow");
+            }
+            state_bytes += entry.second;
+        }
+        model.validate_memory_accounting(state_bytes, graph_workspace_size);
     }
 
     if (n_nodes_pp == n_nodes_tg) {
@@ -1370,10 +1383,33 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
+        mctx->rollback();
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    struct memory_transaction_guard {
+        llama_memory_context_i * context;
+        bool active;
+
+        ~memory_transaction_guard() {
+            if (active) {
+                try {
+                    context->rollback();
+                } catch (const std::exception & error) {
+                    LLAMA_LOG_ERROR("%s: memory rollback failed: %s\n", __func__, error.what());
+                }
+            }
+        }
+
+        void commit() {
+            if (active) {
+                context->commit();
+                active = false;
+            }
+        }
+    } transaction_guard { mctx, mctx != nullptr };
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1457,6 +1493,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    transaction_guard.commit();
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2373,6 +2410,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_DEEPSEEK41 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
@@ -3752,7 +3790,8 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) &&
+            params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }

@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-dsv41.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -2543,7 +2544,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK41:
-            throw std::runtime_error(llama_dsv41_runtime_dependency_error());
+            {
+                if (params.type_k != this->params.dsv41_admission_type_k ||
+                        cparams.offload_kqv != this->params.dsv41_admission_offload_kqv) {
+                    throw std::runtime_error(format(
+                            "DeepSeek V4.1 memory parameters differ from admission: "
+                            "type_k=%s, admitted_type_k=%s, offload_kqv=%s, admitted_offload_kqv=%s",
+                            ggml_type_name(params.type_k),
+                            ggml_type_name(this->params.dsv41_admission_type_k),
+                            cparams.offload_kqv ? "true" : "false",
+                            this->params.dsv41_admission_offload_kqv ? "true" : "false"));
+                }
+                const auto & model_dsv41 = static_cast<const llama_model_deepseek41 &>(*this);
+                res = new llama_memory_dsv41(
+                        *this,
+                        params.type_k,
+                        cparams.offload_kqv,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        model_dsv41.create_memory_engram_runtime(cparams.n_ubatch));
+            } break;
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
@@ -2846,6 +2867,7 @@ llama_model_params llama_model_default_params() {
         /*.dsv41_admission_ubatch      =*/ 2048,
         /*.dsv41_admission_outputs     =*/ 2048,
         /*.dsv41_admission_outputs_per_seq =*/ 2048,
+        /*.dsv41_admission_type_k      =*/ GGML_TYPE_F16,
         /*.dsv41_procfs_root           =*/ "/proc",
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -2859,6 +2881,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mtp                    =*/ false,
         /*.ple_on_disk                 =*/ false,
         /*.ple_direct_io               =*/ true,
+        /*.dsv41_admission_offload_kqv =*/ true,
     };
 
     return result;

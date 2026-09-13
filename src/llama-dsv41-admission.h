@@ -30,6 +30,7 @@ struct llama_dsv41_admission_params {
     uint64_t safety_margin_bytes = LLAMA_DSV41_ADMISSION_MARGIN_BYTES;
     uint64_t configured_cache_bytes = 0;
     uint64_t device_reported_bytes = 0;
+    uint64_t state_bytes = 0;
     uint32_t configured_cache_slots = 0;
     uint32_t n_ctx = LLAMA_DSV41_ADMISSION_CONTEXT;
     uint32_t n_batch = 2048;
@@ -39,8 +40,6 @@ struct llama_dsv41_admission_params {
     uint32_t n_outputs_max_per_seq = 2048;
     uint32_t n_vocab = 0;
     uint32_t n_expert_used = 0;
-    uint32_t kv_element_size = 2;
-    uint32_t index_element_size = 2;
     bool direct_io = true;
     bool unified_memory = true;
 };
@@ -94,3 +93,8 @@ llama_dsv41_admission_result llama_dsv41_admit(
         uint64_t dense_tensor_bytes,
         const std::vector<llama_expert_store_tensor> & expert_tensors,
         const llama_dsv41_admission_params & params);
+
+llama_dsv41_admission_result llama_dsv41_validate_runtime_memory(
+        const llama_dsv41_admission_result & admitted,
+        uint64_t state_bytes,
+        uint64_t graph_workspace_bytes);

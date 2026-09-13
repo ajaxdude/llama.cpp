@@ -92,6 +92,7 @@ llama_dsv41_admission_params base_params() {
     params.n_ubatch = 32;
     params.n_vocab = LLAMA_DSV41_N_VOCAB;
     params.n_expert_used = LLAMA_DSV41_N_EXPERT_USED;
+    params.state_bytes = 2ULL << 30;
     return params;
 }
 
@@ -229,6 +230,7 @@ void test_context_progression() {
     for (uint32_t n_ctx : { 32768U, 65536U, 98304U, 131072U }) {
         auto params = base_params();
         params.n_ctx = n_ctx;
+        params.state_bytes = static_cast<uint64_t>(n_ctx)*65536;
         const auto result = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
         REQUIRE(result.n_ctx == n_ctx);
         REQUIRE(result.state_bytes > previous_state);
@@ -317,6 +319,27 @@ void test_expert_union_and_outputs() {
     REQUIRE(llama_dsv41_output_bytes(100, 16, 10) == expected);
 }
 
+void test_runtime_memory_validation() {
+    auto params = base_params();
+    params.n_ubatch = 1;
+    params.configured_cache_slots = LLAMA_DSV41_N_EXPERT_USED;
+    const auto admitted = llama_dsv41_admit(host_with_used(0), 0, published_tensors(), params);
+
+    const auto measured = llama_dsv41_validate_runtime_memory(
+            admitted, admitted.state_bytes, admitted.graph_workspace_bytes - 1);
+    REQUIRE(measured.projected_bytes == admitted.projected_bytes - 1);
+
+    const uint64_t over_soft = admitted.graph_workspace_bytes +
+        (admitted.soft_bytes - admitted.projected_bytes) + 1;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_validate_runtime_memory(admitted, admitted.state_bytes, over_soft);
+    }).find("category=runtime_workspace") != std::string::npos);
+
+    REQUIRE(thrown([&]() {
+        llama_dsv41_validate_runtime_memory(admitted, 0, admitted.graph_workspace_bytes);
+    }).find("category=runtime") != std::string::npos);
+}
+
 void test_unified_topology() {
     REQUIRE(!llama_dsv41_has_unified_topology({}));
     REQUIRE(!llama_dsv41_has_unified_topology({ GGML_BACKEND_DEVICE_TYPE_CPU }));
@@ -342,6 +365,7 @@ int main() {
     test_context_progression();
     test_diagnostics_and_guards();
     test_expert_union_and_outputs();
+    test_runtime_memory_validation();
     test_unified_topology();
     return 0;
 }

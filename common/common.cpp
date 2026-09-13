@@ -1717,7 +1717,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.dsv41_admission_outputs_per_seq = params.n_outputs_max_per_seq == 0 ?
             mparams.dsv41_admission_outputs :
             std::min<uint32_t>(std::max(params.n_outputs_max_per_seq, 1), mparams.dsv41_admission_outputs);
+    mparams.dsv41_admission_type_k = params.cache_type_k;
     mparams.dsv41_procfs_root = params.dsv41_procfs_root.c_str();
+    mparams.dsv41_admission_offload_kqv = !params.no_kv_offload;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

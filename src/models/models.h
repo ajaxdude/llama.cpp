@@ -9,6 +9,7 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+class llama_dsv41_engram_runtime;
 struct llama_dsv41_expert_runtime;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
@@ -1317,11 +1318,17 @@ struct llama_model_deepseek4 : public llama_model_base {
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
 
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
     struct engram_model;
     struct admission_model;
     std::shared_ptr<engram_model> engram;
     std::shared_ptr<admission_model> admission;
     std::shared_ptr<llama_dsv41_expert_runtime> experts;
+
+    std::unique_ptr<llama_dsv41_engram_runtime> create_memory_engram_runtime(size_t max_tokens) const;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -1333,8 +1340,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     void release_runtime_context() const override;
     uint32_t default_context_size() const override;
     void validate_context_params(const llama_cparams & cparams) const override;
+    void validate_memory_accounting(uint64_t state_bytes, uint64_t graph_workspace_bytes) const override;
 
-    [[noreturn]] std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
 
