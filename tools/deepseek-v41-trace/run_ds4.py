@@ -102,6 +102,8 @@ def main() -> int:
         if bundle.manifest.get("revision") != DS4_REVISION:
             raise PreflightError(
                 f"ds4 trace revision mismatch: expected {DS4_REVISION}, found {bundle.manifest.get('revision')}")
+        if bundle.manifest.get("build", {}).get("sha256") != exporter_sha256:
+            raise PreflightError("ds4 trace build SHA-256 does not match the executed exporter")
         return 0
     except PreflightError as error:
         print(f"error: {error}", file=sys.stderr)

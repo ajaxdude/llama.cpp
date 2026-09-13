@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from preflight import PreflightError, resolved, run_preflight, write_audits
-from trace_format import TraceBundle
+from trace_format import TraceBundle, sha256_file
 
 
 def main() -> int:
@@ -55,6 +55,7 @@ def main() -> int:
         exporter = resolved(args.exporter)
         if not exporter.is_file() or not os.access(exporter, os.X_OK):
             raise PreflightError(f"trace exporter is not executable: {exporter}")
+        exporter_sha256 = sha256_file(exporter)
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
@@ -86,6 +87,8 @@ def main() -> int:
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "llama.cpp":
             raise PreflightError("llama exporter wrote a non-llama.cpp trace")
+        if bundle.manifest.get("build", {}).get("sha256") != exporter_sha256:
+            raise PreflightError("llama trace build SHA-256 does not match the executed exporter")
         return 0
     except PreflightError as error:
         print(f"error: {error}", file=sys.stderr)

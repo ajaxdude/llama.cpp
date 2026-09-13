@@ -479,6 +479,8 @@ int main(int argc, char ** argv) {
                 {"info", llama_build_info()},
                 {"compiler", llama_compiler()},
                 {"target", llama_build_target()},
+                {"path", fs::absolute(argv[0]).lexically_normal().string()},
+                {"sha256", sha256_file(fs::absolute(argv[0]).lexically_normal())},
             }},
             {"model", {
                 {"path", model_path.string()},

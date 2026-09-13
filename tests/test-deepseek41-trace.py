@@ -18,7 +18,7 @@ def manifest(runtime: str = "test") -> dict:
     return {
         "runtime": runtime,
         "revision": "a" * 40,
-        "build": "test-build",
+        "build": {"sha256": "3" * 64},
         "model": {"sha256": "1" * 64, "byte_count": 123},
         "prompt": {"sha256": "2" * 64, "byte_count": 3},
         "config": {
@@ -51,9 +51,9 @@ def manifest(runtime: str = "test") -> dict:
         },
         "environment": {},
         "audits": {
-            "memory": "memory.json",
-            "swap": "swap.json",
-            "watchdog": "watchdog.json",
+            "memory": {"path": "memory.json", "sha256": "4" * 64, "created_unix": 1},
+            "swap": {"path": "swap.json", "sha256": "5" * 64, "created_unix": 1},
+            "watchdog": {"path": "watchdog.json", "sha256": "6" * 64, "created_unix": 1},
         },
     }
 
@@ -265,6 +265,15 @@ class TraceFormatTests(unittest.TestCase):
             event = bundle.events[0]
             (root / event["blob"]).write_bytes(b"bad")
             with self.assertRaisesRegex(trace.TraceError, "truncated blob|corrupt blob"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            bad_manifest = manifest()
+            bad_manifest["audits"]["watchdog"] = "watchdog.json"
+            with trace.TraceBundleWriter(root, bad_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "watchdog audit reference"):
                 trace.TraceBundle(root)
 
     def test_report_generation_passes_identical_bundles(self) -> None:

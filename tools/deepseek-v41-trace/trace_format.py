@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -303,6 +304,7 @@ class TraceBundle:
             raise TraceError("manifest trace_format mismatch")
         if self.manifest.get("trace_version") != TRACE_VERSION:
             raise TraceError("manifest trace_version mismatch")
+        self._validate_manifest()
         self.events = self._read_events(verify_blobs)
         if self.manifest.get("event_count") != len(self.events):
             raise TraceError("manifest event_count mismatch")
@@ -331,6 +333,42 @@ class TraceBundle:
         except OSError as error:
             raise TraceError(f"cannot read events: {error}") from error
         return result
+
+    def _validate_manifest(self) -> None:
+        for key in ("runtime", "revision", "build", "model", "prompt", "config", "comparison", "environment", "audits"):
+            if key not in self.manifest:
+                raise TraceError(f"manifest is missing {key}")
+        if not isinstance(self.manifest["runtime"], str) or not self.manifest["runtime"]:
+            raise TraceError("manifest runtime is invalid")
+        if not isinstance(self.manifest["revision"], str) or not self.manifest["revision"]:
+            raise TraceError("manifest revision is invalid")
+        if not isinstance(self.manifest["build"], dict):
+            raise TraceError("manifest build is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.manifest["build"].get("sha256", "")) is None:
+            raise TraceError("manifest build SHA-256 is invalid")
+        for section in ("model", "prompt"):
+            if not isinstance(self.manifest[section], dict):
+                raise TraceError(f"manifest {section} is invalid")
+            digest = self.manifest[section].get("sha256")
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise TraceError(f"manifest {section} SHA-256 is invalid")
+            if not isinstance(self.manifest[section].get("byte_count"), int):
+                raise TraceError(f"manifest {section} byte_count is invalid")
+        for section in ("config", "comparison", "environment", "audits"):
+            if not isinstance(self.manifest[section], dict):
+                raise TraceError(f"manifest {section} is invalid")
+        if self.manifest["comparison"].get("logits") != "byte-identical-f32":
+            raise TraceError("logit comparison policy must be byte-identical-f32")
+        for kind in ("memory", "swap", "watchdog"):
+            audit = self.manifest["audits"].get(kind)
+            if not isinstance(audit, dict):
+                raise TraceError(f"manifest {kind} audit reference is invalid")
+            if not isinstance(audit.get("path"), str) or not audit["path"]:
+                raise TraceError(f"manifest {kind} audit path is invalid")
+            if re.fullmatch(r"[0-9a-f]{64}", audit.get("sha256", "")) is None:
+                raise TraceError(f"manifest {kind} audit SHA-256 is invalid")
+            if not isinstance(audit.get("created_unix"), int) or audit["created_unix"] <= 0:
+                raise TraceError(f"manifest {kind} audit timestamp is invalid")
 
     def read_blob(self, event: dict[str, Any]) -> bytes:
         try:
