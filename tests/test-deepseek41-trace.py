@@ -1193,6 +1193,57 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(preflight.PreflightError, "must not use /mnt/bigspace"):
                 preflight.require_safe_tmpdir_path(Path("/mnt/bigspace/escape"))
 
+    def test_full_preflights_reject_unusable_lexical_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / "good" / "tmp").mkdir(parents=True)
+            unusable = root / "good" / "missing" / ".." / "tmp"
+            actual = root / "actual"
+            actual.mkdir()
+            link = root / "link"
+            link.symlink_to(actual, target_is_directory=True)
+            self.assertFalse(unusable.is_dir())
+            self.assertFalse(os.access(unusable, os.W_OK | os.X_OK))
+            self.assertTrue(link.is_symlink())
+            cases = (
+                (unusable, "original lexical path"),
+                (link, "symlink"),
+            )
+            for tmpdir, message in cases:
+                with self.subTest(runtime="strix-rocm", tmpdir=tmpdir), mock.patch.dict(
+                        preflight.os.environ,
+                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(tmpdir)},
+                        clear=True), mock.patch.object(
+                        preflight,
+                        "storage_attestation",
+                        return_value=storage_record("/home/test")):
+                    with self.assertRaisesRegex(preflight.PreflightError, message):
+                        preflight.run_strix_preflight(
+                            model=Path("/home/model.gguf"),
+                            prompt=Path("/home/prompt.txt"),
+                            output=Path("/home/trace"),
+                            repo=Path("/home/repo"),
+                            busy_patterns=[],
+                        )
+                with self.subTest(runtime="apple-metal", tmpdir=tmpdir), mock.patch.dict(
+                        preflight.os.environ,
+                        {"TMPDIR": str(tmpdir)},
+                        clear=True), mock.patch.object(
+                        preflight,
+                        "darwin_storage_attestation",
+                        return_value=metal_storage_record("/Users/oracle/test")):
+                    with self.assertRaisesRegex(preflight.PreflightError, message):
+                        preflight.run_oracle_preflight(
+                            model=Path("/Users/oracle/model.gguf"),
+                            prompt=Path("/Users/oracle/prompt.txt"),
+                            output=Path("/Users/oracle/trace"),
+                            repo=Path("/Users/oracle/repo"),
+                            checkout=Path("/Users/oracle/ds4"),
+                            busy_patterns=[],
+                            accelerator={},
+                            runner={},
+                        )
+
     def test_preflight_requires_explicit_nvme_tmpdir(self) -> None:
         with mock.patch.object(
                 preflight,

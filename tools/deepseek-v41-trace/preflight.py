@@ -7,6 +7,7 @@ import os
 import platform
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -84,7 +85,16 @@ def reject_forbidden_path(
 
 def require_safe_tmpdir_path(path: Path) -> Path:
     lexical_path = reject_forbidden_path(path, "TMPDIR")
-    return require_no_symlink_components(lexical_path, "TMPDIR")
+    require_no_symlink_components(lexical_path, "TMPDIR")
+    try:
+        status = os.lstat(lexical_path)
+    except OSError as error:
+        raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path") from error
+    if not stat.S_ISDIR(status.st_mode):
+        raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path")
+    if not os.access(lexical_path, os.W_OK | os.X_OK):
+        raise PreflightError("TMPDIR must be an existing writable directory at its original lexical path")
+    return lexical_path
 
 
 def _decode_mount_field(value: str) -> str:
