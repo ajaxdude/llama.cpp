@@ -1705,16 +1705,12 @@ def _graceful_cleanup(
 ) -> int:
     escalated = False
     artifact_error: ArtifactError | None = None
+    guardian_control_error: ProcessGroupError | None = None
     try:
         if graceful_signal is not None:
             process_group_status = signal_group(
                 child.pid, graceful_signal
             )
-            if (
-                isinstance(child, GuardianProcess)
-                and child.poll() is None
-            ):
-                child.begin_grace()
             try:
                 audit.emit(
                     "process_group_signal",
@@ -1731,8 +1727,19 @@ def _graceful_cleanup(
             except ArtifactError as exc:
                 artifact_error = exc
                 audit.disable_component(exc.component)
+            if (
+                isinstance(child, GuardianProcess)
+                and child.poll() is None
+            ):
+                try:
+                    child.begin_grace()
+                except ProcessGroupError as exc:
+                    guardian_control_error = exc
         deadline = monotonic() + grace_seconds
-        while monotonic() < deadline:
+        while (
+            guardian_control_error is None
+            and monotonic() < deadline
+        ):
             child.poll()
             if not group_alive(child.pid):
                 break
@@ -1740,19 +1747,31 @@ def _graceful_cleanup(
                 isinstance(child, GuardianProcess)
                 and child.poll() is None
             ):
-                child.pulse()
+                try:
+                    child.pulse()
+                except ProcessGroupError as exc:
+                    guardian_control_error = exc
+                    break
             sleeper(min(0.05, deadline - monotonic()))
         child.poll()
-        if group_alive(child.pid):
+        if (
+            guardian_control_error is not None
+            or group_alive(child.pid)
+        ):
             escalated = True
             process_group_status = signal_group(
                 child.pid, signal.SIGKILL
             )
-            signal_reason = (
-                escalation_result[2]
-                if escalation_result is not None
-                else reason
-            )
+            if guardian_control_error is not None:
+                signal_reason = (
+                    "guardian control failed during graceful cleanup"
+                )
+            else:
+                signal_reason = (
+                    escalation_result[2]
+                    if escalation_result is not None
+                    else reason
+                )
             try:
                 audit.emit(
                     "process_group_signal",
@@ -1802,9 +1821,14 @@ def _graceful_cleanup(
                 str(exc),
             )
 
-    if escalated and escalation_result is not None:
+    if guardian_control_error is not None:
+        classification = "signal_error"
+        exit_code = EXIT_SIGNAL_ERROR
+        reason = "guardian control failed during graceful cleanup"
+        error = str(guardian_control_error)
+    elif escalated and escalation_result is not None:
         classification, exit_code, reason = escalation_result
-    if artifact_error is not None:
+    if artifact_error is not None and guardian_control_error is None:
         classification = "lease_error"
         exit_code = EXIT_LEASE_ERROR
         error = f"{artifact_error.component}: {artifact_error}"

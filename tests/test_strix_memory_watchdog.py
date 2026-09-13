@@ -567,6 +567,129 @@ class TestWatchdogBehavior(unittest.TestCase):
         sys.platform.startswith("linux"),
         "Linux guardian lifecycle",
     )
+    def test_guardian_control_failure_still_kills_and_reaps_group(
+        self,
+    ) -> None:
+        child_code = (
+            "import os,signal,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "grandchild=os.fork();"
+            "\nif grandchild == 0:\n"
+            " time.sleep(30)\n"
+            "else:\n"
+            " open(sys.argv[1],'w').write("
+            "f'{os.getpid()} {grandchild}\\n');"
+            " time.sleep(30)\n"
+        )
+        for mode in ("closed", "blocked"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    pid_path = Path(temp_dir) / "pids"
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            child_code,
+                            str(pid_path),
+                        ],
+                        start_new_session=True,
+                    )
+                    read_fd, write_fd = os.pipe()
+                    os.set_blocking(write_fd, False)
+                    if mode == "closed":
+                        os.close(write_fd)
+                        write_fd = -1
+                    else:
+                        try:
+                            while True:
+                                os.write(write_fd, b"x" * 65536)
+                        except BlockingIOError:
+                            pass
+                    guardian = watchdog.GuardianProcess(
+                        process,
+                        process.pid,
+                        write_fd,
+                    )
+                    stream = io.StringIO()
+                    audit = watchdog.AuditLogger(stream)
+                    child_pid = None
+                    grandchild_pid = None
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not pid_path.exists():
+                            if time.monotonic() >= deadline:
+                                self.fail(
+                                    "child process group did not start"
+                                )
+                            time.sleep(0.01)
+                        child_pid, grandchild_pid = (
+                            int(value)
+                            for value in pid_path.read_text(
+                                encoding="utf-8"
+                            ).split()
+                        )
+                        result = watchdog._graceful_cleanup(
+                            audit,
+                            guardian,
+                            snapshot(50),
+                            50,
+                            "parent_signal",
+                            128 + signal.SIGTERM,
+                            "wrapper received SIGTERM",
+                            signal.SIGTERM,
+                            0.4,
+                            watchdog._signal_process_group,
+                            watchdog._process_group_alive,
+                            time.monotonic,
+                            time.sleep,
+                        )
+                    finally:
+                        if process.poll() is None:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.wait(timeout=5)
+                        guardian.close()
+                        os.close(read_fd)
+
+                    records = [
+                        json.loads(line)
+                        for line in stream.getvalue().splitlines()
+                    ]
+                    signals = [
+                        record["signal"]
+                        for record in records
+                        if record["event"] == "process_group_signal"
+                    ]
+                    self.assertEqual(
+                        result, watchdog.EXIT_SIGNAL_ERROR
+                    )
+                    self.assertEqual(signals, ["SIGTERM", "SIGKILL"])
+                    self.assertEqual(
+                        records[-1]["classification"], "signal_error"
+                    )
+                    self.assertEqual(
+                        records[-1]["child_returncode"],
+                        -signal.SIGKILL,
+                    )
+                    assert child_pid is not None
+                    assert grandchild_pid is not None
+                    for process_id in (child_pid, grandchild_pid):
+                        deadline = time.monotonic() + 2
+                        while (
+                            self._process_is_running(process_id)
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        self.assertFalse(
+                            self._process_is_running(process_id)
+                        )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux guardian lifecycle",
+    )
     def test_guardian_pipe_close_kills_group_without_fd_leak(self) -> None:
         child_code = (
             "import json,os,subprocess,sys,time\n"
