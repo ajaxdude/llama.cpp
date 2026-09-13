@@ -25,7 +25,7 @@ struct llama_dsv41_expert_runtime_params {
 };
 
 struct llama_dsv41_expert_runtime {
-    using buft_selector = std::function<ggml_backend_buffer_type_t(int32_t layer)>;
+    using buft_selector = std::function<ggml_backend_buffer_type_t(const llama_expert_store_tensor & tensor)>;
     using upload_fn = std::function<void(ggml_tensor * tensor, size_t offset, const void * data, size_t size)>;
 
     llama_dsv41_expert_runtime(
@@ -43,6 +43,7 @@ struct llama_dsv41_expert_runtime {
     void release_context();
     void release(int32_t layer);
     void release_all();
+    void release_all_after_sync(ggml_backend_sched_t sched);
 
     ggml_tensor * cache_tensor(int32_t layer, llama_expert_projection projection) const;
     size_t cache_slots() const;

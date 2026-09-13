@@ -116,6 +116,8 @@ enum llm_type {
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
+    LLM_TYPE_1B_A400M, // Granite3 MoE
+    LLM_TYPE_3B_A800M, // Granite3 MoE
     LLM_TYPE_7B_A1B,
     LLM_TYPE_8B_A1B, // lfm2moe
     LLM_TYPE_7_9B_A1_3B, // Ling-3.0-tiny
@@ -126,6 +128,7 @@ enum llm_type {
     LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_30B_A3B,
     LLM_TYPE_31B_A3_5B,
+    LLM_TYPE_32B_A9B, // Granite4 Hybrid
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
     LLM_TYPE_75B_A9B, // Nemotron 3 Puzzle
@@ -745,6 +748,8 @@ struct llama_model {
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
+    ggml_backend_buffer_type_t select_moe_buft(
+            int il, enum ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) const;
 
     bool has_tensor_overrides() const;
 
@@ -767,6 +772,7 @@ struct llama_model {
     virtual bool requires_synchronous_graph() const { return false; }
     virtual std::string consume_runtime_error() const { return {}; }
     virtual void release_runtime_work() const {}
+    virtual void release_runtime_work_after_sync(ggml_backend_sched_t) const { release_runtime_work(); }
     virtual void acquire_runtime_context() const {}
     virtual void release_runtime_context() const {}
     virtual uint32_t default_context_size() const { return 0; }

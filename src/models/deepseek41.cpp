@@ -194,7 +194,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         extent.type = table->tensor->type;
         llama_dsv41_validate_engram_extent(extent);
     }
-
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, 0);
@@ -310,7 +309,10 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     experts = std::make_shared<llama_dsv41_expert_runtime>(
             expert_tensors,
             expert_params,
-            [this](int32_t layer) { return select_buft(layer); });
+            [this](const llama_expert_store_tensor & tensor) {
+                return select_moe_buft(
+                        tensor.layer, tensor.type, tensor.ne[0], tensor.ne[1], admission->result.expert_slots);
+            });
 
     for (int32_t il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
@@ -331,6 +333,12 @@ std::string llama_model_deepseek41::consume_runtime_error() const {
 void llama_model_deepseek41::release_runtime_work() const {
     if (experts) {
         experts->release_all();
+    }
+}
+
+void llama_model_deepseek41::release_runtime_work_after_sync(ggml_backend_sched_t sched) const {
+    if (experts) {
+        experts->release_all_after_sync(sched);
     }
 }
 

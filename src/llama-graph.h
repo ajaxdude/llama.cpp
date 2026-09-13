@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <memory>
 #include <set>
@@ -73,6 +74,20 @@ enum llm_norm_type {
     LLM_NORM_RMS,
     LLM_NORM_GROUP,
 };
+
+struct llm_moe_expert_ids {
+    ggml_tensor * routing;
+    ggml_tensor * lookup;
+};
+
+llm_moe_expert_ids llm_build_moe_expert_ids(
+        ggml_context * ctx,
+        llm_arch arch,
+        ggml_tensor * selected,
+        ggml_tensor * lookup,
+        int64_t n_expert,
+        int64_t n_expert_total,
+        uint32_t n_group_experts);
 
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
@@ -1079,6 +1094,19 @@ struct llm_graph_context {
                   int64_t   n_head,
                   int64_t   n_head_kv,
                       int   il) const;
+
+    // Set reshape to false to return contiguous projections before clamp/reshape.
+    llm_graph_qkv build_qkv(
+        const llama_layer & layer,
+              ggml_tensor * cur,
+                  int64_t   n_embd_head_q,
+                  int64_t   n_head_q,
+                  int64_t   n_embd_head_k,
+                  int64_t   n_head_k,
+                  int64_t   n_embd_head_v,
+                  int64_t   n_head_v,
+                      int   il,
+                     bool   reshape = true) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,

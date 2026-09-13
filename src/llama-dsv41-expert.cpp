@@ -124,7 +124,7 @@ struct llama_dsv41_expert_runtime::impl {
                     checked_mul(tensor.nb[2], params.cache_slots, "DeepSeek V4.1 expert cache byte count overflow"),
                     "DeepSeek V4.1 expert cache byte count overflow");
 
-            ggml_backend_buffer_type_t buft = select_buft(tensor.layer);
+            ggml_backend_buffer_type_t buft = select_buft(tensor);
             if (buft == nullptr) {
                 throw std::runtime_error("DeepSeek V4.1 expert cache has no backend buffer type");
             }
@@ -386,6 +386,13 @@ void llama_dsv41_expert_runtime::release_all() {
     }
 }
 
+void llama_dsv41_expert_runtime::release_all_after_sync(ggml_backend_sched_t sched) {
+    if (sched != nullptr) {
+        ggml_backend_sched_synchronize(sched);
+    }
+    release_all();
+}
+
 ggml_tensor * llama_dsv41_expert_runtime::cache_tensor(
         int32_t layer, llama_expert_projection projection) const {
     if (layer < 0 || layer >= (int32_t) pimpl->layers.size()) {
@@ -477,7 +484,7 @@ static void dsv41_expert_remap_callback(
                 state->layer, std::vector<int32_t>(ids, ids + count));
         memcpy(dst->data, remapped.data(), remapped.size()*sizeof(int32_t));
     } catch (const std::exception & error) {
-        std::fill_n(static_cast<int32_t *>(dst->data), count, -1);
+        std::fill_n(static_cast<int32_t *>(dst->data), count, 0);
         state->runtime->set_error(error.what());
     }
 }
