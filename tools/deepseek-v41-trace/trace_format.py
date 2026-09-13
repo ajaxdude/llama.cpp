@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import selectors
 import signal
 import stat
 import struct
@@ -168,9 +169,11 @@ class ExecutionIntegrityError(TraceError):
 
 @dataclass
 class _ProcessContainment:
-    process: subprocess.Popen[bytes]
+    process: Any
     linux_root_pidfd: int | None = None
     linux_lock_held: bool = False
+    linux_prior_subreaper: int | None = None
+    linux_exec_released: bool = False
     test_process_group_id: int | None = None
     job_handle: int | None = None
     windows_job_assigned: bool = False
@@ -194,6 +197,7 @@ class _ContainmentCleanup:
 
 
 _LINUX_SUBREAPER_LOCK = threading.Lock()
+_LINUX_SUBREAPER_POISONED = False
 _TEST_PROCESS_GROUP_CONTAINMENT = threading.local()
 
 
@@ -901,6 +905,324 @@ def _test_only_process_group_containment() -> Iterable[None]:
         _TEST_PROCESS_GROUP_CONTAINMENT.enabled = previous
 
 
+class _LinuxForkExecProcess:
+    def __init__(
+            self,
+            command: list[str],
+            pid: int,
+            *,
+            barrier_fd: int,
+            exec_error_fd: int,
+            stdin_fd: int | None,
+            stdout_fd: int | None,
+            stderr_fd: int | None):
+        self.args = command
+        self.pid = pid
+        self.returncode = None
+        self._barrier_fd = barrier_fd
+        self._exec_error_fd = exec_error_fd
+        self._stdin_fd = stdin_fd
+        self._stdout_fd = stdout_fd
+        self._stderr_fd = stderr_fd
+
+    def release_exec(self) -> None:
+        try:
+            os.write(self._barrier_fd, b"1")
+        finally:
+            os.close(self._barrier_fd)
+            self._barrier_fd = -1
+        error_bytes = bytearray()
+        try:
+            while True:
+                chunk = os.read(self._exec_error_fd, 4096)
+                if not chunk:
+                    break
+                error_bytes.extend(chunk)
+        finally:
+            os.close(self._exec_error_fd)
+            self._exec_error_fd = -1
+        if error_bytes:
+            self.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
+            raise OSError(error_bytes.decode("ascii", "strict"))
+
+    def abort_blocked(self) -> _ContainmentCleanup:
+        failures = []
+        if self._barrier_fd >= 0:
+            try:
+                os.close(self._barrier_fd)
+                self._barrier_fd = -1
+            except BaseException as error:
+                failures.append(_IntegrityFailure("linux-exec-barrier-close", error))
+        try:
+            self.kill()
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-blocked-child-termination", error))
+        try:
+            self.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-blocked-child-reap", error))
+        return _ContainmentCleanup(failures, not failures and self.returncode is not None)
+
+    def close_streams(self) -> list[_IntegrityFailure]:
+        failures = []
+        for attribute in (
+                "_barrier_fd", "_exec_error_fd", "_stdin_fd", "_stdout_fd", "_stderr_fd"):
+            descriptor = getattr(self, attribute)
+            if descriptor is None or descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                failures.append(_IntegrityFailure(
+                    f"linux-process-fd-close:{attribute.removeprefix('_').removesuffix('_fd')}",
+                    error,
+                ))
+            setattr(self, attribute, -1 if attribute in {"_barrier_fd", "_exec_error_fd"} else None)
+        return failures
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError as error:
+            if self.returncode is None:
+                raise TraceError("owned Linux child identity was lost before reap") from error
+            return self.returncode
+        if waited_pid == 0:
+            return None
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(0.01)
+        return int(self.returncode)
+
+    def kill(self) -> None:
+        if self.poll() is None:
+            os.kill(self.pid, signal.SIGKILL)
+
+    def communicate(
+            self,
+            input: bytes | None = None,
+            timeout: float | None = None,
+    ) -> tuple[bytes | None, bytes | None]:
+        if input is not None and self._stdin_fd is None:
+            raise ValueError("stdin is not a pipe")
+        output = bytearray()
+        errors = bytearray()
+        had_stdout = self._stdout_fd is not None
+        had_stderr = self._stderr_fd is not None
+        selector = selectors.DefaultSelector()
+        streams = {}
+        input_view = memoryview(input or b"")
+        input_offset = 0
+        if self._stdin_fd is not None:
+            if input is None:
+                os.close(self._stdin_fd)
+                self._stdin_fd = None
+            else:
+                os.set_blocking(self._stdin_fd, False)
+                selector.register(self._stdin_fd, selectors.EVENT_WRITE)
+        for fd, buffer in ((self._stdout_fd, output), (self._stderr_fd, errors)):
+            if fd is not None:
+                os.set_blocking(fd, False)
+                selector.register(fd, selectors.EVENT_READ)
+                streams[fd] = buffer
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while selector.get_map() or self.poll() is None:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(
+                            self.args,
+                            timeout,
+                            output=bytes(output) if self._stdout_fd is not None else None,
+                            stderr=bytes(errors) if self._stderr_fd is not None else None,
+                        )
+                else:
+                    remaining = 0.05
+                for key, events in selector.select(min(remaining, 0.05)):
+                    if key.fd == self._stdin_fd and events & selectors.EVENT_WRITE:
+                        try:
+                            written = os.write(
+                                key.fd, input_view[input_offset:input_offset + 65536])
+                            input_offset += written
+                        except BrokenPipeError:
+                            input_offset = len(input_view)
+                        if input_offset == len(input_view):
+                            selector.unregister(key.fd)
+                            os.close(key.fd)
+                            self._stdin_fd = None
+                        continue
+                    chunk = os.read(key.fd, 65536)
+                    if chunk:
+                        streams[key.fd].extend(chunk)
+                    else:
+                        selector.unregister(key.fd)
+                        os.close(key.fd)
+                        if key.fd == self._stdout_fd:
+                            self._stdout_fd = None
+                        if key.fd == self._stderr_fd:
+                            self._stderr_fd = None
+                if not selector.get_map() and self.poll() is None:
+                    time.sleep(0.01)
+            self.wait(timeout=0)
+        finally:
+            selector.close()
+        self._stdout_fd = None
+        self._stderr_fd = None
+        return (
+            bytes(output) if had_stdout else None,
+            bytes(errors) if had_stderr else None,
+        )
+
+
+def _linux_child_file_descriptors(
+        mode: Any,
+        target_fd: int,
+) -> tuple[int | None, int | None]:
+    if mode is None:
+        return None, None
+    if mode == subprocess.PIPE:
+        read_fd, write_fd = os.pipe()
+        if target_fd == 0:
+            return write_fd, read_fd
+        return read_fd, write_fd
+    if mode == subprocess.DEVNULL:
+        flags = os.O_RDONLY if target_fd == 0 else os.O_WRONLY
+        descriptor = os.open(os.devnull, flags)
+        return None, descriptor
+    if mode == subprocess.STDOUT and target_fd == 2:
+        return None, subprocess.STDOUT
+    raise TraceError("Linux fork/exec containment received unsupported stream controls")
+
+
+def _start_linux_blocked_process(command: list[str], launch: dict[str, Any]) -> _LinuxForkExecProcess:
+    controls = dict(launch)
+    unknown_controls = set(controls) - {
+        "cwd", "env", "executable", "pass_fds", "stderr", "stdin", "stdout"}
+    if unknown_controls:
+        raise TraceError(
+            f"Linux fork/exec containment received unsupported controls: {sorted(unknown_controls)}")
+    executable = str(controls.pop("executable", command[0]))
+    pass_fds = tuple(int(fd) for fd in controls.pop("pass_fds", ()))
+    environment = controls.pop("env", None)
+    working_directory = controls.pop("cwd", None)
+    opened_descriptors = set()
+    try:
+        stdin_parent, stdin_child = _linux_child_file_descriptors(controls.pop("stdin", None), 0)
+        opened_descriptors.update(
+            descriptor for descriptor in (stdin_parent, stdin_child)
+            if descriptor is not None and descriptor != subprocess.STDOUT)
+        stdout_parent, stdout_child = _linux_child_file_descriptors(controls.pop("stdout", None), 1)
+        opened_descriptors.update(
+            descriptor for descriptor in (stdout_parent, stdout_child)
+            if descriptor is not None and descriptor != subprocess.STDOUT)
+        stderr_parent, stderr_child = _linux_child_file_descriptors(controls.pop("stderr", None), 2)
+        opened_descriptors.update(
+            descriptor for descriptor in (stderr_parent, stderr_child)
+            if descriptor is not None and descriptor != subprocess.STDOUT)
+        barrier_read, barrier_write = os.pipe()
+        opened_descriptors.update((barrier_read, barrier_write))
+        error_read, error_write = os.pipe()
+        opened_descriptors.update((error_read, error_write))
+        os.set_inheritable(error_write, False)
+        child_descriptors = [
+            descriptor for descriptor in (stdin_child, stdout_child, stderr_child)
+            if descriptor is not None and descriptor != subprocess.STDOUT]
+        if any(descriptor <= 2 for descriptor in child_descriptors):
+            raise TraceError("Linux fork/exec containment requires intact standard descriptors")
+    except BaseException:
+        for descriptor in opened_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    try:
+        process_id = os.fork()
+    except BaseException:
+        for descriptor in opened_descriptors:
+            os.close(descriptor)
+        raise
+    if process_id == 0:
+        try:
+            os.close(barrier_write)
+            os.close(error_read)
+            for parent_fd in (stdin_parent, stdout_parent, stderr_parent):
+                if parent_fd is not None:
+                    os.close(parent_fd)
+            for child_fd, target_fd in (
+                    (stdin_child, 0), (stdout_child, 1), (stderr_child, 2)):
+                if child_fd == subprocess.STDOUT:
+                    os.dup2(1, 2)
+                elif child_fd is not None:
+                    os.dup2(child_fd, target_fd)
+            for descriptor in pass_fds:
+                os.set_inheritable(descriptor, True)
+            keep = {0, 1, 2, barrier_read, error_write, *pass_fds}
+            for descriptor_name in os.listdir("/proc/self/fd"):
+                descriptor = int(descriptor_name)
+                if descriptor not in keep:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            if os.read(barrier_read, 1) != b"1":
+                os._exit(126)
+            os.close(barrier_read)
+            if working_directory is not None:
+                os.chdir(working_directory)
+            os.execve(executable, command, os.environ if environment is None else environment)
+        except BaseException as error:
+            try:
+                os.write(error_write, f"{type(error).__name__}: {error}".encode("ascii", "backslashreplace"))
+            finally:
+                os._exit(127)
+    process = _LinuxForkExecProcess(
+        command,
+        process_id,
+        barrier_fd=barrier_write,
+        exec_error_fd=error_read,
+        stdin_fd=stdin_parent,
+        stdout_fd=stdout_parent,
+        stderr_fd=stderr_parent,
+    )
+    parent_close_failures = []
+    for descriptor, component in (
+            (barrier_read, "linux-parent-barrier-read-close"),
+            (error_write, "linux-parent-error-write-close"),
+            (stdin_child, "linux-parent-stdin-child-close"),
+            (stdout_child, "linux-parent-stdout-child-close"),
+            (stderr_child, "linux-parent-stderr-child-close")):
+        if descriptor is None or descriptor == subprocess.STDOUT:
+            continue
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            parent_close_failures.append(_IntegrityFailure(component, error))
+    if parent_close_failures:
+        primary_failure = parent_close_failures.pop(0)
+        cleanup = process.abort_blocked()
+        parent_close_failures.extend(cleanup.failures)
+        parent_close_failures.extend(process.close_streams())
+        raise ExecutionIntegrityError(
+            f"Linux blocked-child setup primary failure "
+            f"[{type(primary_failure.error).__name__}: {primary_failure.error}]; "
+            f"secondary integrity failures: {_format_integrity_failures(parent_close_failures)}",
+            primary_error=primary_failure.error,
+            secondary_errors=parent_close_failures,
+            quiescence_proven=False,
+        ) from primary_failure.error
+    return process
+
+
 def _linux_direct_children() -> set[int]:
     children = set()
     task_root = Path("/proc/self/task")
@@ -932,17 +1254,28 @@ def _linux_task_ids() -> set[int]:
         raise TraceError(f"cannot read Linux subreaper task identities: {error}") from error
 
 
-def _linux_enable_child_subreaper() -> None:
+def _linux_get_child_subreaper() -> int:
     libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(LINUX_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
-        error_number = ctypes.get_errno()
-        raise TraceError(f"cannot enable Linux child subreaper: {os.strerror(error_number)}")
     enabled = ctypes.c_int()
     if libc.prctl(LINUX_PR_GET_CHILD_SUBREAPER, ctypes.byref(enabled), 0, 0, 0) != 0:
         error_number = ctypes.get_errno()
-        raise TraceError(f"cannot verify Linux child subreaper: {os.strerror(error_number)}")
-    if enabled.value != 1:
-        raise TraceError("Linux child subreaper did not remain enabled")
+        raise TraceError(f"cannot read Linux child subreaper: {os.strerror(error_number)}")
+    if enabled.value not in (0, 1):
+        raise TraceError(f"invalid Linux child subreaper state {enabled.value}")
+    return enabled.value
+
+
+def _linux_set_child_subreaper(value: int) -> None:
+    if value not in (0, 1):
+        raise TraceError(f"invalid Linux child subreaper state {value}")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(LINUX_PR_SET_CHILD_SUBREAPER, value, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise TraceError(f"cannot set Linux child subreaper: {os.strerror(error_number)}")
+    actual = _linux_get_child_subreaper()
+    if actual != value:
+        raise TraceError(
+            f"Linux child subreaper verification failed: expected {value}, got {actual}")
 
 
 def _linux_open_pidfd(process_id: int) -> int:
@@ -1016,36 +1349,73 @@ def _linux_signal_owned_children(
 
 
 def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
+    global _LINUX_SUBREAPER_POISONED
     if not _LINUX_SUBREAPER_LOCK.acquire(blocking=False):
         raise TraceError("Linux subreaper containment is already active")
     process = None
     pidfd = None
+    prior_subreaper = None
+    exec_released = False
     try:
-        _linux_enable_child_subreaper()
+        if _LINUX_SUBREAPER_POISONED:
+            raise TraceError("Linux subreaper containment supervisor is not reusable")
+        prior_subreaper = _linux_get_child_subreaper()
+        if prior_subreaper != 1:
+            _linux_set_child_subreaper(1)
         _linux_require_pidfd_support()
         if len(_linux_task_ids()) != 1:
             raise TraceError("Linux subreaper containment requires a single-threaded supervisor")
         if _linux_direct_children():
             raise TraceError("Linux subreaper containment process owns unrelated children")
-        process = subprocess.Popen(command, **launch)
+        process = _start_linux_blocked_process(command, launch)
         pidfd = _linux_open_pidfd(process.pid)
-        return _ProcessContainment(
+        containment = _ProcessContainment(
             process=process,
             linux_root_pidfd=pidfd,
             linux_lock_held=True,
+            linux_prior_subreaper=prior_subreaper,
         )
+        exec_released = True
+        containment.linux_exec_released = True
+        process.release_exec()
+        return containment
     except BaseException as primary_error:
         failures = []
+        startup_quiescence_proven = False
+        if isinstance(primary_error, ExecutionIntegrityError):
+            failures.extend(primary_error.secondary_errors)
+            startup_quiescence_proven = primary_error.quiescence_proven
+            primary_error = primary_error.primary_error or primary_error
         if process is not None:
             failed_containment = _ProcessContainment(
                 process=process,
                 linux_root_pidfd=pidfd,
                 linux_lock_held=True,
+                linux_prior_subreaper=prior_subreaper,
+                linux_exec_released=exec_released,
             )
-            cleanup = _terminate_process_tree(failed_containment)
-            failures.extend(cleanup.failures)
-            failures.extend(_close_process_containment(failed_containment))
+            if exec_released:
+                cleanup = _terminate_process_tree(failed_containment)
+                failures.extend(cleanup.failures)
+                startup_quiescence_proven = cleanup.quiescence_proven
+            else:
+                cleanup = process.abort_blocked()
+                failures.extend(cleanup.failures)
+                startup_quiescence_proven = cleanup.quiescence_proven
+            close_failures = _close_process_containment(
+                failed_containment,
+                quiescence_proven=startup_quiescence_proven,
+            )
+            failures.extend(close_failures)
+            startup_quiescence_proven = (
+                pidfd is not None and startup_quiescence_proven and not close_failures)
         else:
+            if prior_subreaper is not None:
+                try:
+                    _linux_set_child_subreaper(prior_subreaper)
+                except BaseException as error:
+                    _LINUX_SUBREAPER_POISONED = True
+                    failures.append(_IntegrityFailure("linux-subreaper-restore", error))
             _LINUX_SUBREAPER_LOCK.release()
         if failures:
             raise ExecutionIntegrityError(
@@ -1054,7 +1424,7 @@ def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -
                 f"secondary integrity failures: {_format_integrity_failures(failures)}",
                 primary_error=primary_error,
                 secondary_errors=failures,
-                quiescence_proven=False,
+                quiescence_proven=startup_quiescence_proven,
             ) from primary_error
         if process is not None:
             raise ExecutionIntegrityError(
@@ -1062,7 +1432,7 @@ def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -
                 f"[{type(primary_error).__name__}: {primary_error}]",
                 primary_error=primary_error,
                 secondary_errors=[],
-                quiescence_proven=False,
+                quiescence_proven=startup_quiescence_proven,
             ) from primary_error
         raise
 
@@ -1116,8 +1486,10 @@ def _close_windows_process_handle(process: subprocess.Popen[bytes]) -> None:
     process_handle = getattr(process, "_handle", None)
     if process_handle is None:
         return
-    if not _windows_kernel32().CloseHandle(int(process_handle)):
-        raise _windows_error("cannot close process handle")
+    close = getattr(process_handle, "Close", None)
+    if not callable(close):
+        raise TraceError("subprocess process handle does not expose owned Close()")
+    close()
     process._handle = None
 
 
@@ -1267,7 +1639,12 @@ def _run_contained_process(
         None, error, failures, containment, cleanup.quiescence_proven, True)
 
 
-def _close_process_containment(containment: _ProcessContainment | None) -> list[_IntegrityFailure]:
+def _close_process_containment(
+        containment: _ProcessContainment | None,
+        *,
+        quiescence_proven: bool,
+) -> list[_IntegrityFailure]:
+    global _LINUX_SUBREAPER_POISONED
     if containment is None:
         return []
     failures = []
@@ -1288,7 +1665,25 @@ def _close_process_containment(containment: _ProcessContainment | None) -> list[
             containment.linux_root_pidfd = None
         except BaseException as error:
             failures.append(_IntegrityFailure("linux-root-pidfd-close", error))
+    if isinstance(containment.process, _LinuxForkExecProcess):
+        failures.extend(containment.process.close_streams())
     if containment.linux_lock_held:
+        if not quiescence_proven:
+            failures.append(_IntegrityFailure(
+                "linux-subreaper-restore",
+                TraceError("Linux child-subreaper state cannot be restored before full tree quiescence")))
+            _LINUX_SUBREAPER_POISONED = True
+        elif containment.linux_prior_subreaper is None:
+            failures.append(_IntegrityFailure(
+                "linux-subreaper-restore",
+                TraceError("Linux child-subreaper prior state is missing")))
+            _LINUX_SUBREAPER_POISONED = True
+        else:
+            try:
+                _linux_set_child_subreaper(containment.linux_prior_subreaper)
+            except BaseException as error:
+                _LINUX_SUBREAPER_POISONED = True
+                failures.append(_IntegrityFailure("linux-subreaper-restore", error))
         containment.linux_lock_held = False
         _LINUX_SUBREAPER_LOCK.release()
     return failures
@@ -1517,7 +1912,13 @@ def run_approved_executable(
             os.close(descriptor)
         except BaseException as error:
             integrity_failures.append(_IntegrityFailure("executable-descriptor-close", error))
-        integrity_failures.extend(_close_process_containment(containment))
+        containment_failures = _close_process_containment(
+            containment,
+            quiescence_proven=quiescence_proven,
+        )
+        integrity_failures.extend(containment_failures)
+        if containment_failures:
+            quiescence_proven = False
     if result is not None and primary_error is None:
         try:
             stdout = _decode_subprocess_stream(

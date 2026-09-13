@@ -2401,22 +2401,26 @@ class TraceFormatTests(unittest.TestCase):
         lock = mock.Mock()
         lock.acquire.return_value = True
         with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
-                trace, "_linux_enable_child_subreaper"), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_get_child_subreaper", return_value=0), mock.patch.object(
+                trace, "_linux_set_child_subreaper") as set_subreaper, mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace, "_linux_direct_children", return_value={42}), mock.patch.object(
-                trace.subprocess, "Popen") as popen, self.assertRaisesRegex(
+                trace, "_start_linux_blocked_process") as start, self.assertRaisesRegex(
                 trace.TraceError, "owns unrelated children"):
             trace._start_linux_subreaper_process(["approved"], {})
-        popen.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(set_subreaper.call_args_list, [mock.call(1), mock.call(0)])
         lock.release.assert_called_once()
 
     def test_linux_subreaper_boundary_precedes_target_execution(self) -> None:
         source = inspect.getsource(trace._start_linux_subreaper_process)
-        self.assertLess(source.index("_linux_enable_child_subreaper"), source.index("subprocess.Popen"))
-        self.assertLess(source.index("_linux_task_ids"), source.index("subprocess.Popen"))
-        self.assertLess(source.index("_linux_direct_children"), source.index("subprocess.Popen"))
-        self.assertIn("_linux_open_pidfd", source)
+        self.assertLess(source.index("_linux_get_child_subreaper"), source.index("_start_linux_blocked_process"))
+        self.assertLess(source.index("_linux_task_ids"), source.index("_start_linux_blocked_process"))
+        self.assertLess(source.index("_linux_direct_children"), source.index("_start_linux_blocked_process"))
+        self.assertLess(source.index("_start_linux_blocked_process"), source.index("_linux_open_pidfd"))
+        self.assertLess(source.index("_linux_open_pidfd"), source.index("process.release_exec"))
         self.assertNotIn("killpg", source)
         self.assertNotIn("os.kill(", inspect.getsource(trace._linux_signal_owned_children))
 
@@ -2424,13 +2428,173 @@ class TraceFormatTests(unittest.TestCase):
         lock = mock.Mock()
         lock.acquire.return_value = True
         with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
-                trace, "_linux_enable_child_subreaper"), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_get_child_subreaper", return_value=0), mock.patch.object(
+                trace, "_linux_set_child_subreaper") as set_subreaper, mock.patch.object(
                 trace, "_linux_require_pidfd_support", side_effect=trace.TraceError("pidfd unavailable")), mock.patch.object(
-                trace.subprocess, "Popen") as popen, self.assertRaisesRegex(
+                trace, "_start_linux_blocked_process") as start, self.assertRaisesRegex(
                 trace.TraceError, "pidfd unavailable"):
             trace._start_linux_subreaper_process(["approved"], {})
-        popen.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(set_subreaper.call_args_list, [mock.call(1), mock.call(0)])
         lock.release.assert_called_once()
+
+    def test_linux_prelaunch_primary_and_restore_failure_are_both_retained(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        primary = trace.TraceError("pidfd unavailable")
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_get_child_subreaper", return_value=0), mock.patch.object(
+                trace, "_linux_set_child_subreaper", side_effect=[None, OSError("restore failed")]), mock.patch.object(
+                trace, "_linux_require_pidfd_support", side_effect=primary), self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            trace._start_linux_subreaper_process(["approved"], {})
+        self.assertIs(raised.exception.primary_error, primary)
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertFalse(raised.exception.quiescence_proven)
+        self.assertEqual(
+            [failure.component for failure in raised.exception.secondary_errors],
+            ["linux-subreaper-restore"],
+        )
+        lock.release.assert_called_once()
+
+    def test_linux_pidfd_failure_aborts_blocked_child_before_exec(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        process = mock.Mock(pid=71)
+        process.abort_blocked.return_value = trace._ContainmentCleanup([], True)
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_get_child_subreaper", return_value=0), mock.patch.object(
+                trace, "_linux_set_child_subreaper") as set_subreaper, mock.patch.object(
+                trace, "_linux_require_pidfd_support"), mock.patch.object(
+                trace, "_linux_task_ids", return_value={1}), mock.patch.object(
+                trace, "_linux_direct_children", return_value=set()), mock.patch.object(
+                trace, "_start_linux_blocked_process", return_value=process), mock.patch.object(
+                trace, "_linux_open_pidfd", side_effect=OSError("pidfd failed")), self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            trace._start_linux_subreaper_process(["approved"], {})
+        self.assertFalse(raised.exception.quiescence_proven)
+        process.abort_blocked.assert_called_once()
+        process.release_exec.assert_not_called()
+        self.assertEqual(set_subreaper.call_args_list, [mock.call(1), mock.call(0)])
+        lock.release.assert_called_once()
+
+    def test_linux_exec_barrier_releases_only_after_pidfd(self) -> None:
+        events = []
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        process = mock.Mock(pid=71)
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_get_child_subreaper", return_value=1), mock.patch.object(
+                trace, "_linux_require_pidfd_support"), mock.patch.object(
+                trace, "_linux_task_ids", return_value={1}), mock.patch.object(
+                trace, "_linux_direct_children", return_value=set()), mock.patch.object(
+                trace, "_start_linux_blocked_process",
+                side_effect=lambda *_args: events.append("blocked") or process), mock.patch.object(
+                trace, "_linux_open_pidfd",
+                side_effect=lambda pid: events.append(f"pidfd:{pid}") or 90), mock.patch.object(
+                trace.os, "close"), mock.patch.object(
+                trace, "_linux_set_child_subreaper") as restore:
+            process.release_exec.side_effect = lambda: events.append("exec")
+            containment = trace._start_linux_subreaper_process(["approved"], {})
+            self.assertEqual(containment.linux_root_pidfd, 90)
+            self.assertEqual(containment.linux_prior_subreaper, 1)
+            self.assertTrue(containment.linux_exec_released)
+            self.assertEqual(trace._close_process_containment(
+                containment, quiescence_proven=True), [])
+        self.assertEqual(events, ["blocked", "pidfd:71", "exec"])
+        restore.assert_called_once_with(1)
+        lock.release.assert_called_once()
+
+    def test_linux_blocked_child_never_signals_after_identity_loss(self) -> None:
+        process = trace._LinuxForkExecProcess(
+            ["approved"],
+            71,
+            barrier_fd=80,
+            exec_error_fd=81,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(trace.os, "waitpid", side_effect=ChildProcessError), mock.patch.object(
+                trace.os, "kill") as kill, self.assertRaisesRegex(
+                trace.TraceError, "identity was lost"):
+            process.kill()
+        kill.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux fork/exec containment test")
+    def test_linux_fork_exec_barrier_blocks_target_until_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "target-ran"
+            process = trace._start_linux_blocked_process(
+                ["/bin/sh", "-c", "printf ran > \"$1\"", "sh", str(marker)],
+                {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE},
+            )
+            self.assertFalse(marker.exists())
+            process.release_exec()
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b"")
+            self.assertEqual(marker.read_text(encoding="ascii"), "ran")
+            self.assertEqual(process.close_streams(), [])
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux fork/exec containment test")
+    def test_linux_blocked_child_abort_reaps_without_target_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "target-ran"
+            before = len(os.listdir("/proc/self/fd"))
+            process = trace._start_linux_blocked_process(
+                ["/bin/sh", "-c", "printf ran > \"$1\"", "sh", str(marker)],
+                {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE},
+            )
+            cleanup = process.abort_blocked()
+            self.assertTrue(cleanup.quiescence_proven)
+            self.assertEqual(cleanup.failures, [])
+            self.assertFalse(marker.exists())
+            self.assertEqual(process.close_streams(), [])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_linux_process_stream_close_reports_every_failure(self) -> None:
+        process = trace._LinuxForkExecProcess(
+            ["approved"],
+            71,
+            barrier_fd=80,
+            exec_error_fd=81,
+            stdin_fd=82,
+            stdout_fd=83,
+            stderr_fd=84,
+        )
+        with mock.patch.object(trace.os, "close", side_effect=[
+                OSError("barrier"), None, OSError("stdin"), None, OSError("stderr")]):
+            failures = process.close_streams()
+        self.assertEqual(
+            [failure.component for failure in failures],
+            [
+                "linux-process-fd-close:barrier",
+                "linux-process-fd-close:stdin",
+                "linux-process-fd-close:stderr",
+            ],
+        )
+        self.assertEqual(
+            [str(failure.error) for failure in failures],
+            ["barrier", "stdin", "stderr"],
+        )
+
+    def test_linux_fork_exec_rejects_controls_without_descriptor_leaks(self) -> None:
+        for launch in (
+                {"shell": True},
+                {"close_fds": False},
+                {"stdin": subprocess.PIPE, "stderr": object()},
+        ):
+            with self.subTest(controls=sorted(launch)):
+                before = len(os.listdir("/dev/fd"))
+                with self.assertRaisesRegex(trace.TraceError, "unsupported"):
+                    trace._start_linux_blocked_process(["/bin/true"], launch)
+                self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_unproven_posix_containment_fails_closed_before_setsid_escape(self) -> None:
         if sys.platform == "linux":
@@ -2522,8 +2686,22 @@ class TraceFormatTests(unittest.TestCase):
         self.assertTrue(containment.windows_process_resumed)
 
     def test_windows_job_assignment_failure_kills_and_reaps_exact_child(self) -> None:
+        class OwnedHandle:
+            def __init__(self, value: int):
+                self.value = value
+                self.close_count = 0
+
+            def __int__(self) -> int:
+                return self.value
+
+            def Close(self) -> None:
+                if self.close_count:
+                    raise AssertionError("process handle closed twice")
+                self.close_count += 1
+
         process = mock.Mock(pid=91)
-        process._handle = 92
+        process._handle = OwnedHandle(92)
+        owned_handle = process._handle
         kernel32 = mock.Mock()
         kernel32.AssignProcessToJobObject.return_value = 0
         kernel32.CloseHandle.return_value = 1
@@ -2537,11 +2715,167 @@ class TraceFormatTests(unittest.TestCase):
         process.kill.assert_called_once()
         process.wait.assert_called_once_with(timeout=trace.PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
         kernel32.TerminateJobObject.assert_not_called()
-        self.assertEqual(
-            kernel32.CloseHandle.call_args_list,
-            [mock.call(92), mock.call(93)],
-        )
+        self.assertEqual(kernel32.CloseHandle.call_args_list, [mock.call(93)])
+        self.assertEqual(owned_handle.close_count, 1)
         self.assertIsNone(process._handle)
+
+    def test_windows_process_handle_ownership_closes_once(self) -> None:
+        class OwnedHandle:
+            def __init__(self):
+                self.close_count = 0
+
+            def Close(self) -> None:
+                if self.close_count:
+                    raise AssertionError("recycled process handle closed")
+                self.close_count += 1
+
+        process = mock.Mock()
+        owned_handle = OwnedHandle()
+        process._handle = owned_handle
+        with mock.patch.object(trace, "_windows_kernel32") as kernel32:
+            trace._close_windows_process_handle(process)
+            trace._close_windows_process_handle(process)
+        self.assertEqual(owned_handle.close_count, 1)
+        self.assertIsNone(process._handle)
+        kernel32.assert_not_called()
+
+    def test_linux_subreaper_restores_exact_prior_state(self) -> None:
+        for prior_state in (0, 1):
+            with self.subTest(prior_state=prior_state):
+                lock = mock.Mock()
+                containment = trace._ProcessContainment(
+                    process=mock.Mock(),
+                    linux_lock_held=True,
+                    linux_prior_subreaper=prior_state,
+                )
+                with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                        trace, "_linux_set_child_subreaper") as restore:
+                    failures = trace._close_process_containment(
+                        containment, quiescence_proven=True)
+                self.assertEqual(failures, [])
+                restore.assert_called_once_with(prior_state)
+                lock.release.assert_called_once()
+
+    def test_linux_subreaper_restore_failure_poisoning_blocks_completion(self) -> None:
+        lock = mock.Mock()
+        containment = trace._ProcessContainment(
+            process=mock.Mock(),
+            linux_lock_held=True,
+            linux_prior_subreaper=0,
+        )
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_set_child_subreaper", side_effect=OSError("restore failed")):
+            failures = trace._close_process_containment(
+                containment, quiescence_proven=True)
+            self.assertTrue(trace._LINUX_SUBREAPER_POISONED)
+        self.assertEqual([failure.component for failure in failures], ["linux-subreaper-restore"])
+        lock.release.assert_called_once()
+
+    def test_linux_subreaper_restores_after_timeout_and_target_exception(self) -> None:
+        for primary in (
+                subprocess.TimeoutExpired(["approved"], 1),
+                OSError("target failed"),
+        ):
+            with self.subTest(primary=type(primary).__name__):
+                lock = mock.Mock()
+                process = mock.Mock(pid=71)
+                process.communicate.side_effect = primary
+                containment = trace._ProcessContainment(
+                    process=process,
+                    linux_root_pidfd=90,
+                    linux_lock_held=True,
+                    linux_prior_subreaper=0,
+                    linux_exec_released=True,
+                )
+                cleanup = trace._ContainmentCleanup([], True)
+                with mock.patch.object(
+                        trace, "_start_contained_process", return_value=containment), mock.patch.object(
+                        trace, "_terminate_process_tree", return_value=cleanup), mock.patch.object(
+                        trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                        trace.os, "close"), mock.patch.object(
+                        trace, "_linux_set_child_subreaper") as restore:
+                    result = trace._run_contained_process(
+                        ["approved"],
+                        label="approved executable",
+                        timeout=1,
+                        input_data=None,
+                        launch={},
+                    )
+                    close_failures = trace._close_process_containment(
+                        containment,
+                        quiescence_proven=result.quiescence_proven,
+                    )
+                self.assertIs(result.primary_error, primary)
+                self.assertEqual(close_failures, [])
+                restore.assert_called_once_with(0)
+                lock.release.assert_called_once()
+
+    def test_linux_subreaper_does_not_restore_without_tree_quiescence(self) -> None:
+        lock = mock.Mock()
+        containment = trace._ProcessContainment(
+            process=mock.Mock(),
+            linux_lock_held=True,
+            linux_prior_subreaper=0,
+        )
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", False), mock.patch.object(
+                trace, "_linux_set_child_subreaper") as restore:
+            failures = trace._close_process_containment(
+                containment,
+                quiescence_proven=False,
+            )
+            self.assertTrue(trace._LINUX_SUBREAPER_POISONED)
+        restore.assert_not_called()
+        self.assertEqual([failure.component for failure in failures], ["linux-subreaper-restore"])
+        lock.release.assert_called_once()
+
+    def test_linux_poisoned_subreaper_supervisor_rejects_reuse(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_LINUX_SUBREAPER_POISONED", True), mock.patch.object(
+                trace, "_start_linux_blocked_process") as start, self.assertRaisesRegex(
+                trace.TraceError, "not reusable"):
+            trace._start_linux_subreaper_process(["approved"], {})
+        start.assert_not_called()
+        lock.release.assert_called_once()
+
+    def test_containment_handle_close_failure_forces_quiescence_false(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            install = Path(temp).resolve() / "install"
+            executable = install / "bin" / "approved"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"approved")
+            executable.chmod(0o555)
+            policy = {
+                "install_root": str(install),
+                "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "runtime_receipt": {"components": []},
+            }
+            result = subprocess.CompletedProcess([str(executable)], 0, b"", b"")
+            contained = trace._ContainedRun(result, None, [], mock.Mock(), True, True)
+            close_failure = trace._IntegrityFailure(
+                "linux-root-pidfd-close", OSError("close failed"))
+            with isolated_test_install_trust(), mock.patch.object(
+                    trace, "_run_contained_process", return_value=contained), mock.patch.object(
+                    trace, "_close_process_containment", return_value=[close_failure]), self.assertRaises(
+                    trace.ExecutionIntegrityError) as raised:
+                trace.run_approved_executable(
+                    [str(executable)],
+                    path=executable,
+                    runtime_policy=policy,
+                    expected_path=str(executable),
+                    expected_sha256=trace.sha256_file(executable),
+                    label="approved executable",
+                    check=False,
+                    capture_output=True,
+                )
+        self.assertFalse(raised.exception.quiescence_proven)
+        self.assertEqual(
+            [failure.component for failure in raised.exception.secondary_errors],
+            ["linux-root-pidfd-close"],
+        )
 
     def test_ds4_writable_root_blocks_restore_before_postcheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3682,7 +4016,12 @@ class TraceFormatTests(unittest.TestCase):
                 "windows-process-reap",
                 "windows-process-termination",
                 "windows-job-assignment",
-                "linux-child-ownership"):
+                "linux-child-ownership",
+                "linux-root-pidfd-close",
+                "linux-subreaper-restore",
+                "windows-process-handle-close",
+                "windows-thread-handle-close",
+                "containment-handle-close"):
             with self.subTest(component=component):
                 primary = subprocess.TimeoutExpired(["exporter"], 7)
                 failure = runtime_trace._IntegrityFailure(
