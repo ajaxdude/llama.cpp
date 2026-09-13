@@ -238,10 +238,12 @@ llama_dsv41_admission_result llama_dsv41_admit(
     if (!params.unified_memory) {
         reject("unified_memory", result, "Strix admission requires one unified host/GPU memory pool");
     }
-    if (params.soft_bytes == 0 || params.soft_bytes >= params.watchdog_bytes ||
+    if (params.soft_bytes == 0 || params.soft_bytes > LLAMA_DSV41_ADMISSION_SOFT_BYTES ||
+            params.watchdog_bytes > LLAMA_DSV41_WATCHDOG_EMERGENCY_BYTES ||
+            params.soft_bytes >= params.watchdog_bytes ||
             params.watchdog_bytes >= params.hard_bytes ||
             params.hard_bytes > LLAMA_DSV41_ADMISSION_HARD_BYTES) {
-        reject("thresholds", result, "require soft < watchdog < hard <= 120 GiB");
+        reject("thresholds", result, "require soft <= 116 GiB, watchdog <= 118 GiB, and soft < watchdog < hard <= 120 GiB");
     }
     if (params.safety_margin_bytes == 0) {
         reject("thresholds", result, "safety margin must be non-zero");
@@ -276,10 +278,17 @@ llama_dsv41_admission_result llama_dsv41_admit(
         result.expert_staging_slot_bytes = std::max(result.expert_staging_slot_bytes, bytes);
     }
 
+    const uint64_t max_cache_bytes = checked_mul(
+            result.expert_slot_bytes, LLAMA_DSV41_N_EXPERT, "maximum expert cache");
+    if (params.configured_cache_slots > LLAMA_DSV41_N_EXPERT ||
+            params.configured_cache_bytes > max_cache_bytes) {
+        reject("cache", result, "configured cache exceeds the published expert count");
+    }
     const uint64_t bytes_slots = params.configured_cache_bytes == 0 ?
             LLAMA_DSV41_N_EXPERT : params.configured_cache_bytes/result.expert_slot_bytes;
     if (params.configured_cache_slots != 0 && params.configured_cache_bytes != 0 &&
-            params.configured_cache_slots != bytes_slots) {
+            params.configured_cache_bytes != checked_mul(
+                    params.configured_cache_slots, result.expert_slot_bytes, "configured expert cache")) {
         reject("cache", result, "configured cache slots and bytes disagree");
     }
     uint64_t slot_cap = LLAMA_DSV41_N_EXPERT;
@@ -356,7 +365,8 @@ llama_dsv41_admission_result llama_dsv41_admit(
 
 std::string llama_dsv41_admission_result::describe() const {
     return format(
-            "DeepSeek V4.1 memory admission: category=%s, context=%u, sequences=%u, ubatch=%u, current=%llu, fixed=%llu, "
+            "DeepSeek V4.1 memory admission: category=%s, context=%u, sequences=%u, ubatch=%u, "
+            "host_total=%llu, host_available=%llu, current=%llu, fixed=%llu, "
             "dense=%llu, state=%llu, workspace=%llu, engram_staging=%llu, expert_slots=%u, "
             "expert_cache=%llu, expert_staging=%llu, outputs=%llu, safety_margin=%llu, projected=%llu, "
             "soft=%llu, watchdog=%llu, hard=%llu, device_reported_ignored=%llu",
@@ -364,6 +374,8 @@ std::string llama_dsv41_admission_result::describe() const {
             n_ctx,
             n_seq,
             n_ubatch,
+            (unsigned long long) host_total,
+            (unsigned long long) host_available,
             (unsigned long long) host_used,
             (unsigned long long) fixed_bytes,
             (unsigned long long) dense_tensor_bytes,

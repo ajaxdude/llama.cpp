@@ -161,10 +161,15 @@ void test_configured_cache() {
     const auto tensors = published_tensors();
     auto params = base_params();
     params.configured_cache_slots = 12;
-    params.configured_cache_bytes = 12*398131200ULL + 1024;
+    params.configured_cache_bytes = 12*398131200ULL;
     const auto result = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
     REQUIRE(result.expert_slots == 12);
     REQUIRE(result.expert_cache_bytes == 12*398131200ULL);
+
+    params.configured_cache_bytes += 1024;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("disagree") != std::string::npos);
 
     params.configured_cache_slots = 13;
     REQUIRE(thrown([&]() {
@@ -176,6 +181,11 @@ void test_configured_cache() {
     REQUIRE(thrown([&]() {
         llama_dsv41_admit(host_with_used(0), 0, tensors, params);
     }).find("top-k") != std::string::npos);
+
+    params.configured_cache_slots = LLAMA_DSV41_N_EXPERT + 1;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("published expert count") != std::string::npos);
 }
 
 void test_threshold_boundaries() {
@@ -201,6 +211,17 @@ void test_threshold_boundaries() {
     REQUIRE(thrown([&]() {
         llama_dsv41_admit(host_with_used(params.hard_bytes), 0, tensors, params);
     }).find("category=hard") != std::string::npos);
+
+    params.soft_bytes = LLAMA_DSV41_ADMISSION_SOFT_BYTES + 1;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("category=thresholds") != std::string::npos);
+
+    params.soft_bytes = LLAMA_DSV41_ADMISSION_SOFT_BYTES;
+    params.watchdog_bytes = LLAMA_DSV41_WATCHDOG_EMERGENCY_BYTES + 1;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("category=thresholds") != std::string::npos);
 }
 
 void test_context_progression() {
@@ -244,7 +265,8 @@ void test_diagnostics_and_guards() {
     const std::string diagnostic = result.describe();
     for (const char * field : {
                 "category=", "current=", "fixed=", "dense=", "state=", "workspace=",
-                "expert_slots=", "expert_cache=", "expert_staging=", "soft=", "watchdog=", "hard=" }) {
+                "host_total=", "host_available=", "expert_slots=", "expert_cache=", "expert_staging=",
+                "soft=", "watchdog=", "hard=" }) {
         REQUIRE(diagnostic.find(field) != std::string::npos);
     }
 
