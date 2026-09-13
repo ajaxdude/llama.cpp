@@ -185,7 +185,11 @@ uint64_t llama_dsv41_engram_staging_bytes(uint32_t n_ubatch) {
             checked_mul(n_ubatch, LLAMA_ENGRAM_LAYERS*LLAMA_ENGRAM_COLS*LLAMA_ENGRAM_DIM, "Engram decoded rows"),
             sizeof(float),
             "Engram decoded rows");
-    return checked_add(checked_add(ids, decoded, "Engram staging"), n_ubatch, "Engram staging");
+    const uint64_t select = checked_mul(n_ubatch, sizeof(int32_t), "Engram text selection");
+    return checked_add(
+            checked_add(checked_add(ids, decoded, "Engram staging"), n_ubatch, "Engram staging"),
+            select,
+            "Engram staging");
 }
 
 uint64_t llama_dsv41_output_bytes(uint32_t n_vocab, uint32_t n_ubatch) {
