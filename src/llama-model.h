@@ -769,6 +769,8 @@ struct llama_model {
     virtual void release_runtime_work() const {}
     virtual void acquire_runtime_context() const {}
     virtual void release_runtime_context() const {}
+    virtual uint32_t default_context_size() const { return 0; }
+    virtual void validate_context_params(const llama_cparams &) const {}
 
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;

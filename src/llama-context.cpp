@@ -130,7 +130,8 @@ llama_context::llama_context(
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
-    cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    const uint32_t n_ctx_default = model.default_context_size();
+    cparams.n_ctx            = params.n_ctx           == 0    ? (n_ctx_default == 0 ? hparams.n_ctx_train : n_ctx_default) : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -254,6 +255,8 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+
+    model.validate_context_params(cparams);
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later

@@ -1318,7 +1318,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
 
     struct engram_model;
+    struct admission_model;
     std::shared_ptr<engram_model> engram;
+    std::shared_ptr<admission_model> admission;
     std::shared_ptr<llama_dsv41_expert_runtime> experts;
 
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1328,6 +1330,8 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     void release_runtime_work() const override;
     void acquire_runtime_context() const override;
     void release_runtime_context() const override;
+    uint32_t default_context_size() const override;
+    void validate_context_params(const llama_cparams & cparams) const override;
 
     [[noreturn]] std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

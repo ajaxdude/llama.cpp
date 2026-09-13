@@ -1699,6 +1699,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.ple_cache_mb    = params.ple_cache_mb;
     mparams.expert_cache_slots = params.expert_cache_slots;
     mparams.expert_cache_bytes = params.expert_cache_mib > 0 ? (size_t) params.expert_cache_mib << 20 : 0;
+    mparams.dsv41_memory_soft_bytes = (uint64_t) params.dsv41_memory_soft_mib << 20;
+    mparams.dsv41_memory_watchdog_bytes = (uint64_t) params.dsv41_memory_watchdog_mib << 20;
+    mparams.dsv41_memory_hard_bytes = (uint64_t) params.dsv41_memory_hard_mib << 20;
+    mparams.dsv41_memory_safety_margin_bytes = (uint64_t) params.dsv41_memory_safety_margin_mib << 20;
+    mparams.dsv41_admission_context = params.n_ctx == 0 ? 32768 : params.n_ctx;
+    mparams.dsv41_admission_sequences = params.n_parallel;
+    mparams.dsv41_admission_ubatch = params.n_ubatch;
+    mparams.dsv41_procfs_root = params.dsv41_procfs_root.c_str();
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

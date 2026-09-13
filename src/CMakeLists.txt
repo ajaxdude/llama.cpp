@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-dsv41-admission.cpp
             llama-dsv41.cpp
             llama-dsv41-engram.cpp
             llama-dsv41-expert.cpp

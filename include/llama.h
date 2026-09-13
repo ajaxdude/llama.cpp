@@ -348,9 +348,19 @@ extern "C" {
         int32_t ple_io_threads; // parallel pread workers
         int32_t ple_cache_mb;   // in-memory cache of recently read rows, 0 disables
 
-        // DeepSeek V4.1 routed-expert cache. Both values must be non-zero.
+        // DeepSeek V4.1 routed-expert cache. Zero values auto-fit within admission.
         size_t  expert_cache_bytes;
         int32_t expert_cache_slots;
+
+        // DeepSeek V4.1 unified host-memory admission. Zero values use safe Strix defaults.
+        uint64_t dsv41_memory_soft_bytes;
+        uint64_t dsv41_memory_watchdog_bytes;
+        uint64_t dsv41_memory_hard_bytes;
+        uint64_t dsv41_memory_safety_margin_bytes;
+        uint32_t dsv41_admission_context;
+        uint32_t dsv41_admission_sequences;
+        uint32_t dsv41_admission_ubatch;
+        const char * dsv41_procfs_root;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
