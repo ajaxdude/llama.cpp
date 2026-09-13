@@ -174,6 +174,66 @@ private:
     size_t offset = 0;
 };
 
+class device_writer : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const uint8_t * bytes = static_cast<const uint8_t *>(src);
+        metadata.insert(metadata.end(), bytes, bytes + size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        tensors.emplace_back(size);
+        ggml_backend_tensor_get(tensor, tensors.back().data(), offset, size);
+        tensor_bytes += size;
+    }
+
+    size_t n_bytes() override {
+        return metadata.size();
+    }
+
+    std::vector<uint8_t> metadata;
+    std::vector<std::vector<uint8_t>> tensors;
+    size_t tensor_bytes = 0;
+};
+
+class device_reader : public llama_io_read_i {
+public:
+    explicit device_reader(const device_writer & writer) :
+        metadata(writer.metadata),
+        tensors(writer.tensors) {
+    }
+
+    void read(void * dst, size_t size) override {
+        if (offset > metadata.size() || size > metadata.size() - offset) {
+            throw std::runtime_error("test on-device metadata is truncated");
+        }
+        std::memcpy(dst, metadata.data() + offset, size);
+        offset += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t tensor_offset, size_t size) override {
+        if (i_tensor >= tensors.size() || tensors[i_tensor].size() != size) {
+            throw std::runtime_error("test on-device tensor layout differs");
+        }
+        ggml_backend_tensor_set(tensor, tensors[i_tensor].data(), tensor_offset, size);
+        ++i_tensor;
+    }
+
+    size_t n_bytes() override {
+        return offset;
+    }
+
+    size_t tensor_reads() const {
+        return i_tensor;
+    }
+
+private:
+    const std::vector<uint8_t> & metadata;
+    const std::vector<std::vector<uint8_t>> & tensors;
+    size_t offset = 0;
+    size_t i_tensor = 0;
+};
+
 static void test_transaction_commit_rollback() {
     llama_memory_dsv41 memory(small_config());
     llama_ubatch ubatch = make_ubatch(0, 1, 0);
@@ -458,6 +518,27 @@ static void test_state_save_load() {
     vector_reader full_reader(full_writer.data);
     memory.state_read(full_reader, -1);
     check(memory.seq_pos_max(2) == 2, "full state restore lost sequence state");
+
+    device_writer on_device_writer;
+    memory.state_write(on_device_writer, 2, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    vector_writer host_writer;
+    memory.state_write(host_writer, 2);
+    check(on_device_writer.metadata.size() + on_device_writer.tensor_bytes == host_writer.data.size(),
+          "on-device state metadata includes tensor payload bytes");
+    memory.clear(true);
+    device_reader on_device_reader(on_device_writer);
+    memory.state_read(on_device_reader, 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    check(on_device_reader.tensor_reads() == on_device_writer.tensors.size(),
+          "on-device state restore did not consume every tensor");
+    check(memory.seq_pos_max(1) == 2 &&
+          memory.sequence_candidate_ids(1) == std::vector<int32_t>({ 11 }),
+          "on-device state restore lost sequence metadata");
+    ggml_backend_tensor_get(
+            memory.raw_k(0),
+            actual.data(),
+            ((size_t) memory.config().raw_window + 2)*row_bytes,
+            row_bytes);
+    check(actual == expected, "on-device state restore lost raw cache data");
 }
 
 static void test_accounting() {
