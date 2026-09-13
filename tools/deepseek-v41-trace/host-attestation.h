@@ -14,6 +14,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace dsv41 {
 
 namespace fs = std::filesystem;
@@ -98,16 +104,36 @@ static inline fs::path existing_ancestor(const fs::path & path) {
     return fs::canonical(current);
 }
 
+static inline void require_usable_directory(const fs::path & path, const char * label) {
+    if (fs::is_symlink(path)) {
+        throw std::runtime_error(std::string(label) + " must not be a symlink");
+    }
+    if (!fs::is_directory(path)) {
+        throw std::runtime_error(std::string(label) + " must be an existing directory");
+    }
+#if defined(_WIN32)
+    if (_access(path.string().c_str(), 6) != 0) {
+#else
+    if (access(path.string().c_str(), W_OK | X_OK) != 0) {
+#endif
+        throw std::runtime_error(std::string(label) + " must be writable and searchable");
+    }
+}
+
 static inline storage_attestation require_nvme_path(
         const fs::path & path,
         const char * label,
         const fs::path & mountinfo_path = "/proc/self/mountinfo",
         const fs::path & sys_dev_block_root = "/sys/dev/block",
-        const fs::path & sys_class_block_root = "/sys/class/block") {
+        const fs::path & sys_class_block_root = "/sys/class/block",
+        const fs::path & forbidden_root = "/mnt/bigspace") {
     const fs::path absolute = fs::absolute(path).lexically_normal();
+    const fs::path forbidden = fs::absolute(forbidden_root).lexically_normal();
+    if (path_is_within(absolute, forbidden)) {
+        throw std::runtime_error(std::string(label) + " must not use /mnt/bigspace");
+    }
     const fs::path resolved = fs::weakly_canonical(absolute);
     const fs::path existing = existing_ancestor(resolved);
-    const fs::path forbidden = "/mnt/bigspace";
     if (path_is_within(resolved, forbidden)) {
         throw std::runtime_error(std::string(label) + " must not use /mnt/bigspace");
     }

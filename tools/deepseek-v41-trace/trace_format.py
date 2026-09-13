@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -138,10 +139,363 @@ def canonical_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def strict_json_loads(data: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise TraceError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(data, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise TraceError(f"invalid JSON: {error}") from error
+
+
+def _require_exact_keys(record: dict[str, Any], keys: set[str], label: str) -> None:
+    missing = sorted(keys - set(record))
+    extra = sorted(set(record) - keys)
+    if missing or extra:
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(missing))
+        if extra:
+            detail.append("unexpected " + ", ".join(extra))
+        raise TraceError(f"{label} fields are invalid: {'; '.join(detail)}")
+
+
+def validate_accelerator_attestation(runtime: str, accelerator: Any) -> dict[str, Any]:
+    if not isinstance(accelerator, dict):
+        raise TraceError("manifest accelerator attestation is invalid")
+    common = {
+        "format",
+        "version",
+        "runtime_kind",
+        "platform",
+        "backend",
+        "backend_device",
+        "backend_description",
+        "architecture",
+        "source",
+    }
+    if runtime == "llama.cpp":
+        _require_exact_keys(
+            accelerator,
+            common | {"pci_device_id", "kfd_node", "gpu_id", "gfx_target_version"},
+            "llama.cpp accelerator attestation",
+        )
+        expected = {
+            "format": "dsv41-accelerator-attestation",
+            "version": 2,
+            "runtime_kind": "strix-rocm",
+            "platform": "linux",
+            "backend": "ROCm",
+            "backend_device": "ROCm0",
+            "architecture": "gfx1151",
+            "gfx_target_version": 110501,
+            "source": "linux-kfd-sysfs",
+        }
+        for key, value in expected.items():
+            if accelerator.get(key) != value:
+                raise TraceError(f"llama.cpp accelerator {key} mismatch")
+        if re.fullmatch(
+                r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]",
+                accelerator.get("pci_device_id", "")) is None:
+            raise TraceError("llama.cpp accelerator PCI identity is invalid")
+        if not isinstance(accelerator.get("kfd_node"), str) or not accelerator["kfd_node"].isdigit():
+            raise TraceError("llama.cpp accelerator KFD node is invalid")
+        if type(accelerator.get("gpu_id")) is not int or accelerator["gpu_id"] <= 0:
+            raise TraceError("llama.cpp accelerator GPU identity is invalid")
+    elif runtime == "ds4":
+        _require_exact_keys(
+            accelerator,
+            common | {
+                "metal_registry_id",
+                "recommended_max_working_set_bytes",
+                "unified_memory",
+            },
+            "ds4 accelerator attestation",
+        )
+        expected = {
+            "format": "dsv41-accelerator-attestation",
+            "version": 2,
+            "runtime_kind": "apple-metal",
+            "platform": "macos",
+            "backend": "Metal",
+            "source": "metal-device-query",
+            "unified_memory": True,
+        }
+        for key, value in expected.items():
+            if accelerator.get(key) != value:
+                raise TraceError(f"ds4 accelerator {key} mismatch")
+        if type(accelerator.get("unified_memory")) is not bool:
+            raise TraceError("ds4 accelerator unified-memory identity is invalid")
+        registry_id = accelerator.get("metal_registry_id")
+        if type(registry_id) is not int or registry_id <= 0:
+            raise TraceError("ds4 accelerator Metal registry identity is invalid")
+        working_set = accelerator.get("recommended_max_working_set_bytes")
+        if type(working_set) is not int or working_set <= 0:
+            raise TraceError("ds4 accelerator working-set identity is invalid")
+    else:
+        raise TraceError(f"unsupported runtime accelerator attestation: {runtime}")
+    for key in ("backend_device", "backend_description", "architecture"):
+        if not isinstance(accelerator.get(key), str) or not accelerator[key]:
+            raise TraceError(f"manifest accelerator {key} is invalid")
+    return accelerator
+
+
+def validate_storage_attestation(runtime: str, item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise TraceError("storage attestation is invalid")
+    common = {
+        "format",
+        "version",
+        "runtime_kind",
+        "platform",
+        "storage_kind",
+        "resolved_path",
+        "existing_path",
+        "mount_point",
+        "filesystem_type",
+        "source",
+    }
+    if runtime == "llama.cpp":
+        _require_exact_keys(
+            item,
+            common | {
+                "mount_source",
+                "device_number",
+                "block_device_path",
+                "nvme_device",
+                "rotational",
+            },
+            "llama.cpp storage attestation",
+        )
+        expected = {
+            "format": "dsv41-storage-attestation",
+            "version": 2,
+            "runtime_kind": "strix-rocm",
+            "platform": "linux",
+            "storage_kind": "linux-nvme",
+            "source": "linux-mountinfo-sysfs",
+            "rotational": False,
+        }
+        for key, value in expected.items():
+            if item.get(key) != value:
+                raise TraceError(f"llama.cpp storage {key} mismatch")
+        if type(item.get("rotational")) is not bool:
+            raise TraceError("llama.cpp storage rotational identity is invalid")
+        if not isinstance(item.get("nvme_device"), str) or re.fullmatch(
+                r"nvme[0-9]+(?:c[0-9]+)?n[0-9]+", item["nvme_device"]) is None:
+            raise TraceError("llama.cpp storage NVMe device identity is invalid")
+        if not isinstance(item.get("mount_source"), str) or not item["mount_source"].startswith("/dev/"):
+            raise TraceError("llama.cpp storage mount source is not a local block device")
+        if re.fullmatch(r"[0-9]+:[0-9]+", item.get("device_number", "")) is None:
+            raise TraceError("llama.cpp storage device number is invalid")
+        block_device_path = item.get("block_device_path")
+        if not isinstance(block_device_path, str) or item["nvme_device"] not in Path(block_device_path).parts:
+            raise TraceError("llama.cpp storage block device ancestry is invalid")
+    elif runtime == "ds4":
+        _require_exact_keys(
+            item,
+            common | {
+                "device_identifier",
+                "parent_whole_disk",
+                "bus_protocol",
+                "filesystem_device",
+                "internal",
+                "solid_state",
+            },
+            "ds4 storage attestation",
+        )
+        expected = {
+            "format": "dsv41-storage-attestation",
+            "version": 2,
+            "runtime_kind": "apple-metal",
+            "platform": "macos",
+            "storage_kind": "darwin-local-solid-state",
+            "source": "diskutil-info-plist",
+            "internal": True,
+            "solid_state": True,
+        }
+        for key, value in expected.items():
+            if item.get(key) != value:
+                raise TraceError(f"ds4 storage {key} mismatch")
+        if type(item.get("internal")) is not bool or type(item.get("solid_state")) is not bool:
+            raise TraceError("ds4 storage media identity is invalid")
+        for key in ("device_identifier", "parent_whole_disk", "bus_protocol"):
+            if not isinstance(item.get(key), str) or not item[key]:
+                raise TraceError(f"ds4 storage {key} is invalid")
+        if item["bus_protocol"].lower() in {"network", "virtual", "disk image"}:
+            raise TraceError("ds4 storage bus protocol is not local")
+        if type(item.get("filesystem_device")) is not int or item["filesystem_device"] < 0:
+            raise TraceError("ds4 storage filesystem device identity is invalid")
+    else:
+        raise TraceError(f"unsupported runtime storage attestation: {runtime}")
+    for path_key in ("resolved_path", "existing_path", "mount_point"):
+        value = item.get(path_key)
+        if not isinstance(value, str) or not value.startswith("/"):
+            raise TraceError(f"storage {path_key} is invalid")
+    if not isinstance(item.get("filesystem_type"), str) or not item["filesystem_type"]:
+        raise TraceError("storage filesystem type is invalid")
+    try:
+        Path(item["resolved_path"]).relative_to(Path(item["mount_point"]))
+        Path(item["existing_path"]).relative_to(Path(item["mount_point"]))
+    except ValueError as error:
+        raise TraceError("storage mount ancestry is invalid") from error
+    return item
+
+
+def validate_host_attestation(host: Any) -> dict[str, Any]:
+    if not isinstance(host, dict):
+        raise TraceError("ds4 host attestation is invalid")
+    _require_exact_keys(
+        host,
+        {
+            "format",
+            "version",
+            "runtime_kind",
+            "platform",
+            "machine",
+            "hardware_model",
+            "os_version",
+            "memory_bytes",
+            "source",
+        },
+        "ds4 host attestation",
+    )
+    expected = {
+        "format": "dsv41-host-attestation",
+        "version": 1,
+        "runtime_kind": "apple-metal",
+        "platform": "macos",
+        "machine": "arm64",
+        "source": "darwin-sysctl",
+    }
+    for key, value in expected.items():
+        if host.get(key) != value:
+            raise TraceError(f"ds4 host {key} mismatch")
+    for key in ("hardware_model", "os_version"):
+        if not isinstance(host.get(key), str) or not host[key]:
+            raise TraceError(f"ds4 host {key} is invalid")
+    if type(host.get("memory_bytes")) is not int or host["memory_bytes"] < 128 * 1024 * 1024 * 1024:
+        raise TraceError("ds4 host memory is below 128 GiB")
+    return host
+
+
+WATCHDOG_STATE_KEYS = {
+    "total_bytes",
+    "available_bytes",
+    "used_bytes",
+    "swap_entries",
+    "peak_used_bytes",
+    "child_pid",
+    "child_status",
+    "child_returncode",
+    "process_group_id",
+    "process_group_status",
+    "threshold_reason",
+}
+
+
+def validate_watchdog_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise TraceError("watchdog JSONL event is not an object")
+    event_name = event.get("event")
+    required = {"timestamp", "event"} | WATCHDOG_STATE_KEYS
+    optional: set[str] = set()
+    if event_name == "preflight":
+        required |= {"soft_bytes", "emergency_bytes", "strict_ceiling_bytes"}
+    elif event_name == "child_started":
+        required.add("command")
+    elif event_name == "sample":
+        pass
+    elif event_name == "process_group_signal":
+        required.add("signal")
+        optional.add("grace_deadline_monotonic")
+    elif event_name == "final":
+        required |= {"classification", "exit_code"}
+        optional |= {"error", "secondary_errors"}
+    else:
+        raise TraceError(f"watchdog JSONL event name is invalid: {event_name}")
+    missing = sorted(required - set(event))
+    unexpected = sorted(set(event) - required - optional)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise TraceError("watchdog JSONL event fields are invalid: " + "; ".join(details))
+    if not isinstance(event["timestamp"], str) or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+            event["timestamp"]) is None:
+        raise TraceError("watchdog JSONL timestamp is invalid")
+    for key in ("total_bytes", "available_bytes", "used_bytes", "swap_entries", "peak_used_bytes"):
+        if event[key] is not None and (type(event[key]) is not int or event[key] < 0):
+            raise TraceError(f"watchdog JSONL {key} is invalid")
+    for key in ("child_pid", "process_group_id"):
+        if event[key] is not None and (type(event[key]) is not int or event[key] <= 0):
+            raise TraceError(f"watchdog JSONL {key} is invalid")
+    if event["child_returncode"] is not None and type(event["child_returncode"]) is not int:
+        raise TraceError("watchdog JSONL child_returncode is invalid")
+    if event["child_status"] not in {"not_started", "running", "signaled", "exited"}:
+        raise TraceError("watchdog JSONL child_status is invalid")
+    if event["process_group_status"] not in {
+            "not_created", "active", "leader_exited", "signal_error",
+            "termination_timeout", "missing", "sighup_sent", "sigint_sent",
+            "sigterm_sent", "sigkill_sent"}:
+        raise TraceError("watchdog JSONL process_group_status is invalid")
+    if not isinstance(event["threshold_reason"], str) or not event["threshold_reason"]:
+        raise TraceError("watchdog JSONL threshold_reason is invalid")
+    if event_name == "preflight":
+        for key in ("soft_bytes", "emergency_bytes", "strict_ceiling_bytes"):
+            if type(event[key]) is not int or event[key] <= 0:
+                raise TraceError(f"watchdog JSONL {key} is invalid")
+    elif event_name == "child_started":
+        if not isinstance(event["command"], list) or not event["command"] or (
+                not all(isinstance(value, str) and value for value in event["command"])):
+            raise TraceError("watchdog JSONL command is invalid")
+    elif event_name == "process_group_signal":
+        if event["signal"] not in {"SIGHUP", "SIGINT", "SIGTERM", "SIGKILL"}:
+            raise TraceError("watchdog JSONL signal is invalid")
+        deadline = event.get("grace_deadline_monotonic")
+        if deadline is not None and (
+                event["signal"] != "SIGTERM" or
+                not isinstance(deadline, (int, float)) or isinstance(deadline, bool) or
+                not math.isfinite(deadline)):
+            raise TraceError("watchdog JSONL grace deadline is invalid")
+    elif event_name == "final":
+        if event["classification"] not in {
+                "child_exit", "soft_limit", "grace_timeout", "swap_appeared",
+                "emergency_limit", "procfs_error", "signal_error", "termination_timeout",
+                "lease_error", "parent_signal", "internal_error", "launch_error",
+                "configuration_error", "startup_swap_active", "startup_emergency_limit",
+                "startup_soft_limit"}:
+            raise TraceError("watchdog JSONL classification is invalid")
+        if type(event["exit_code"]) is not int:
+            raise TraceError("watchdog JSONL exit code is invalid")
+        if "error" in event and (not isinstance(event["error"], str) or not event["error"]):
+            raise TraceError("watchdog JSONL error is invalid")
+        secondary_errors = event.get("secondary_errors")
+        if secondary_errors is not None:
+            if not isinstance(secondary_errors, list) or not secondary_errors:
+                raise TraceError("watchdog JSONL secondary errors are invalid")
+            for secondary_error in secondary_errors:
+                _require_exact_keys(
+                    secondary_error, {"component", "detail"}, "watchdog JSONL secondary error")
+                if secondary_error["component"] not in {"audit", "lease", "stderr"} or (
+                        not isinstance(secondary_error["detail"], str) or not secondary_error["detail"]):
+                    raise TraceError("watchdog JSONL secondary error is invalid")
+    return event
+
+
 def element_count(shape: Iterable[int]) -> int:
     count = 1
     for dim in shape:
-        if not isinstance(dim, int) or dim <= 0:
+        if type(dim) is not int or dim <= 0:
             raise TraceError(f"shape dimension must be a nonzero positive integer: {dim!r}")
         count *= dim
     return count
@@ -233,19 +587,25 @@ def validate_event(event: dict[str, Any]) -> None:
     missing = sorted(required - event.keys())
     if missing:
         raise TraceError(f"event is missing fields: {', '.join(missing)}")
+    allowed = set(required)
+    if event.get("component") == "expert.ids":
+        allowed.add("semantic_id_space")
+    extra = sorted(set(event) - allowed)
+    if extra:
+        raise TraceError(f"event has unexpected fields: {', '.join(extra)}")
     if event["trace_version"] != TRACE_VERSION:
         raise TraceError(f"unsupported event version: {event['trace_version']!r}")
     if event["byte_order"] != "little":
         raise TraceError("trace blobs must use little-endian byte order")
     if event["phase"] not in ("input", "prefill", "decode"):
         raise TraceError("event phase is invalid")
-    if not isinstance(event["step"], int) or event["step"] < 0:
+    if type(event["step"]) is not int or event["step"] < 0:
         raise TraceError("event step is invalid")
-    if not isinstance(event["token_start"], int) or event["token_start"] < 0:
+    if type(event["token_start"]) is not int or event["token_start"] < 0:
         raise TraceError("event token_start is invalid")
-    if not isinstance(event["token_count"], int) or event["token_count"] <= 0:
+    if type(event["token_count"]) is not int or event["token_count"] <= 0:
         raise TraceError("event token_count is invalid")
-    if event["layer"] is not None and (not isinstance(event["layer"], int) or event["layer"] < 0):
+    if event["layer"] is not None and (type(event["layer"]) is not int or event["layer"] < 0):
         raise TraceError("event layer is invalid")
     if not isinstance(event["shape"], list) or not event["shape"] or any(dim <= 0 for dim in event["shape"]):
         raise TraceError("event shape dimensions must be nonzero")
@@ -350,8 +710,8 @@ class TraceBundle:
             raise TraceError("trace root must not be a symlink")
         self.root = root.resolve()
         try:
-            self.manifest = json.loads(self._path(MANIFEST_NAME).read_text(encoding="ascii"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            self.manifest = strict_json_loads(self._path(MANIFEST_NAME).read_text(encoding="ascii"))
+        except (OSError, UnicodeError, TraceError) as error:
             raise TraceError(f"cannot read manifest: {error}") from error
         if self.manifest.get("trace_format") != TRACE_FORMAT:
             raise TraceError("manifest trace_format mismatch")
@@ -372,8 +732,8 @@ class TraceBundle:
                     if not raw.endswith(b"\n"):
                         raise TraceError(f"events.jsonl is truncated at line {line_number}")
                     try:
-                        event = json.loads(raw.decode("ascii"))
-                    except (UnicodeError, json.JSONDecodeError) as error:
+                        event = strict_json_loads(raw.decode("ascii"))
+                    except (UnicodeError, TraceError) as error:
                         raise TraceError(f"invalid event at line {line_number}: {error}") from error
                     validate_event(event)
                     if verify_blobs:
@@ -388,69 +748,127 @@ class TraceBundle:
         return result
 
     def _validate_manifest(self) -> None:
-        for key in (
-                "runtime", "revision", "build", "model", "prompt", "accelerator",
-                "config", "comparison", "environment", "audits"):
-            if key not in self.manifest:
-                raise TraceError(f"manifest is missing {key}")
-        if not isinstance(self.manifest["runtime"], str) or not self.manifest["runtime"]:
+        if not isinstance(self.manifest.get("runtime"), str) or not self.manifest["runtime"]:
             raise TraceError("manifest runtime is invalid")
         if self.manifest["runtime"] not in ("ds4", "llama.cpp"):
             raise TraceError("manifest runtime must be ds4 or llama.cpp")
+        top_level = {
+            "trace_format",
+            "trace_version",
+            "event_count",
+            "runtime",
+            "revision",
+            "build",
+            "model",
+            "prompt",
+            "accelerator",
+            "config",
+            "comparison",
+            "environment",
+            "paths",
+            "audits",
+            "expected",
+        }
+        top_level.add("candidate" if self.manifest["runtime"] == "llama.cpp" else "host")
+        _require_exact_keys(self.manifest, top_level, f"{self.manifest['runtime']} manifest")
         if not isinstance(self.manifest["revision"], str) or not self.manifest["revision"]:
             raise TraceError("manifest revision is invalid")
         if self.manifest["runtime"] == "ds4" and self.manifest["revision"] != DS4_REVISION:
             raise TraceError(f"ds4 revision must be {DS4_REVISION}")
         if not isinstance(self.manifest["build"], dict):
             raise TraceError("manifest build is invalid")
+        build_keys = (
+            {"number", "info", "compiler", "target", "path", "sha256"}
+            if self.manifest["runtime"] == "llama.cpp"
+            else {"compiler", "target", "path", "sha256"}
+        )
+        _require_exact_keys(self.manifest["build"], build_keys, "manifest build")
         build_sha256 = self.manifest["build"].get("sha256", "")
         if not isinstance(build_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", build_sha256) is None:
             raise TraceError("manifest build SHA-256 is invalid")
+        for key in build_keys - {"sha256", "number"}:
+            value = self.manifest["build"].get(key)
+            if not isinstance(value, str) or not value:
+                raise TraceError(f"manifest build {key} is invalid")
+        if "number" in build_keys and type(self.manifest["build"]["number"]) is not int:
+            raise TraceError("manifest build number is invalid")
+        if not self.manifest["build"]["path"].startswith("/"):
+            raise TraceError("manifest build path is not absolute")
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
+        _require_exact_keys(
+            self.manifest["model"],
+            {"path", "sha256", "byte_count", "architecture"},
+            "manifest model",
+        )
+        _require_exact_keys(
+            self.manifest["prompt"],
+            {
+                "path",
+                "sha256",
+                "byte_count",
+                "corpus_name",
+                "corpus_sha256",
+                "target_tokens",
+                "provenance",
+            },
+            "manifest prompt",
+        )
+        for section in ("model", "prompt"):
             digest = self.manifest[section].get("sha256")
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise TraceError(f"manifest {section} SHA-256 is invalid")
-            if not isinstance(self.manifest[section].get("byte_count"), int) or self.manifest[section]["byte_count"] <= 0:
+            if type(self.manifest[section].get("byte_count")) is not int or self.manifest[section]["byte_count"] <= 0:
                 raise TraceError(f"manifest {section} byte_count is invalid")
         for section in ("config", "comparison", "environment", "audits"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
+        _require_exact_keys(
+            self.manifest["environment"],
+            {"system_info", "command"},
+            "manifest environment",
+        )
+        if not all(isinstance(value, str) and value for value in self.manifest["environment"].values()):
+            raise TraceError("manifest environment values are invalid")
+        system_info = self.manifest["environment"]["system_info"].lower()
+        if self.manifest["runtime"] == "llama.cpp" and "linux" not in system_info:
+            raise TraceError("llama.cpp environment is not Linux")
+        if self.manifest["runtime"] == "ds4" and not any(
+                name in system_info for name in ("darwin", "macos")):
+            raise TraceError("ds4 environment is not macOS")
         context = self.manifest["config"].get("context")
         decode_steps = self.manifest["config"].get("decode_steps")
-        if not isinstance(context, int) or not isinstance(decode_steps, int) or (
+        if type(context) is not int or type(decode_steps) is not int or (
                 decode_steps <= 0 or context <= decode_steps):
             raise TraceError("manifest context or decode_steps is invalid")
         if self.manifest["model"]["sha256"] != MODEL_SHA256:
             raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
         if self.manifest["model"].get("architecture") != "deepseek41":
             raise TraceError("model architecture must be deepseek41")
-        accelerator = self.manifest["accelerator"]
-        if not isinstance(accelerator, dict):
-            raise TraceError("manifest accelerator attestation is invalid")
-        accelerator_expected = {
-            "format": "dsv41-accelerator-attestation",
-            "version": 1,
-            "architecture": "gfx1151",
-            "gfx_target_version": 110501,
-            "source": "linux-kfd-sysfs",
+        accelerator = validate_accelerator_attestation(self.manifest["runtime"], self.manifest["accelerator"])
+        if self.manifest["runtime"] == "ds4":
+            if "host" not in self.manifest:
+                raise TraceError("ds4 host attestation is missing")
+            validate_host_attestation(self.manifest["host"])
+        else:
+            if "host" in self.manifest:
+                raise TraceError("llama.cpp manifest must not contain Apple host attestation")
+        required_paths = {
+            "model", "prompt", "output", "repository", "temporary_directory",
         }
-        for key, value in accelerator_expected.items():
-            if accelerator.get(key) != value:
-                raise TraceError(f"manifest accelerator {key} mismatch")
-        if not isinstance(accelerator.get("backend_description"), str) or not accelerator["backend_description"]:
-            raise TraceError("manifest accelerator backend description is invalid")
-        if not isinstance(accelerator.get("backend_device"), str) or not accelerator["backend_device"]:
-            raise TraceError("manifest accelerator backend device is invalid")
-        if re.fullmatch(
-                r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]",
-                accelerator.get("pci_device_id", "")) is None:
-            raise TraceError("manifest accelerator PCI identity is invalid")
-        if not isinstance(accelerator.get("kfd_node"), str) or not accelerator["kfd_node"].isdigit():
-            raise TraceError("manifest accelerator KFD node is invalid")
-        if not isinstance(accelerator.get("gpu_id"), int) or accelerator["gpu_id"] <= 0:
-            raise TraceError("manifest accelerator GPU identity is invalid")
+        if self.manifest["runtime"] == "ds4":
+            required_paths.update({"runtime_checkout", "runner_executable", "runner_script", "exporter"})
+        paths = self.manifest["paths"]
+        if not isinstance(paths, dict) or set(paths) != required_paths:
+            raise TraceError("manifest execution paths are invalid")
+        for label, value in paths.items():
+            if not isinstance(label, str) or not isinstance(value, str) or not value.startswith("/"):
+                raise TraceError("manifest execution path is invalid")
+        if self.manifest["model"].get("path") != paths["model"]:
+            raise TraceError("manifest model path is not bound to execution paths")
+        if self.manifest["prompt"].get("path") != paths["prompt"]:
+            raise TraceError("manifest prompt path is not bound to execution paths")
         corpus_name = self.manifest["prompt"].get("corpus_name")
         if corpus_name not in CORPUS_SHA256:
             raise TraceError("prompt corpus is not in the fixed correctness corpus set")
@@ -459,6 +877,7 @@ class TraceBundle:
         provenance = self.manifest["prompt"].get("provenance")
         if not isinstance(provenance, dict):
             raise TraceError("prompt provenance reference is missing")
+        _require_exact_keys(provenance, {"path", "sha256"}, "prompt provenance reference")
         provenance_sha256 = provenance.get("sha256", "")
         if not isinstance(provenance_sha256, str) or re.fullmatch(
                 r"[0-9a-f]{64}", provenance_sha256) is None:
@@ -467,8 +886,8 @@ class TraceBundle:
             raise TraceError("prompt provenance path is not content addressed")
         try:
             provenance_bytes = self._path(provenance["path"]).read_bytes()
-            provenance_record = json.loads(provenance_bytes.decode("ascii"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            provenance_record = strict_json_loads(provenance_bytes.decode("ascii"))
+        except (OSError, UnicodeError, TraceError) as error:
             raise TraceError(f"cannot read prompt provenance: {error}") from error
         if sha256_bytes(provenance_bytes) != provenance_sha256:
             raise TraceError("prompt provenance SHA-256 mismatch")
@@ -489,12 +908,22 @@ class TraceBundle:
                 raise TraceError(f"prompt provenance {key} mismatch")
         if re.fullmatch(r"[0-9a-f]{64}", provenance_record.get("builder_sha256", "")) is None:
             raise TraceError("prompt provenance builder SHA-256 is invalid")
+        _require_exact_keys(
+            provenance_record,
+            set(provenance_checks) | {"builder_sha256"},
+            "prompt provenance",
+        )
         if self.manifest["prompt"].get("target_tokens") != expected_target:
             raise TraceError("prompt target token count does not fill the configured context")
         if self.manifest["runtime"] == "llama.cpp":
             candidate = self.manifest.get("candidate")
             if not isinstance(candidate, dict):
                 raise TraceError("llama.cpp candidate attestation is missing")
+            _require_exact_keys(
+                candidate,
+                {"repository", "revision", "base_revision", "diff_sha256", "executable_sha256"},
+                "llama.cpp candidate attestation",
+            )
             if candidate.get("repository") != REPOSITORY:
                 raise TraceError(f"candidate repository must be {REPOSITORY}")
             for key in ("revision", "base_revision", "diff_sha256", "executable_sha256"):
@@ -523,10 +952,41 @@ class TraceBundle:
         }
         if self.manifest["config"].get("deepseek41") != expected_config:
             raise TraceError("DeepSeek V4.1 configuration is invalid")
-        if self.manifest["comparison"].get("logits") != "byte-identical-f32":
-            raise TraceError("logit comparison policy must be byte-identical-f32")
+        expected_comparison = {
+            "tokens": "exact",
+            "engram_rows": "exact",
+            "expert_ids": "exact-original-id-space",
+            "expert_weights": "byte-identical-f32",
+            "attention_candidates": "exact",
+            "logits": "byte-identical-f32",
+        }
+        if self.manifest["comparison"] != expected_comparison:
+            raise TraceError("trace comparison policy is invalid")
         config = self.manifest["config"]
         if self.manifest["runtime"] == "llama.cpp":
+            _require_exact_keys(
+                config,
+                {
+                    "context",
+                    "batch",
+                    "ubatch",
+                    "device",
+                    "device_architecture",
+                    "device_pci_id",
+                    "decode_steps",
+                    "kv_type_k",
+                    "kv_type_v",
+                    "flash_attention",
+                    "gpu_layers",
+                    "load_mode",
+                    "expert_cache_slots",
+                    "expert_cache_bytes",
+                    "tokenizer_add_bos",
+                    "tokenizer_parse_special",
+                    "deepseek41",
+                },
+                "llama.cpp config",
+            )
             if accelerator["backend_device"] != "ROCm0":
                 raise TraceError("llama.cpp accelerator backend device must be ROCm0")
             if config.get("batch") != ADMITTED_BATCH or config.get("ubatch") != ADMITTED_UBATCH:
@@ -540,27 +1000,55 @@ class TraceBundle:
                     config.get("device_pci_id") != accelerator["pci_device_id"]):
                 raise TraceError("llama.cpp trace device identity is not bound to the accelerator attestation")
             if config.get("kv_type_k") != "f16" or config.get("kv_type_v") != "f16" or (
-                    config.get("flash_attention") not in (True, 1)) or config.get("load_mode") != 0:
+                    config.get("flash_attention") is not True) or config.get("load_mode") != 0:
                 raise TraceError("llama.cpp trace inference configuration is invalid")
-        if self.manifest["runtime"] == "ds4" and config.get("prefill_chunk") != ADMITTED_UBATCH:
-            raise TraceError("ds4 trace does not use the admitted prefill chunk")
+        if self.manifest["runtime"] == "ds4":
+            _require_exact_keys(
+                config,
+                {
+                    "context",
+                    "decode_steps",
+                    "prefill_chunk",
+                    "device_backend",
+                    "device_registry_id",
+                    "deepseek41",
+                },
+                "ds4 config",
+            )
+            if config.get("prefill_chunk") != ADMITTED_UBATCH:
+                raise TraceError("ds4 trace does not use the admitted prefill chunk")
+            if config.get("device_backend") != "Metal" or (
+                    config.get("device_registry_id") != accelerator["metal_registry_id"]):
+                raise TraceError("ds4 trace device identity is not bound to the accelerator attestation")
         for audit_phase in ("pre", "post"):
             phase_audits = self.manifest["audits"].get(audit_phase)
             if not isinstance(phase_audits, dict):
                 raise TraceError(f"manifest {audit_phase} audit set is invalid")
-            for kind in ("memory", "swap", "watchdog"):
+            expected_kinds = (
+                ("memory", "swap", "watchdog")
+                if self.manifest["runtime"] == "llama.cpp"
+                else ("memory", "swap", "runner")
+            )
+            if set(phase_audits) != set(expected_kinds):
+                raise TraceError(f"manifest {audit_phase} audit kinds are invalid")
+            for kind in expected_kinds:
                 self._validate_audit_reference(audit_phase, kind, phase_audits.get(kind))
 
     def _validate_audit_reference(self, phase: str, kind: str, audit: Any) -> None:
         if not isinstance(audit, dict):
             raise TraceError(f"manifest {phase} {kind} audit reference is invalid")
+        _require_exact_keys(
+            audit,
+            {"path", "sha256", "created_unix"},
+            f"manifest {phase} {kind} audit reference",
+        )
         audit_path = audit.get("path")
         if not isinstance(audit_path, str) or not audit_path:
             raise TraceError(f"manifest {phase} {kind} audit path is invalid")
         digest = audit.get("sha256", "")
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise TraceError(f"manifest {phase} {kind} audit SHA-256 is invalid")
-        if not isinstance(audit.get("created_unix"), int) or audit["created_unix"] <= 0:
+        if type(audit.get("created_unix")) is not int or audit["created_unix"] <= 0:
             raise TraceError(f"manifest {phase} {kind} audit timestamp is invalid")
         expected_path = f"audits/{phase}/{digest}.json"
         if audit_path != expected_path:
@@ -573,56 +1061,128 @@ class TraceBundle:
         if sha256_bytes(evidence) != digest:
             raise TraceError(f"{phase} {kind} audit evidence SHA-256 mismatch")
         try:
-            record = json.loads(evidence.decode("ascii"))
-        except (UnicodeError, json.JSONDecodeError) as error:
+            record = strict_json_loads(evidence.decode("ascii"))
+        except (UnicodeError, TraceError) as error:
             raise TraceError(f"{phase} {kind} audit evidence is invalid: {error}") from error
         if record.get("kind") != kind or record.get("created_unix") != audit["created_unix"]:
             raise TraceError(f"{phase} {kind} audit evidence metadata mismatch")
-        if record.get("environment") != {"HIP_LAUNCH_BLOCKING": "1"}:
+        record_keys = {"created_unix", "kind", "environment", "data"}
+        if kind == "memory":
+            record_keys |= {"storage", "accelerator"}
+            if self.manifest["runtime"] == "ds4":
+                record_keys.add("host")
+        _require_exact_keys(record, record_keys, f"{phase} {kind} audit evidence")
+        expected_environment = (
+            {"HIP_LAUNCH_BLOCKING": "1"}
+            if self.manifest["runtime"] == "llama.cpp"
+            else {}
+        )
+        if record.get("environment") != expected_environment:
             raise TraceError(f"{phase} {kind} audit environment is invalid")
         if not isinstance(record.get("data"), dict):
             raise TraceError(f"{phase} {kind} audit evidence data is invalid")
         if kind == "memory":
+            _require_exact_keys(
+                record["data"],
+                {"mem_total_bytes", "mem_available_bytes", "mem_used_bytes"},
+                f"{phase} memory audit data",
+            )
             used = record["data"].get("mem_used_bytes")
-            if not isinstance(used, int) or used < 0 or used >= SOFT_MEMORY_LIMIT:
+            total = record["data"].get("mem_total_bytes")
+            available = record["data"].get("mem_available_bytes")
+            if type(used) is not int or used < 0:
                 raise TraceError(f"{phase} memory audit evidence is invalid")
+            if self.manifest["runtime"] == "llama.cpp" and used >= SOFT_MEMORY_LIMIT:
+                raise TraceError(f"{phase} memory audit evidence is invalid")
+            if self.manifest["runtime"] == "ds4" and (
+                    type(total) is not int or total < 128 * 1024 * 1024 * 1024 or
+                    type(available) is not int or available <= 0 or available > total or used > total):
+                raise TraceError(f"{phase} ds4 memory audit evidence is invalid")
             storage = record.get("storage")
             required_storage = {
                 "model", "prompt", "output", "repository", "temporary_directory",
             }
+            if self.manifest["runtime"] == "ds4":
+                required_storage.update({"runtime_checkout", "runner_executable", "runner_script", "exporter"})
             if not isinstance(storage, dict) or set(storage) != required_storage:
                 raise TraceError(f"{phase} memory audit storage evidence is missing")
             for label, item in storage.items():
-                if not isinstance(label, str) or not isinstance(item, dict):
+                if not isinstance(label, str):
                     raise TraceError(f"{phase} memory audit storage evidence is invalid")
-                if item.get("rotational") is not False or not isinstance(item.get("nvme_device"), str):
-                    raise TraceError(f"{phase} memory audit storage is not non-rotational NVMe")
-                if re.fullmatch(r"nvme[0-9]+(?:c[0-9]+)?n[0-9]+", item["nvme_device"]) is None:
-                    raise TraceError(f"{phase} memory audit NVMe device identity is invalid")
-                for path_key in ("resolved_path", "existing_path", "mount_point", "block_device_path"):
-                    value = item.get(path_key)
-                    if not isinstance(value, str) or not value.startswith("/"):
-                        raise TraceError(f"{phase} memory audit {path_key} is invalid")
-                if not isinstance(item.get("filesystem_type"), str) or not item["filesystem_type"]:
-                    raise TraceError(f"{phase} memory audit filesystem type is invalid")
-                if not isinstance(item.get("mount_source"), str) or not item["mount_source"]:
-                    raise TraceError(f"{phase} memory audit mount source is invalid")
-                if not item["mount_source"].startswith("/dev/"):
-                    raise TraceError(f"{phase} memory audit mount source is not a local block device")
-                if re.fullmatch(r"[0-9]+:[0-9]+", item.get("device_number", "")) is None:
-                    raise TraceError(f"{phase} memory audit device number is invalid")
-                if item["nvme_device"] not in Path(item["block_device_path"]).parts:
-                    raise TraceError(f"{phase} memory audit block device ancestry is invalid")
-                try:
-                    Path(item["resolved_path"]).relative_to(Path(item["mount_point"]))
-                    Path(item["existing_path"]).relative_to(Path(item["mount_point"]))
-                except ValueError as error:
-                    raise TraceError(f"{phase} memory audit mount ancestry is invalid") from error
-            if self.manifest["runtime"] == "llama.cpp" and record.get("accelerator") != self.manifest["accelerator"]:
+                validate_storage_attestation(self.manifest["runtime"], item)
+                if item["resolved_path"] != self.manifest["paths"][label]:
+                    raise TraceError(f"{phase} memory audit {label} path differs from the manifest")
+            if record.get("accelerator") != self.manifest["accelerator"]:
                 raise TraceError(f"{phase} memory audit accelerator evidence mismatch")
+            if self.manifest["runtime"] == "ds4":
+                host = validate_host_attestation(record.get("host"))
+                if host != self.manifest["host"]:
+                    raise TraceError(f"{phase} ds4 host evidence mismatch")
+                if host["memory_bytes"] != total:
+                    raise TraceError(f"{phase} ds4 host memory differs from the memory audit")
         if kind == "swap":
-            if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
-                raise TraceError(f"{phase} swap audit evidence does not report zero configured swap")
+            if self.manifest["runtime"] == "llama.cpp":
+                _require_exact_keys(record["data"], {"enabled", "entries"}, f"{phase} swap audit data")
+                if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
+                    raise TraceError(f"{phase} swap audit evidence does not report zero configured swap")
+            elif record["data"] != {
+                    "source": "darwin-sysctl-vm.swapusage",
+                    "total_bytes": 0,
+                    "used_bytes": 0,
+                    "free_bytes": 0,
+            }:
+                raise TraceError(f"{phase} ds4 swap audit evidence does not report zero swap")
+        if kind == "runner":
+            data = record["data"]
+            _require_exact_keys(
+                data,
+                {
+                    "format",
+                    "version",
+                    "runtime_kind",
+                    "source",
+                    "runner_pid",
+                    "runner_parent_pid",
+                    "runner_uid",
+                    "runner_executable",
+                    "runner_executable_sha256",
+                    "runner_script",
+                    "runner_script_sha256",
+                    "exporter_path",
+                    "exporter_sha256",
+                    "checkout_path",
+                    "checkout_revision",
+                    "command_sha256",
+                },
+                f"{phase} ds4 runner audit",
+            )
+            expected = {
+                "format": "dsv41-runner-ownership",
+                "version": 1,
+                "runtime_kind": "apple-metal",
+                "source": "python-subprocess",
+                "exporter_sha256": self.manifest["build"]["sha256"],
+                "checkout_revision": DS4_REVISION,
+                "checkout_path": self.manifest["paths"]["runtime_checkout"],
+                "runner_executable": self.manifest["paths"]["runner_executable"],
+                "runner_script": self.manifest["paths"]["runner_script"],
+                "exporter_path": self.manifest["paths"]["exporter"],
+            }
+            for key, value in expected.items():
+                if data.get(key) != value:
+                    raise TraceError(f"{phase} ds4 runner {key} mismatch")
+            for key in ("runner_pid", "runner_parent_pid"):
+                if type(data.get(key)) is not int or data[key] <= 0:
+                    raise TraceError(f"{phase} ds4 runner {key} is invalid")
+            if type(data.get("runner_uid")) is not int or data["runner_uid"] < 0:
+                raise TraceError(f"{phase} ds4 runner UID is invalid")
+            for key in (
+                    "runner_executable_sha256",
+                    "runner_script_sha256",
+                    "exporter_sha256",
+                    "command_sha256"):
+                if re.fullmatch(r"[0-9a-f]{64}", data.get(key, "")) is None:
+                    raise TraceError(f"{phase} ds4 runner {key} is invalid")
         if kind == "watchdog":
             required = (
                 "format",
@@ -659,16 +1219,15 @@ class TraceBundle:
                 "audit_fd",
                 "audit",
             )
-            if any(key not in record["data"] for key in required):
-                raise TraceError(f"{phase} watchdog audit evidence is incomplete")
+            _require_exact_keys(record["data"], set(required), f"{phase} watchdog audit evidence")
             data = record["data"]
             if data["format"] != WATCHDOG_LEASE_FORMAT or data["version"] != WATCHDOG_VERSION:
                 raise TraceError(f"{phase} watchdog audit format is invalid")
             if not isinstance(data["lease_id"], str) or re.fullmatch(r"[0-9a-f]{32,64}", data["lease_id"]) is None:
                 raise TraceError(f"{phase} watchdog audit lease ID is invalid")
-            if not isinstance(data["watchdog_pid"], int) or data["watchdog_pid"] <= 1:
+            if type(data["watchdog_pid"]) is not int or data["watchdog_pid"] <= 1:
                 raise TraceError(f"{phase} watchdog audit PID is invalid")
-            if not isinstance(data["watchdog_start_time_ticks"], int) or data["watchdog_start_time_ticks"] <= 0:
+            if type(data["watchdog_start_time_ticks"]) is not int or data["watchdog_start_time_ticks"] <= 0:
                 raise TraceError(f"{phase} watchdog audit start time is invalid")
             for key in ("watchdog_command_sha256", "watchdog_script_sha256"):
                 if not isinstance(data[key], str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None:
@@ -688,12 +1247,12 @@ class TraceBundle:
                 raise TraceError(f"{phase} watchdog timing policy is invalid")
             if data["procfs_root"] != "/proc":
                 raise TraceError(f"{phase} watchdog procfs root is invalid")
-            if not isinstance(data["guardian_pid"], int) or data["guardian_pid"] <= 1 or (
-                    not isinstance(data["child_pid"], int) or data["child_pid"] <= 1) or (
-                    not isinstance(data["child_process_group_id"], int) or data["child_process_group_id"] <= 1):
+            if type(data["guardian_pid"]) is not int or data["guardian_pid"] <= 1 or (
+                    type(data["child_pid"]) is not int or data["child_pid"] <= 1) or (
+                    type(data["child_process_group_id"]) is not int or data["child_process_group_id"] <= 1):
                 raise TraceError(f"{phase} watchdog child identity is invalid")
             for key in ("audit_device", "audit_inode", "audit_uid", "audit_fd"):
-                if not isinstance(data[key], int) or data[key] < 0:
+                if type(data[key]) is not int or data[key] < 0:
                     raise TraceError(f"{phase} watchdog audit {key} is invalid")
             if data["audit_mode"] != 0o600:
                 raise TraceError(f"{phase} watchdog audit mode is invalid")
@@ -707,7 +1266,7 @@ class TraceBundle:
             if not isinstance(data["watchdog_command_sha256"], str) or re.fullmatch(
                     r"[0-9a-f]{64}", data["watchdog_command_sha256"]) is None:
                 raise TraceError(f"{phase} watchdog audit command SHA-256 is invalid")
-            if not isinstance(data["heartbeat_unix"], int) or data["heartbeat_unix"] <= 0:
+            if type(data["heartbeat_unix"]) is not int or data["heartbeat_unix"] <= 0:
                 raise TraceError(f"{phase} watchdog audit heartbeat timestamp is invalid")
             max_age = data.get("max_heartbeat_age_seconds")
             if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) or (
@@ -719,12 +1278,17 @@ class TraceBundle:
             audit_jsonl = data["audit"]
             if not isinstance(audit_jsonl, dict):
                 raise TraceError(f"{phase} watchdog JSONL reference is invalid")
+            _require_exact_keys(
+                audit_jsonl,
+                {"path", "sha256", "event_count"},
+                f"{phase} watchdog JSONL reference",
+            )
             jsonl_digest = audit_jsonl.get("sha256", "")
             if not isinstance(jsonl_digest, str) or re.fullmatch(r"[0-9a-f]{64}", jsonl_digest) is None:
                 raise TraceError(f"{phase} watchdog JSONL SHA-256 is invalid")
             if audit_jsonl.get("path") != f"audits/{phase}/{jsonl_digest}.jsonl":
                 raise TraceError(f"{phase} watchdog JSONL path is invalid")
-            if not isinstance(audit_jsonl.get("event_count"), int) or audit_jsonl["event_count"] < 2:
+            if type(audit_jsonl.get("event_count")) is not int or audit_jsonl["event_count"] < 2:
                 raise TraceError(f"{phase} watchdog JSONL event count is invalid")
             jsonl_path = self._path(audit_jsonl["path"])
             try:
@@ -737,8 +1301,8 @@ class TraceBundle:
             if len(lines) != audit_jsonl["event_count"]:
                 raise TraceError(f"{phase} watchdog JSONL event count mismatch")
             try:
-                events = [json.loads(line) for line in lines]
-            except json.JSONDecodeError as error:
+                events = [validate_watchdog_event(strict_json_loads(line)) for line in lines]
+            except TraceError as error:
                 raise TraceError(f"{phase} watchdog JSONL is invalid: {error}") from error
             if not any(event.get("event") == "preflight" for event in events) or (
                     not any(event.get("event") == "child_started" for event in events)):
@@ -769,12 +1333,17 @@ class TraceBundle:
         expected = self.manifest.get("expected")
         if not isinstance(expected, dict):
             raise TraceError("manifest expected coverage is missing")
+        _require_exact_keys(
+            expected,
+            {"prompt_tokens", "decode_steps", "components"},
+            "manifest expected coverage",
+        )
         prompt_tokens = expected.get("prompt_tokens")
         decode_steps = expected.get("decode_steps")
         components = expected.get("components")
-        if not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+        if type(prompt_tokens) is not int or prompt_tokens <= 0:
             raise TraceError("expected prompt_tokens is invalid")
-        if not isinstance(decode_steps, int) or decode_steps <= 0:
+        if type(decode_steps) is not int or decode_steps <= 0:
             raise TraceError("expected decode_steps is invalid")
         if self.manifest.get("config", {}).get("decode_steps") != decode_steps:
             raise TraceError("expected decode_steps does not match config")
@@ -827,7 +1396,8 @@ class TraceBundle:
             decode_coverage = rules.get("decode")
             if input_coverage == "tokens":
                 input_events = [event for event in events if event["phase"] == "input"]
-                if len(input_events) != 1 or input_events[0]["token_start"] != 0 or input_events[0]["token_count"] != prompt_tokens:
+                if len(input_events) != 1 or input_events[0]["token_start"] != 0 or (
+                        input_events[0]["token_count"] != prompt_tokens):
                     raise TraceError(f"{component} input coverage is incomplete")
             for layer in expected_layers or [None]:
                 layer_events = [event for event in events if event["layer"] == layer]
@@ -952,8 +1522,6 @@ def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
     checks = (
         ("model.sha256", "model_identity"),
         ("model.architecture", "model_identity"),
-        ("accelerator.architecture", "accelerator_identity"),
-        ("accelerator.pci_device_id", "accelerator_identity"),
         ("prompt.sha256", "prompt_identity"),
         ("prompt.byte_count", "prompt_identity"),
         ("expected.prompt_tokens", "tokenizer"),

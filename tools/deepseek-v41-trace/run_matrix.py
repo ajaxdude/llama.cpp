@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, require_nvme_path, resolved, run_preflight
+from preflight import PreflightError, require_nvme_path, resolved, run_strix_preflight
 from trace_format import (
     ADMITTED_BATCH,
     ADMITTED_UBATCH,
@@ -16,9 +16,9 @@ from trace_format import (
     MODEL_SHA256,
     REQUIRED_EXPERT_CACHE_MIB,
     REQUIRED_EXPERT_SLOTS,
-    TraceBundle,
-    report,
+    TraceError,
     sha256_file,
+    strict_json_loads,
 )
 
 CORPORA = (
@@ -58,11 +58,15 @@ def prepare_prompt(
     if result.returncode != 0:
         raise RuntimeError(f"prompt builder failed: {result.stderr.strip()}")
     try:
-        record = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
+        record = strict_json_loads(result.stdout)
+    except TraceError as error:
         raise RuntimeError(f"prompt builder returned invalid JSON: {error}") from error
     if record.get("actual_tokens") != target_tokens:
         raise RuntimeError("prompt builder did not produce the requested token count")
+    temporary_directory = record.pop("temporary_directory", None)
+    expected_temporary_directory = os.environ.get("TMPDIR")
+    if not expected_temporary_directory or temporary_directory != str(resolved(Path(expected_temporary_directory))):
+        raise RuntimeError("prompt builder did not attest the selected temporary directory")
     record.update({
         "format": "dsv41-prompt-provenance",
         "version": 1,
@@ -87,7 +91,7 @@ def prepare_prompt(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the DeepSeek V4.1 cross-runtime corpus matrix")
+    parser = argparse.ArgumentParser(description="Capture the DeepSeek V4.1 llama.cpp corpus matrix")
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -97,10 +101,6 @@ def main() -> int:
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--base-revision", required=True)
     parser.add_argument("--candidate-diff-sha256", required=True)
-    parser.add_argument("--ds4-runner", type=Path)
-    parser.add_argument("--ds4-exporter", type=Path)
-    parser.add_argument("--ds4-exporter-sha256")
-    parser.add_argument("--ds4-checkout", type=Path, default=Path("/home/papa/src/ds4-v41"))
     parser.add_argument("--llama-only", action="store_true")
     parser.add_argument("--contexts", type=int, nargs="+", default=[32768])
     parser.add_argument("--ubatches", type=int, nargs="+", default=[ADMITTED_UBATCH])
@@ -126,11 +126,10 @@ def main() -> int:
         if args.expert_cache_mib != REQUIRED_EXPERT_CACHE_MIB:
             raise PreflightError(
                 f"DeepSeek V4.1 correctness matrix requires {REQUIRED_EXPERT_CACHE_MIB} MiB expert cache")
-        if not args.llama_only and (
-                args.ds4_runner is None or args.ds4_exporter is None or args.ds4_exporter_sha256 is None):
+        if not args.llama_only:
             raise PreflightError(
-                "--ds4-runner, --ds4-exporter, and --ds4-exporter-sha256 are required "
-                "unless --llama-only is selected")
+                "cross-runtime capture must run on separate Strix and Apple hosts; "
+                "use --llama-only here and compare completed bundles with trace_format.py")
         repo = resolved(args.repo)
         output = require_nvme_path(args.output, "matrix output")
         model = require_nvme_path(args.model, "model")
@@ -143,7 +142,7 @@ def main() -> int:
             repo / "tests" / "corpus" / CORPORA[0],
             "repository corpus",
         )
-        run_preflight(
+        run_strix_preflight(
             model=model,
             prompt=initial_corpus,
             output=output,
@@ -191,7 +190,7 @@ def main() -> int:
             for corpus in corpus_records:
                 stem = Path(corpus["name"]).stem
                 prompt = prompts / f"{stem}-c{context}.txt"
-                run_preflight(
+                run_strix_preflight(
                     model=model,
                     prompt=Path(corpus["path"]),
                     output=prompt,
@@ -215,7 +214,6 @@ def main() -> int:
                     stem = Path(corpus["name"]).stem
                     case = f"{stem}-c{context}-ub{ubatch}"
                     llama_output = output / "llama" / case
-                    ds4_output = output / "ds4" / case
                     prompt = prepared_prompts[corpus["name"]]["path"]
                     provenance = prepared_prompts[corpus["name"]]["provenance_path"]
                     common = [
@@ -229,21 +227,6 @@ def main() -> int:
                     ]
                     for pattern in args.busy_pattern:
                         common.extend(["--busy-pattern", pattern])
-                    if not args.llama_only:
-                        assert args.ds4_runner is not None
-                        assert args.ds4_exporter is not None
-                        assert args.ds4_exporter_sha256 is not None
-                        run([
-                            sys.executable,
-                            str(resolved(args.ds4_runner)),
-                            "--repo", str(repo),
-                            "--checkout", str(resolved(args.ds4_checkout)),
-                            "--exporter", str(resolved(args.ds4_exporter)),
-                            "--exporter-sha256", args.ds4_exporter_sha256,
-                            "--output", str(ds4_output),
-                            "--prefill-chunk", str(ubatch),
-                            *common,
-                        ])
                     run([
                         sys.executable,
                         str(resolved(args.llama_runner)),
@@ -260,30 +243,17 @@ def main() -> int:
                         "--expert-cache-mib", str(args.expert_cache_mib),
                         *common,
                     ])
-                    if args.llama_only:
-                        results.append({
-                            "case": case,
-                            "status": "BRINGUP TRACE CAPTURED",
-                            "cross_runtime_status": "INCOMPLETE",
-                            "trace": str(llama_output),
-                        })
-                    else:
-                        comparison = report(TraceBundle(ds4_output), TraceBundle(llama_output))
-                        result_path = output / "reports" / f"{case}.json"
-                        result_path.parent.mkdir(parents=True, exist_ok=True)
-                        result_path.write_text(
-                            json.dumps(comparison, sort_keys=True, separators=(",", ":")) + "\n",
-                            encoding="ascii",
-                        )
-                        results.append({"case": case, **comparison})
-                        if comparison["status"] != "TARGET PASS":
-                            raise RuntimeError(
-                                f"correctness mismatch in {case}: {comparison['first_divergence']}")
+                    results.append({
+                        "case": case,
+                        "status": "BRINGUP TRACE CAPTURED",
+                        "cross_runtime_status": "INCOMPLETE",
+                        "trace": str(llama_output),
+                    })
 
         summary = {
-            "status": "BRINGUP TRACE CAPTURED" if args.llama_only else "TARGET PASS",
-            "mode": "llama-only" if args.llama_only else "cross-runtime",
-            "cross_runtime_status": "INCOMPLETE" if args.llama_only else "TARGET PASS",
+            "status": "BRINGUP TRACE CAPTURED",
+            "mode": "llama-only",
+            "cross_runtime_status": "INCOMPLETE",
             "model": str(model),
             "model_sha256": model_sha256,
             "candidate_revision": args.candidate_revision,

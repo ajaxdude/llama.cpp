@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +53,13 @@ int main(int argc, char ** argv) {
         model_path = dsv41::require_nvme_path(model_path, "model").resolved_path;
         corpus_path = dsv41::require_nvme_path(corpus_path, "corpus").resolved_path;
         output_path = dsv41::require_nvme_path(output_path, "prompt output").resolved_path;
+        const char * tmpdir_value = std::getenv("TMPDIR");
+        if (tmpdir_value == nullptr || *tmpdir_value == '\0') {
+            throw std::runtime_error("TMPDIR is required");
+        }
+        dsv41::require_usable_directory(tmpdir_value, "TMPDIR");
+        const dsv41::storage_attestation temporary_storage =
+            dsv41::require_nvme_path(tmpdir_value, "temporary directory");
         if (fs::exists(output_path)) {
             throw std::runtime_error("prompt output already exists: " + output_path.string());
         }
@@ -115,6 +123,7 @@ int main(int argc, char ** argv) {
             {"actual_tokens", verified.size()},
             {"byte_count", prompt.size()},
             {"add_bos", add_bos},
+            {"temporary_directory", temporary_storage.resolved_path.string()},
         }).dump().c_str());
         llama_model_free(model);
         return 0;

@@ -623,7 +623,10 @@ static std::vector<std::string> command_line(int argc, char ** argv) {
 static json accelerator_json(const dsv41::accelerator_attestation & accelerator) {
     return {
         {"format", "dsv41-accelerator-attestation"},
-        {"version", 1},
+        {"version", 2},
+        {"runtime_kind", "strix-rocm"},
+        {"platform", "linux"},
+        {"backend", "ROCm"},
         {"backend_device", accelerator.backend_device},
         {"backend_description", accelerator.backend_description},
         {"pci_device_id", accelerator.pci_device_id},
@@ -632,6 +635,26 @@ static json accelerator_json(const dsv41::accelerator_attestation & accelerator)
         {"gfx_target_version", accelerator.gfx_target_version},
         {"architecture", accelerator.architecture},
         {"source", "linux-kfd-sysfs"},
+    };
+}
+
+static json storage_json(const dsv41::storage_attestation & storage) {
+    return {
+        {"format", "dsv41-storage-attestation"},
+        {"version", 2},
+        {"runtime_kind", "strix-rocm"},
+        {"platform", "linux"},
+        {"storage_kind", "linux-nvme"},
+        {"resolved_path", storage.resolved_path.string()},
+        {"existing_path", storage.existing_path.string()},
+        {"mount_point", storage.mount_point},
+        {"filesystem_type", storage.filesystem_type},
+        {"mount_source", storage.mount_source},
+        {"device_number", storage.device_number},
+        {"block_device_path", storage.block_device_path.string()},
+        {"nvme_device", storage.nvme_device},
+        {"rotational", false},
+        {"source", "linux-mountinfo-sysfs"},
     };
 }
 
@@ -673,6 +696,10 @@ int main(int argc, char ** argv) {
             dsv41::require_nvme_path(params.prompt_file, "prompt");
         const dsv41::storage_attestation output_storage =
             dsv41::require_nvme_path(params.out_file, "trace output");
+        const fs::path temporary_directory = required_environment("TMPDIR");
+        dsv41::require_usable_directory(temporary_directory, "TMPDIR");
+        const dsv41::storage_attestation temporary_storage =
+            dsv41::require_nvme_path(temporary_directory, "temporary directory");
         if (required_environment("HIP_LAUNCH_BLOCKING") != "1") {
             throw std::runtime_error("HIP_LAUNCH_BLOCKING=1 is required for gfx1151 correctness runs");
         }
@@ -684,6 +711,13 @@ int main(int argc, char ** argv) {
         const json memory_audit = audit_reference("DSV41_TRACE_MEMORY_AUDIT", "memory");
         if (memory_audit.value("accelerator", json::object()) != accelerator_json(configured_accelerator)) {
             throw std::runtime_error("preflight accelerator audit does not match the selected execution device");
+        }
+        const json audited_storage = memory_audit.value("storage", json::object());
+        if (audited_storage.value("model", json::object()) != storage_json(model_storage) ||
+                audited_storage.value("prompt", json::object()) != storage_json(prompt_storage) ||
+                audited_storage.value("output", json::object()) != storage_json(output_storage) ||
+                audited_storage.value("temporary_directory", json::object()) != storage_json(temporary_storage)) {
+            throw std::runtime_error("preflight storage audit does not match the selected execution paths");
         }
         const json swap_audit = audit_reference("DSV41_TRACE_SWAP_AUDIT", "swap");
         const json watchdog_audit = audit_reference("DSV41_TRACE_WATCHDOG_AUDIT", "watchdog");
@@ -762,6 +796,13 @@ int main(int argc, char ** argv) {
                 {"sha256", sha256_data(prompt_bytes.data(), prompt_bytes.size())},
             }},
             {"accelerator", accelerator_json(accelerator)},
+            {"paths", {
+                {"model", model_path.string()},
+                {"prompt", prompt_path.string()},
+                {"output", output_path.string()},
+                {"repository", audited_storage["repository"].value("resolved_path", "")},
+                {"temporary_directory", temporary_storage.resolved_path.string()},
+            }},
             {"config", {
                 {"context", llama_n_ctx(ctx)},
                 {"batch", params.n_batch},

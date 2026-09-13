@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
 import json
 import struct
 import sys
@@ -28,16 +29,35 @@ WATCHDOG_EVENTS = [
     {
         "timestamp": "1970-01-01T00:00:01.000Z",
         "event": "preflight",
+        "total_bytes": 128 * 1024 * 1024 * 1024,
+        "available_bytes": 64 * 1024 * 1024 * 1024,
+        "used_bytes": 64 * 1024 * 1024 * 1024,
+        "swap_entries": 0,
+        "peak_used_bytes": 64 * 1024 * 1024 * 1024,
+        "child_pid": None,
+        "child_status": "not_started",
+        "child_returncode": None,
+        "process_group_id": None,
+        "process_group_status": "not_created",
+        "threshold_reason": "none",
         "soft_bytes": trace.SOFT_MEMORY_LIMIT,
         "emergency_bytes": trace.WATCHDOG_EMERGENCY_LIMIT,
         "strict_ceiling_bytes": trace.STRICT_MEMORY_LIMIT,
-        "swap_entries": 0,
     },
     {
         "timestamp": "1970-01-01T00:00:01.000Z",
         "event": "child_started",
+        "total_bytes": 128 * 1024 * 1024 * 1024,
+        "available_bytes": 64 * 1024 * 1024 * 1024,
+        "used_bytes": 64 * 1024 * 1024 * 1024,
+        "swap_entries": 0,
+        "peak_used_bytes": 64 * 1024 * 1024 * 1024,
         "child_pid": 456,
+        "child_status": "running",
+        "child_returncode": None,
         "process_group_id": 455,
+        "process_group_status": "active",
+        "threshold_reason": "none",
         "command": ["python3", "run_matrix.py"],
     },
 ]
@@ -49,7 +69,10 @@ WATCHDOG_JSONL_SHA256 = trace.sha256_bytes(WATCHDOG_JSONL)
 
 ACCELERATOR_ATTESTATION = {
     "format": "dsv41-accelerator-attestation",
-    "version": 1,
+    "version": 2,
+    "runtime_kind": "strix-rocm",
+    "platform": "linux",
+    "backend": "ROCm",
     "backend_device": "ROCm0",
     "backend_description": "AMD Radeon Graphics",
     "pci_device_id": "0000:c1:00.0",
@@ -60,6 +83,22 @@ ACCELERATOR_ATTESTATION = {
     "source": "linux-kfd-sysfs",
 }
 
+METAL_ACCELERATOR_ATTESTATION = {
+    "format": "dsv41-accelerator-attestation",
+    "version": 2,
+    "runtime_kind": "apple-metal",
+    "platform": "macos",
+    "backend": "Metal",
+    "backend_device": "Metal0",
+    "backend_description": "Apple M3 Ultra",
+    "architecture": "Apple M3 Ultra",
+    "metal_registry_id": 0x12345678,
+    "recommended_max_working_set_bytes": 256 * 1024 * 1024 * 1024,
+    "unified_memory": True,
+    "source": "metal-device-query",
+}
+
+
 def storage_record(path: str) -> dict[str, object]:
     model_storage = path.startswith("/mnt/models")
     mount_point = "/mnt/models" if model_storage else "/home"
@@ -67,6 +106,11 @@ def storage_record(path: str) -> dict[str, object]:
     device_number = "259:0" if model_storage else "259:3"
     nvme_device = "nvme1n1" if model_storage else "nvme0n1"
     return {
+        "format": "dsv41-storage-attestation",
+        "version": 2,
+        "runtime_kind": "strix-rocm",
+        "platform": "linux",
+        "storage_kind": "linux-nvme",
         "resolved_path": path,
         "existing_path": path,
         "mount_point": mount_point,
@@ -76,6 +120,7 @@ def storage_record(path: str) -> dict[str, object]:
         "block_device_path": f"/sys/devices/pci/block/{nvme_device}",
         "nvme_device": nvme_device,
         "rotational": False,
+        "source": "linux-mountinfo-sysfs",
     }
 
 
@@ -85,6 +130,70 @@ STORAGE_ATTESTATION = {
     "output": storage_record("/home"),
     "repository": storage_record("/home/repo"),
     "temporary_directory": storage_record("/home/tmp"),
+}
+
+def metal_storage_record(path: str, mount_point: str = "/Users") -> dict[str, object]:
+    return {
+        "format": "dsv41-storage-attestation",
+        "version": 2,
+        "runtime_kind": "apple-metal",
+        "platform": "macos",
+        "storage_kind": "darwin-local-solid-state",
+        "resolved_path": path,
+        "existing_path": path,
+        "mount_point": mount_point,
+        "filesystem_type": "apfs",
+        "device_identifier": "disk3s1",
+        "parent_whole_disk": "disk3",
+        "bus_protocol": "Apple Fabric",
+        "filesystem_device": 1,
+        "internal": True,
+        "solid_state": True,
+        "source": "diskutil-info-plist",
+    }
+
+
+DS4_STORAGE_ATTESTATION = {
+    "model": metal_storage_record("/Users/oracle/model.gguf"),
+    "prompt": metal_storage_record("/Users/oracle/prompt.txt"),
+    "output": metal_storage_record("/Users/oracle/output"),
+    "repository": metal_storage_record("/Users/oracle/repo"),
+    "runtime_checkout": metal_storage_record("/Users/oracle/ds4"),
+    "temporary_directory": metal_storage_record("/Users/oracle/tmp"),
+    "runner_executable": metal_storage_record("/usr/bin/python3", "/"),
+    "runner_script": metal_storage_record("/Users/oracle/repo/tools/deepseek-v41-trace/run_ds4.py"),
+    "exporter": metal_storage_record("/Users/oracle/bin/ds4-trace"),
+}
+
+DS4_HOST_ATTESTATION = {
+    "format": "dsv41-host-attestation",
+    "version": 1,
+    "runtime_kind": "apple-metal",
+    "platform": "macos",
+    "machine": "arm64",
+    "hardware_model": "Mac14,8",
+    "os_version": "15.6",
+    "memory_bytes": 256 * 1024 * 1024 * 1024,
+    "source": "darwin-sysctl",
+}
+
+DS4_RUNNER_ATTESTATION = {
+    "format": "dsv41-runner-ownership",
+    "version": 1,
+    "runtime_kind": "apple-metal",
+    "source": "python-subprocess",
+    "runner_pid": 100,
+    "runner_parent_pid": 99,
+    "runner_uid": 501,
+    "runner_executable": "/usr/bin/python3",
+    "runner_executable_sha256": "1" * 64,
+    "runner_script": "/Users/oracle/repo/tools/deepseek-v41-trace/run_ds4.py",
+    "runner_script_sha256": "2" * 64,
+    "exporter_path": "/Users/oracle/bin/ds4-trace",
+    "exporter_sha256": "3" * 64,
+    "checkout_path": "/Users/oracle/ds4",
+    "checkout_revision": trace.DS4_REVISION,
+    "command_sha256": "4" * 64,
 }
 
 AUDIT_RECORDS = {
@@ -148,12 +257,64 @@ AUDIT_RECORDS = {
     },
 }
 
+DS4_AUDIT_RECORDS = {
+    "memory": {
+        "created_unix": 1,
+        "kind": "memory",
+        "environment": {},
+        "data": {
+            "mem_total_bytes": DS4_HOST_ATTESTATION["memory_bytes"],
+            "mem_available_bytes": 128 * 1024 * 1024 * 1024,
+            "mem_used_bytes": 128 * 1024 * 1024 * 1024,
+        },
+        "storage": DS4_STORAGE_ATTESTATION,
+        "accelerator": dict(METAL_ACCELERATOR_ATTESTATION),
+        "host": DS4_HOST_ATTESTATION,
+    },
+    "swap": {
+        "created_unix": 1,
+        "kind": "swap",
+        "environment": {},
+        "data": {
+            "source": "darwin-sysctl-vm.swapusage",
+            "total_bytes": 0,
+            "used_bytes": 0,
+            "free_bytes": 0,
+        },
+    },
+    "runner": {
+        "created_unix": 1,
+        "kind": "runner",
+        "environment": {},
+        "data": DS4_RUNNER_ATTESTATION,
+    },
+}
 
-def audit_bytes(kind: str, phase: str) -> bytes:
-    record = json.loads(json.dumps(AUDIT_RECORDS[kind]))
+
+def audit_bytes(kind: str, phase: str, runtime: str = "llama.cpp") -> bytes:
+    records = DS4_AUDIT_RECORDS if runtime == "ds4" else AUDIT_RECORDS
+    record = json.loads(json.dumps(records[kind]))
     if kind == "watchdog":
         record["data"]["audit"]["path"] = f"audits/{phase}/{WATCHDOG_JSONL_SHA256}.jsonl"
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def replace_audit_record(root: Path, phase: str, kind: str, record: dict[str, object]) -> None:
+    data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    digest = trace.sha256_bytes(data)
+    path = root / "audits" / phase / f"{digest}.json"
+    path.write_bytes(data)
+    manifest_path = root / trace.MANIFEST_NAME
+    manifest_record = json.loads(manifest_path.read_text(encoding="ascii"))
+    manifest_record["audits"][phase][kind] = {
+        "path": f"audits/{phase}/{digest}.json",
+        "sha256": digest,
+        "created_unix": record["created_unix"],
+    }
+    manifest_path.write_text(
+        json.dumps(manifest_record, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
 
 
 def provenance_bytes(prompt: bytes = b"abc") -> bytes:
@@ -174,13 +335,38 @@ def provenance_bytes(prompt: bytes = b"abc") -> bytes:
 
 def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
     provenance_sha256 = trace.sha256_bytes(provenance_bytes(prompt))
+    is_ds4 = runtime == "ds4"
+    storage = DS4_STORAGE_ATTESTATION if is_ds4 else STORAGE_ATTESTATION
+    audit_kinds = ("memory", "swap", "runner") if is_ds4 else ("memory", "swap", "watchdog")
     result = {
         "runtime": runtime,
-        "revision": trace.DS4_REVISION if runtime == "ds4" else "a" * 40,
-        "build": {"sha256": "3" * 64},
-        "model": {"sha256": trace.MODEL_SHA256, "byte_count": 123, "architecture": "deepseek41"},
-        "accelerator": dict(ACCELERATOR_ATTESTATION),
+        "revision": trace.DS4_REVISION if is_ds4 else "a" * 40,
+        "build": (
+            {
+                "compiler": "clang",
+                "target": "arm64-apple-darwin",
+                "path": "/Users/oracle/bin/ds4-trace",
+                "sha256": "3" * 64,
+            }
+            if is_ds4
+            else {
+                "number": 1,
+                "info": "test",
+                "compiler": "clang",
+                "target": "arm64-apple-darwin",
+                "path": "/home/repo/build/bin/llama-deepseek-v41-trace",
+                "sha256": "3" * 64,
+            }
+        ),
+        "model": {
+            "path": storage["model"]["resolved_path"],
+            "sha256": trace.MODEL_SHA256,
+            "byte_count": 123,
+            "architecture": "deepseek41",
+        },
+        "accelerator": dict(METAL_ACCELERATOR_ATTESTATION if is_ds4 else ACCELERATOR_ATTESTATION),
         "prompt": {
+            "path": storage["prompt"]["resolved_path"],
             "sha256": trace.sha256_bytes(prompt),
             "byte_count": len(prompt),
             "corpus_name": "correctness-prose.txt",
@@ -194,18 +380,6 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
         "config": {
             "context": 3,
             "decode_steps": 1,
-            "batch": trace.ADMITTED_BATCH,
-            "ubatch": trace.ADMITTED_UBATCH,
-            "kv_type_k": "f16",
-            "kv_type_v": "f16",
-            "flash_attention": True,
-            "expert_cache_slots": trace.REQUIRED_EXPERT_SLOTS,
-            "expert_cache_bytes": trace.REQUIRED_EXPERT_CACHE_BYTES,
-            "device": "ROCm0",
-            "device_architecture": "gfx1151",
-            "device_pci_id": "0000:c1:00.0",
-            "gpu_layers": 99,
-            "load_mode": 0,
             "deepseek41": {
                 "layer_count": 40,
                 "vocab_size": 129280,
@@ -222,7 +396,18 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "candidate_propagation_layers": [24, 28, 32, 36],
             },
         },
-        "comparison": {"logits": "byte-identical-f32"},
+        "paths": {
+                label: record["resolved_path"]
+                for label, record in storage.items()
+        },
+        "comparison": {
+            "tokens": "exact",
+            "engram_rows": "exact",
+            "expert_ids": "exact-original-id-space",
+            "expert_weights": "byte-identical-f32",
+            "attention_candidates": "exact",
+            "logits": "byte-identical-f32",
+        },
         "expected": {
             "prompt_tokens": 2,
             "decode_steps": 1,
@@ -240,20 +425,39 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "decode.greedy_token": {"layers": None, "decode": "steps"},
             },
         },
-        "environment": {},
+        "environment": {
+            "system_info": "Linux test system" if runtime == "llama.cpp" else "macOS test system",
+            "command": "test command",
+        },
         "audits": {
             phase: {
                 kind: {
-                    "path": f"audits/{phase}/{trace.sha256_bytes(audit_bytes(kind, phase))}.json",
-                    "sha256": trace.sha256_bytes(audit_bytes(kind, phase)),
+                    "path": f"audits/{phase}/{trace.sha256_bytes(audit_bytes(kind, phase, runtime))}.json",
+                    "sha256": trace.sha256_bytes(audit_bytes(kind, phase, runtime)),
                     "created_unix": 1,
                 }
-                for kind in ("memory", "swap", "watchdog")
+                for kind in audit_kinds
             }
             for phase in ("pre", "post")
         },
     }
-    if runtime == "llama.cpp":
+    if not is_ds4:
+        result["config"].update({
+            "batch": trace.ADMITTED_BATCH,
+            "ubatch": trace.ADMITTED_UBATCH,
+            "kv_type_k": "f16",
+            "kv_type_v": "f16",
+            "flash_attention": True,
+            "expert_cache_slots": trace.REQUIRED_EXPERT_SLOTS,
+            "expert_cache_bytes": trace.REQUIRED_EXPERT_CACHE_BYTES,
+            "device": "ROCm0",
+            "device_architecture": "gfx1151",
+            "device_pci_id": "0000:c1:00.0",
+            "gpu_layers": 99,
+            "load_mode": 0,
+            "tokenizer_add_bos": True,
+            "tokenizer_parse_special": True,
+        })
         result["candidate"] = {
             "repository": trace.REPOSITORY,
             "revision": "a" * 40,
@@ -262,18 +466,24 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "executable_sha256": "3" * 64,
         }
     else:
+        result["host"] = dict(DS4_HOST_ATTESTATION)
         result["config"]["prefill_chunk"] = trace.ADMITTED_UBATCH
+        result["config"]["device_backend"] = "Metal"
+        result["config"]["device_registry_id"] = METAL_ACCELERATOR_ATTESTATION["metal_registry_id"]
     return result
 
 
 def add_required_events(writer: object, logits: bytes | None = None, prompt: bytes = b"abc") -> None:
+    runtime = writer.manifest["runtime"]
+    audit_kinds = ("memory", "swap", "runner") if runtime == "ds4" else ("memory", "swap", "watchdog")
     for phase in ("pre", "post"):
         audit_root = writer.root / "audits" / phase
         audit_root.mkdir(parents=True, exist_ok=True)
-        for kind in ("memory", "swap", "watchdog"):
-            data = audit_bytes(kind, phase)
+        for kind in audit_kinds:
+            data = audit_bytes(kind, phase, runtime)
             (audit_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
-        (audit_root / f"{WATCHDOG_JSONL_SHA256}.jsonl").write_bytes(WATCHDOG_JSONL)
+        if runtime == "llama.cpp":
+            (audit_root / f"{WATCHDOG_JSONL_SHA256}.jsonl").write_bytes(WATCHDOG_JSONL)
     provenance_root = writer.root / "provenance"
     provenance_root.mkdir(exist_ok=True)
     data = provenance_bytes(prompt)
@@ -671,7 +881,7 @@ class TraceFormatTests(unittest.TestCase):
         )
         for key, value, message in (
                 ("architecture", "gfx1100", "architecture mismatch"),
-                ("architecture", None, "architecture mismatch"),
+                ("architecture", None, "fields are invalid"),
                 ("backend_device", "ROCm1", "backend_device mismatch"),
                 ("gfx_target_version", 110500, "gfx_target_version mismatch"),
                 ("source", "environment", "source mismatch")):
@@ -702,6 +912,30 @@ class TraceFormatTests(unittest.TestCase):
         with mock.patch.object(run_llama.subprocess, "run", return_value=failed_result):
             with self.assertRaisesRegex(preflight.PreflightError, "query failed"):
                 run_llama.query_accelerator_attestation(Path("/exporter"), "ROCm0")
+
+    def test_metal_accelerator_attestation_is_runtime_specific(self) -> None:
+        valid = dict(METAL_ACCELERATOR_ATTESTATION)
+        self.assertEqual(run_ds4.validate_accelerator_attestation(valid), valid)
+        for mutation, message in (
+                ({"runtime_kind": "strix-rocm"}, "runtime_kind mismatch"),
+                ({"platform": "linux"}, "platform mismatch"),
+                ({"backend": "ROCm"}, "backend mismatch"),
+                ({"source": "environment"}, "source mismatch"),
+                ({"pci_device_id": "0000:c1:00.0"}, "fields are invalid")):
+            invalid = dict(valid)
+            invalid.update(mutation)
+            with self.assertRaisesRegex(preflight.PreflightError, message):
+                run_ds4.validate_accelerator_attestation(invalid)
+
+    def test_metal_accelerator_query_rejects_duplicate_keys(self) -> None:
+        duplicate = json.dumps(METAL_ACCELERATOR_ATTESTATION).replace(
+            '"backend": "Metal"',
+            '"backend": "Metal", "backend": "Metal"',
+        )
+        result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, duplicate, "")
+        with mock.patch.object(run_ds4.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(preflight.PreflightError, "duplicate JSON key"):
+                run_ds4.query_accelerator_attestation(Path("/exporter"), "Metal0")
 
     def test_nvme_attestation_uses_mount_and_block_ancestry(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -800,6 +1034,140 @@ class TraceFormatTests(unittest.TestCase):
                     sys_dev_block_root=dev_block,
                     sys_class_block_root=class_block,
                 )
+            forbidden = root / "forbidden"
+            forbidden.mkdir()
+            (forbidden / "escape").symlink_to(xfs, target_is_directory=True)
+            with self.assertRaisesRegex(preflight.PreflightError, "must not use"):
+                preflight.storage_attestation(
+                    forbidden / "escape" / "model.gguf",
+                    "forbidden symlink",
+                    mountinfo_path=mountinfo,
+                    sys_dev_block_root=dev_block,
+                    sys_class_block_root=class_block,
+                    forbidden_root=forbidden,
+                )
+
+    def test_darwin_storage_and_host_preflight_are_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("repo", "ds4", "tmp", "output"):
+                (root / name).mkdir()
+            model = root / "model.gguf"
+            prompt = root / "prompt.txt"
+            model.write_bytes(b"model")
+            prompt.write_bytes(b"prompt")
+            runner_executable = root / "python3"
+            runner_script = root / "repo" / "tools" / "deepseek-v41-trace" / "run_ds4.py"
+            exporter = root / "ds4-trace"
+            runner_script.parent.mkdir(parents=True)
+            runner_executable.write_bytes(b"python")
+            runner_script.write_bytes(b"runner")
+            exporter.write_bytes(b"exporter")
+
+            def disk_info(path: Path) -> dict[str, object]:
+                return {
+                    "MountPoint": str(root.resolve()),
+                    "FilesystemType": "apfs",
+                    "DeviceIdentifier": "disk3s1",
+                    "ParentWholeDisk": "disk3",
+                    "BusProtocol": "Apple Fabric",
+                    "Internal": True,
+                    "SolidState": True,
+                    "VolumeNetwork": False,
+                    "DiskImage": False,
+                }
+
+            def command_text(*args: str) -> str:
+                commands = {
+                    ("sysctl", "-n", "hw.memsize"): str(256 * 1024 * 1024 * 1024),
+                    ("sysctl", "-n", "hw.model"): "Mac14,8",
+                    ("sysctl", "-n", "kern.osproductversion"): "15.6",
+                    ("sysctl", "-n", "vm.swapusage"): "total = 0.00M used = 0.00M free = 0.00M (encrypted)",
+                    ("vm_stat",): (
+                        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                        "Pages free: 1000000.\n"
+                        "Pages inactive: 1000000.\n"
+                        "Pages speculative: 1000000.\n"
+                    ),
+                    ("ps", "-axo", "pid=,ppid=,command="): "",
+                }
+                return commands[args]
+
+            runner = dict(DS4_RUNNER_ATTESTATION)
+            runner["runner_executable"] = str(runner_executable.resolve())
+            runner["runner_executable_sha256"] = trace.sha256_file(runner_executable)
+            runner["runner_script"] = str(runner_script.resolve())
+            runner["runner_script_sha256"] = trace.sha256_file(runner_script)
+            runner["exporter_path"] = str(exporter.resolve())
+            runner["exporter_sha256"] = trace.sha256_file(exporter)
+            runner["checkout_path"] = str((root / "ds4").resolve())
+            with mock.patch.dict(preflight.os.environ, {"TMPDIR": str(root / "tmp")}, clear=True):
+                result = preflight.run_oracle_preflight(
+                    model=model,
+                    prompt=prompt,
+                    output=root / "output",
+                    repo=root / "repo",
+                    checkout=root / "ds4",
+                    busy_patterns=[],
+                    accelerator=dict(METAL_ACCELERATOR_ATTESTATION),
+                    runner=runner,
+                    disk_info=disk_info,
+                    command_text=command_text,
+                    system="Darwin",
+                    machine="arm64",
+                )
+            self.assertEqual(result["runtime_kind"], "apple-metal")
+            self.assertEqual(result["storage"]["model"]["storage_kind"], "darwin-local-solid-state")
+            self.assertEqual(result["host"]["memory_bytes"], 256 * 1024 * 1024 * 1024)
+
+            for mutation, message in (
+                    ({"Internal": False}, "internal non-rotational"),
+                    ({"SolidState": False}, "internal non-rotational"),
+                    ({"VolumeNetwork": True}, "local storage"),
+                    ({"DiskImage": True}, "local storage"),
+                    ({"BusProtocol": "Network"}, "bus protocol")):
+                def invalid_info(path: Path, mutation: dict[str, object] = mutation) -> dict[str, object]:
+                    result = disk_info(path)
+                    result.update(mutation)
+                    return result
+
+                with self.assertRaisesRegex(preflight.PreflightError, message):
+                    preflight.darwin_storage_attestation(
+                        model,
+                        "model",
+                        disk_info=invalid_info,
+                    )
+
+            with self.assertRaisesRegex(preflight.PreflightError, "macOS on arm64"):
+                preflight.darwin_host_and_memory_audit(
+                    command_text=command_text,
+                    system="Linux",
+                    machine="x86_64",
+                )
+
+    def test_darwin_storage_queries_the_containing_mount(self) -> None:
+        path = Path("/Users/test/model.gguf")
+        disk_info = {
+            "DeviceIdentifier": "disk3s5",
+            "ParentWholeDisk": "disk3",
+            "BusProtocol": "Apple Fabric",
+            "Internal": True,
+            "SolidState": True,
+        }
+
+        def check_output(command, **_kwargs):
+            if command == ["df", "-P", str(path)]:
+                return (
+                    "Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                    "/dev/disk3s5 100 10 90 10% /System/Volumes/Data\n"
+                )
+            self.assertEqual(command, ["diskutil", "info", "-plist", "/System/Volumes/Data"])
+            return preflight.plistlib.dumps(disk_info)
+
+        with mock.patch.object(preflight.subprocess, "check_output", side_effect=check_output):
+            result = preflight._diskutil_info(path)
+        self.assertEqual(result["_dsv41_mount_point"], "/System/Volumes/Data")
+        self.assertEqual({key: value for key, value in result.items() if not key.startswith("_")}, disk_info)
 
     def test_preflight_requires_explicit_nvme_tmpdir(self) -> None:
         with mock.patch.object(
@@ -808,13 +1176,43 @@ class TraceFormatTests(unittest.TestCase):
                 return_value=storage_record("/home/test")):
             with mock.patch.dict(preflight.os.environ, {"HIP_LAUNCH_BLOCKING": "1"}, clear=True):
                 with self.assertRaisesRegex(preflight.PreflightError, "TMPDIR is required"):
-                    preflight.run_preflight(
+                    preflight.run_strix_preflight(
                         model=Path("/home/model.gguf"),
                         prompt=Path("/home/prompt.txt"),
                         output=Path("/home/trace"),
                         repo=Path("/home/repo"),
                         busy_patterns=[],
                     )
+            with tempfile.TemporaryDirectory() as temp:
+                missing = Path(temp) / "missing"
+                with mock.patch.dict(
+                        preflight.os.environ,
+                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(missing)},
+                        clear=True):
+                    with self.assertRaisesRegex(preflight.PreflightError, "existing writable directory"):
+                        preflight.run_strix_preflight(
+                            model=Path("/home/model.gguf"),
+                            prompt=Path("/home/prompt.txt"),
+                            output=Path("/home/trace"),
+                            repo=Path("/home/repo"),
+                            busy_patterns=[],
+                        )
+                actual = Path(temp) / "actual"
+                actual.mkdir()
+                link = Path(temp) / "link"
+                link.symlink_to(actual, target_is_directory=True)
+                with mock.patch.dict(
+                        preflight.os.environ,
+                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(link)},
+                        clear=True):
+                    with self.assertRaisesRegex(preflight.PreflightError, "must not be a symlink"):
+                        preflight.run_strix_preflight(
+                            model=Path("/home/model.gguf"),
+                            prompt=Path("/home/prompt.txt"),
+                            output=Path("/home/trace"),
+                            repo=Path("/home/repo"),
+                            busy_patterns=[],
+                        )
 
     def test_watchdog_lease_rejects_arbitrary_heartbeat_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -870,20 +1268,12 @@ class TraceFormatTests(unittest.TestCase):
                 "sample": {},
             }), encoding="ascii")
             child_argv = ["python3", "run_matrix.py"]
+            watchdog_events = json.loads(json.dumps(WATCHDOG_EVENTS))
+            watchdog_events[1]["child_pid"] = child_pid
+            watchdog_events[1]["process_group_id"] = child_pid
+            watchdog_events[1]["command"] = child_argv
             audit.write_text(
-                json.dumps({
-                    "event": "preflight",
-                    "soft_bytes": preflight.SOFT_MEMORY_LIMIT,
-                    "emergency_bytes": preflight.WATCHDOG_EMERGENCY_LIMIT,
-                    "strict_ceiling_bytes": preflight.STRICT_MEMORY_LIMIT,
-                    "swap_entries": 0,
-                }) + "\n" +
-                json.dumps({
-                    "event": "child_started",
-                    "child_pid": child_pid,
-                    "process_group_id": child_pid,
-                    "command": child_argv,
-                }) + "\n",
+                "".join(json.dumps(event) + "\n" for event in watchdog_events),
                 encoding="ascii",
             )
             lease_record = {
@@ -1135,6 +1525,241 @@ class TraceFormatTests(unittest.TestCase):
                     add_required_events(writer)
                 with self.assertRaisesRegex(trace.TraceError, message):
                     trace.TraceBundle(root)
+
+    def test_accepts_truthful_metal_vs_strix_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            left = Path(temp) / "ds4"
+            right = Path(temp) / "llama"
+            with trace.TraceBundleWriter(left, manifest("ds4")) as writer:
+                add_required_events(writer)
+            with trace.TraceBundleWriter(right, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            left_bundle = trace.TraceBundle(left)
+            right_bundle = trace.TraceBundle(right)
+            self.assertNotEqual(
+                left_bundle.manifest["accelerator"]["architecture"],
+                right_bundle.manifest["accelerator"]["architecture"],
+            )
+            result = trace.report(left_bundle, right_bundle)
+            self.assertEqual(result["status"], "TARGET PASS")
+
+    def test_rejects_cross_runtime_attestation_substitution(self) -> None:
+        for runtime, accelerator, message in (
+                ("ds4", ACCELERATOR_ATTESTATION, "ds4 accelerator attestation fields"),
+                ("llama.cpp", METAL_ACCELERATOR_ATTESTATION, "llama.cpp accelerator attestation fields")):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                trace_manifest = manifest(runtime)
+                trace_manifest["accelerator"] = dict(accelerator)
+                with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
+        for runtime, records, replacement, message in (
+                (
+                    "ds4",
+                    DS4_AUDIT_RECORDS,
+                    storage_record("/mnt/models/model.gguf"),
+                    "ds4 storage attestation fields",
+                ),
+                (
+                    "llama.cpp",
+                    AUDIT_RECORDS,
+                    metal_storage_record("/Users/oracle/model.gguf"),
+                    "llama.cpp storage attestation fields",
+                )):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest(runtime)) as writer:
+                    add_required_events(writer)
+                record = json.loads(json.dumps(records["memory"]))
+                record["storage"]["model"] = replacement
+                replace_audit_record(root, "pre", "memory", record)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
+    def test_rejects_ds4_accelerator_audit_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            for phase in ("pre", "post"):
+                record = json.loads(json.dumps(DS4_AUDIT_RECORDS["memory"]))
+                del record["accelerator"]
+                replace_audit_record(root, phase, "memory", record)
+            with self.assertRaisesRegex(trace.TraceError, "missing accelerator"):
+                trace.TraceBundle(root)
+
+    def test_rejects_cross_runtime_host_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("llama.cpp")
+            trace_manifest["host"] = dict(DS4_HOST_ATTESTATION)
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "unexpected host"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["host"]["runtime_kind"] = "strix-rocm"
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "host runtime_kind mismatch"):
+                trace.TraceBundle(root)
+
+    def test_rejects_storage_audit_path_substitution(self) -> None:
+        for runtime, records, different in (
+                ("llama.cpp", AUDIT_RECORDS, "/mnt/models/different.gguf"),
+                ("ds4", DS4_AUDIT_RECORDS, "/Users/oracle/different.gguf")):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest(runtime)) as writer:
+                    add_required_events(writer)
+                for phase in ("pre", "post"):
+                    record = json.loads(json.dumps(records["memory"]))
+                    record["storage"]["model"]["resolved_path"] = different
+                    record["storage"]["model"]["existing_path"] = different
+                    replace_audit_record(root, phase, "memory", record)
+                with self.assertRaisesRegex(trace.TraceError, "model path differs from the manifest"):
+                    trace.TraceBundle(root)
+
+    def test_rejects_duplicate_and_unknown_runtime_attestation_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            manifest_path = root / trace.MANIFEST_NAME
+            data = manifest_path.read_text(encoding="ascii")
+            data = data.replace(
+                '"runtime_kind":"apple-metal"',
+                '"runtime_kind":"apple-metal","runtime_kind":"apple-metal"',
+                1,
+            )
+            manifest_path.write_text(data, encoding="ascii")
+            with self.assertRaisesRegex(trace.TraceError, "duplicate JSON key"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["accelerator"]["runtime_kind"] = "unknown"
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "runtime_kind mismatch"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            del trace_manifest["accelerator"]["runtime_kind"]
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "fields are invalid"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["unknown_top_level"] = True
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "unexpected unknown_top_level"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["config"]["unvalidated_mode"] = "unsafe"
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "unexpected unvalidated_mode"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["environment"]["system_info"] = "Linux test system"
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "environment is not macOS"):
+                trace.TraceBundle(root)
+
+    def test_rejects_boolean_accelerator_identities(self) -> None:
+        for runtime, field in (
+                ("llama.cpp", "gpu_id"),
+                ("ds4", "metal_registry_id"),
+                ("ds4", "recommended_max_working_set_bytes")):
+            with self.subTest(runtime=runtime, field=field), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                trace_manifest = manifest(runtime)
+                trace_manifest["accelerator"][field] = True
+                with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, "invalid"):
+                    trace.TraceBundle(root)
+
+    def test_rejects_unknown_watchdog_event_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            events = json.loads(json.dumps(WATCHDOG_EVENTS))
+            events[0]["unknown"] = True
+            data = "".join(
+                json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+                for event in events
+            ).encode("ascii")
+            digest = trace.sha256_bytes(data)
+            for phase in ("pre", "post"):
+                jsonl = root / "audits" / phase / f"{digest}.jsonl"
+                jsonl.write_bytes(data)
+                record = json.loads(json.dumps(AUDIT_RECORDS["watchdog"]))
+                record["data"]["audit"]["path"] = f"audits/{phase}/{digest}.jsonl"
+                record["data"]["audit"]["sha256"] = digest
+                record["data"]["audit"]["event_count"] = len(events)
+                replace_audit_record(root, phase, "watchdog", record)
+            with self.assertRaisesRegex(trace.TraceError, "unexpected unknown"):
+                trace.TraceBundle(root)
+
+    def test_ds4_runner_path_must_match_attested_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            for phase in ("pre", "post"):
+                record = json.loads(json.dumps(DS4_AUDIT_RECORDS["runner"]))
+                record["data"]["runner_script"] = "/Users/oracle/other/run_ds4.py"
+                replace_audit_record(root, phase, "runner", record)
+            with self.assertRaisesRegex(trace.TraceError, "runner_script mismatch"):
+                trace.TraceBundle(root)
+
+    def test_unapproved_ds4_exporter_is_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            exporter = root / "exporter"
+            exporter.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            exporter.chmod(0o755)
+            argv = [
+                "run_ds4.py",
+                "--repo", str(root),
+                "--model", str(root / "model.gguf"),
+                "--prompt", str(root / "prompt.txt"),
+                "--output", str(root / "output"),
+                "--exporter", str(exporter),
+                "--exporter-sha256", trace.sha256_file(exporter),
+                "--corpus-name", "correctness-prose.txt",
+                "--corpus-sha256", trace.CORPUS_SHA256["correctness-prose.txt"],
+                "--prompt-provenance", str(root / "prompt.json"),
+                "--preflight-only",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                    sys, "stderr", io.StringIO()), mock.patch.object(
+                    run_ds4, "query_accelerator_attestation") as query:
+                self.assertEqual(run_ds4.main(), 1)
+            query.assert_not_called()
 
     def test_rejects_wrong_component_schema_and_same_bundle_compare(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

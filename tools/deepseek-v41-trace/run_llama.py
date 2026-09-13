@@ -15,7 +15,7 @@ from preflight import (
     bind_embedded_audits,
     bind_prompt_provenance,
     resolved,
-    run_preflight,
+    run_strix_preflight,
     safe_trace_path,
     seal_audits,
     validate_prompt_provenance,
@@ -34,6 +34,7 @@ from trace_format import (
     TraceBundle,
     TraceError,
     sha256_file,
+    strict_json_loads,
 )
 
 
@@ -98,8 +99,8 @@ def bind_candidate_attestation(
         accelerator: dict[str, object]) -> None:
     manifest_path = safe_trace_path(output, "manifest.json")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, TraceError) as error:
         raise PreflightError(f"cannot bind candidate attestation: {error}") from error
     if manifest.get("accelerator") != accelerator:
         raise PreflightError("llama trace accelerator attestation differs from the preflight query")
@@ -115,9 +116,29 @@ def validate_accelerator_attestation(
         expected_device: str = "ROCm0") -> dict[str, object]:
     if not isinstance(record, dict):
         raise PreflightError("accelerator attestation is not an object")
+    required_keys = {
+        "format",
+        "version",
+        "runtime_kind",
+        "platform",
+        "backend",
+        "backend_device",
+        "backend_description",
+        "pci_device_id",
+        "kfd_node",
+        "gpu_id",
+        "gfx_target_version",
+        "architecture",
+        "source",
+    }
+    if set(record) != required_keys:
+        raise PreflightError("accelerator attestation fields are invalid")
     expected = {
         "format": "dsv41-accelerator-attestation",
-        "version": 1,
+        "version": 2,
+        "runtime_kind": "strix-rocm",
+        "platform": "linux",
+        "backend": "ROCm",
         "backend_device": expected_device,
         "architecture": "gfx1151",
         "gfx_target_version": 110501,
@@ -134,7 +155,7 @@ def validate_accelerator_attestation(
         raise PreflightError("accelerator attestation PCI identity is invalid")
     if not isinstance(record.get("kfd_node"), str) or not record["kfd_node"].isdigit():
         raise PreflightError("accelerator attestation KFD node is invalid")
-    if not isinstance(record.get("gpu_id"), int) or record["gpu_id"] <= 0:
+    if type(record.get("gpu_id")) is not int or record["gpu_id"] <= 0:
         raise PreflightError("accelerator attestation GPU identity is invalid")
     return dict(record)
 
@@ -153,8 +174,8 @@ def query_accelerator_attestation(exporter: Path, device: str) -> dict[str, obje
         detail = result.stderr.strip() or f"exit {result.returncode}"
         raise PreflightError(f"selected accelerator query failed: {detail}")
     try:
-        record = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
+        record = strict_json_loads(result.stdout)
+    except TraceError as error:
         raise PreflightError(f"selected accelerator query returned invalid JSON: {error}") from error
     return validate_accelerator_attestation(record, expected_device=device)
 
@@ -235,7 +256,7 @@ def main() -> int:
             raise PreflightError(f"trace exporter is not executable: {exporter}")
         accelerator = query_accelerator_attestation(exporter, args.device)
         if args.preflight_only:
-            audit = run_preflight(
+            audit = run_strix_preflight(
                 model=args.model,
                 prompt=args.prompt,
                 output=args.output,
@@ -262,7 +283,7 @@ def main() -> int:
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
-        preflight_audit = run_preflight(
+        preflight_audit = run_strix_preflight(
             model=args.model,
             prompt=args.prompt,
             output=args.output,
@@ -295,7 +316,7 @@ def main() -> int:
         if result.returncode != 0:
             return result.returncode
         verify_sealed_audits(pre_audits, pre_audit_digests)
-        postflight_audit = run_preflight(
+        postflight_audit = run_strix_preflight(
             model=args.model,
             prompt=args.prompt,
             output=args.output,

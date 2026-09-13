@@ -12,14 +12,25 @@ from preflight import (
     PreflightError,
     bind_embedded_audits,
     bind_prompt_provenance,
+    darwin_storage_attestation,
     resolved,
-    run_preflight,
+    run_oracle_preflight,
     seal_audits,
     validate_prompt_provenance,
     verify_sealed_audits,
     write_audits,
 )
-from trace_format import ADMITTED_UBATCH, CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, sha256_file
+from trace_format import (
+    ADMITTED_UBATCH,
+    CORPUS_SHA256,
+    MODEL_SHA256,
+    TraceBundle,
+    TraceError,
+    canonical_json,
+    sha256_bytes,
+    sha256_file,
+    strict_json_loads,
+)
 
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 APPROVED_EXPORTERS: dict[str, str] = {}
@@ -51,17 +62,171 @@ def verify_exporter_approval(exporter_sha256: str) -> None:
             "publish and review the exporter before cross-runtime execution")
 
 
-def preflight(args: argparse.Namespace) -> dict[str, object]:
+def validate_accelerator_attestation(
+        record: object,
+        *,
+        expected_device: str = "Metal0") -> dict[str, object]:
+    if not isinstance(record, dict):
+        raise PreflightError("accelerator attestation is not an object")
+    required_keys = {
+        "format",
+        "version",
+        "runtime_kind",
+        "platform",
+        "backend",
+        "backend_device",
+        "backend_description",
+        "architecture",
+        "metal_registry_id",
+        "recommended_max_working_set_bytes",
+        "unified_memory",
+        "source",
+    }
+    if set(record) != required_keys:
+        raise PreflightError("accelerator attestation fields are invalid")
+    expected = {
+        "format": "dsv41-accelerator-attestation",
+        "version": 2,
+        "runtime_kind": "apple-metal",
+        "platform": "macos",
+        "backend": "Metal",
+        "backend_device": expected_device,
+        "unified_memory": True,
+        "source": "metal-device-query",
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise PreflightError(f"accelerator attestation {key} mismatch")
+    if type(record.get("unified_memory")) is not bool:
+        raise PreflightError("accelerator attestation unified-memory identity is invalid")
+    for key in ("backend_description", "architecture"):
+        if not isinstance(record.get(key), str) or not record[key]:
+            raise PreflightError(f"accelerator attestation {key} is missing")
+    if type(record.get("metal_registry_id")) is not int or record["metal_registry_id"] <= 0:
+        raise PreflightError("accelerator attestation Metal registry identity is invalid")
+    if type(record.get("recommended_max_working_set_bytes")) is not int or (
+            record["recommended_max_working_set_bytes"] <= 0):
+        raise PreflightError("accelerator attestation working-set identity is invalid")
+    return dict(record)
+
+
+def query_accelerator_attestation(exporter: Path, device: str) -> dict[str, object]:
+    try:
+        result = subprocess.run(
+            [str(exporter), "--dsv41-attest-device", device],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise PreflightError(f"cannot query selected accelerator: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise PreflightError(f"selected accelerator query failed: {detail}")
+    try:
+        record = strict_json_loads(result.stdout)
+    except TraceError as error:
+        raise PreflightError(f"selected accelerator query returned invalid JSON: {error}") from error
+    return validate_accelerator_attestation(record, expected_device=device)
+
+
+def runner_attestation(
+        *,
+        exporter: Path,
+        exporter_sha256: str,
+        checkout: Path,
+        command: list[str]) -> dict[str, object]:
+    runner_executable = resolved(Path(sys.executable))
+    runner_script = resolved(Path(__file__))
+    return {
+        "format": "dsv41-runner-ownership",
+        "version": 1,
+        "runtime_kind": "apple-metal",
+        "source": "python-subprocess",
+        "runner_pid": os.getpid(),
+        "runner_parent_pid": os.getppid(),
+        "runner_uid": os.getuid(),
+        "runner_executable": str(runner_executable),
+        "runner_executable_sha256": sha256_file(runner_executable),
+        "runner_script": str(runner_script),
+        "runner_script_sha256": sha256_file(runner_script),
+        "exporter_path": str(exporter),
+        "exporter_sha256": exporter_sha256,
+        "checkout_path": str(checkout),
+        "checkout_revision": DS4_REVISION,
+        "command_sha256": sha256_bytes(canonical_json(command).encode("ascii")),
+    }
+
+
+def bind_oracle_attestation(
+        output: Path,
+        audit: dict[str, object],
+        accelerator: dict[str, object],
+        command: list[str]) -> None:
+    manifest_path = output / "manifest.json"
+    try:
+        manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, TraceError) as error:
+        raise PreflightError(f"cannot bind ds4 runtime attestation: {error}") from error
+    if manifest.get("accelerator") != accelerator:
+        raise PreflightError("ds4 trace accelerator attestation differs from the preflight query")
+    storage = audit.get("storage")
+    if not isinstance(storage, dict):
+        raise PreflightError("ds4 storage attestation is missing")
+    paths = {}
+    for label, record in storage.items():
+        if not isinstance(record, dict) or not isinstance(record.get("resolved_path"), str):
+            raise PreflightError(f"ds4 storage attestation is invalid for {label}")
+        paths[label] = record["resolved_path"]
+    if manifest.get("model", {}).get("path") != paths["model"]:
+        raise PreflightError("ds4 trace model path differs from the attested path")
+    if manifest.get("prompt", {}).get("path") != paths["prompt"]:
+        raise PreflightError("ds4 trace prompt path differs from the attested path")
+    if "paths" in manifest and manifest["paths"] != paths:
+        raise PreflightError("ds4 trace execution paths differ from preflight")
+    manifest["paths"] = paths
+    host = audit.get("host")
+    if not isinstance(host, dict):
+        raise PreflightError("ds4 host attestation is missing")
+    if "host" in manifest and manifest["host"] != host:
+        raise PreflightError("ds4 trace host identity differs from preflight")
+    manifest["host"] = host
+    manifest["environment"] = {
+        "system_info": f"macOS {host['os_version']} arm64 {host['hardware_model']}",
+        "command": shlex.join(command),
+    }
+    config = manifest.get("config")
+    if not isinstance(config, dict):
+        raise PreflightError("ds4 trace config is invalid")
+    for key, value in (
+            ("device_backend", "Metal"),
+            ("device_registry_id", accelerator["metal_registry_id"])):
+        if key in config and config[key] != value:
+            raise PreflightError(f"ds4 trace {key} differs from preflight")
+        config[key] = value
+    temp = manifest_path.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+    os.replace(temp, manifest_path)
+
+
+def preflight(
+        args: argparse.Namespace,
+        *,
+        accelerator: dict[str, object],
+        runner: dict[str, object]) -> dict[str, object]:
     checkout = resolved(args.checkout)
     revision = verify_checkout(checkout)
     if revision != DS4_REVISION:
         raise PreflightError(f"ds4 revision mismatch: expected {DS4_REVISION}, found {revision}")
-    result = run_preflight(
+    result = run_oracle_preflight(
         model=args.model,
         prompt=args.prompt,
         output=args.output,
         repo=args.repo,
+        checkout=checkout,
         busy_patterns=args.busy_pattern,
+        accelerator=accelerator,
+        runner=runner,
     )
     result.update({
         "runtime": "ds4",
@@ -71,6 +236,8 @@ def preflight(args: argparse.Namespace) -> dict[str, object]:
             "context": args.context,
             "decode_steps": args.decode_steps,
             "prefill_chunk": args.prefill_chunk,
+            "device_backend": "Metal",
+            "device_registry_id": accelerator["metal_registry_id"],
         },
     })
     return result
@@ -92,6 +259,7 @@ def main() -> int:
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--prefill-chunk", type=int, default=ADMITTED_UBATCH)
+    parser.add_argument("--device", default="Metal0")
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
@@ -102,11 +270,6 @@ def main() -> int:
                 f"found {args.prefill_chunk}")
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
-        if args.preflight_only:
-            audit = preflight(args)
-            print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
-            return 0
-
         exporter = resolved(args.exporter)
         if not exporter.is_file() or not os.access(exporter, os.X_OK):
             raise PreflightError(f"trace exporter is not executable: {exporter}")
@@ -115,6 +278,29 @@ def main() -> int:
             raise PreflightError(
                 f"trace exporter SHA-256 mismatch: expected {args.exporter_sha256}, found {exporter_sha256}")
         verify_exporter_approval(exporter_sha256)
+        output = resolved(args.output)
+        command = [
+            str(exporter),
+            "--model", str(resolved(args.model)),
+            "--prompt-file", str(resolved(args.prompt)),
+            "--output", str(output),
+            "--context", str(args.context),
+            "--decode-steps", str(args.decode_steps),
+            "--prefill-chunk", str(args.prefill_chunk),
+            "--device", args.device,
+        ]
+        accelerator = query_accelerator_attestation(exporter, args.device)
+        runner = runner_attestation(
+            exporter=exporter,
+            exporter_sha256=exporter_sha256,
+            checkout=resolved(args.checkout),
+            command=command,
+        )
+        if args.preflight_only:
+            audit = preflight(args, accelerator=accelerator, runner=runner)
+            print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
+            return 0
+
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
@@ -125,35 +311,30 @@ def main() -> int:
             corpus_sha256=args.corpus_sha256,
             model_sha256=model_sha256,
             target_tokens=args.context - args.decode_steps,
+            path_resolver=lambda path, label: Path(
+                str(darwin_storage_attestation(path, label)["resolved_path"])),
         )
-        output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
-        preflight_audit = preflight(args)
+        preflight_audit = preflight(args, accelerator=accelerator, runner=runner)
         preflight_audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
         pre_audit_digests = seal_audits(pre_audits)
-        command = [
-            str(exporter),
-            "--model", str(resolved(args.model)),
-            "--prompt-file", str(resolved(args.prompt)),
-            "--output", str(output),
-            "--context", str(args.context),
-            "--decode-steps", str(args.decode_steps),
-            "--prefill-chunk", str(args.prefill_chunk),
-            "--memory-audit", pre_audits["memory"],
-            "--swap-audit", pre_audits["swap"],
-            "--watchdog-audit", pre_audits["watchdog"],
-        ]
         print("exec:", shlex.join(command), file=sys.stderr)
         result = subprocess.run(command, cwd=resolved(args.checkout), check=False)
         if result.returncode != 0:
             return result.returncode
         verify_sealed_audits(pre_audits, pre_audit_digests)
-        postflight_audit = preflight(args)
+        post_accelerator = query_accelerator_attestation(exporter, args.device)
+        if post_accelerator != accelerator:
+            raise PreflightError("selected accelerator identity changed during trace execution")
+        postflight_audit = preflight(args, accelerator=post_accelerator, runner=runner)
+        if postflight_audit.get("host") != preflight_audit.get("host"):
+            raise PreflightError("ds4 host identity changed during trace execution")
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
+        bind_oracle_attestation(output, preflight_audit, accelerator, command)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "ds4":
             raise PreflightError("ds4 exporter wrote a non-ds4 trace")
@@ -164,6 +345,8 @@ def main() -> int:
             raise PreflightError("ds4 trace build SHA-256 does not match the executed exporter")
         if bundle.manifest.get("model", {}).get("sha256") != MODEL_SHA256:
             raise PreflightError("ds4 trace model SHA-256 does not match the published GGUF")
+        if bundle.manifest.get("accelerator") != accelerator:
+            raise PreflightError("ds4 trace accelerator attestation differs from the measured Metal device")
         return 0
     except (PreflightError, TraceError) as error:
         print(f"error: {error}", file=sys.stderr)

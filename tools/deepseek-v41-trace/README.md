@@ -4,13 +4,15 @@ This directory defines version 2 of the cross-runtime trace format used by issue
 
 Each trace is a directory:
 
-- `manifest.json` records the model and prompt SHA-256 values, exact runtime revision/build, inference configuration, environment, and content-addressed memory/swap/watchdog audit references.
+- `manifest.json` records the model and prompt SHA-256 values, exact runtime revision/build, inference configuration, environment, runtime-specific host evidence, exact execution paths, and content-addressed audit references.
 - `events.jsonl` is an ordered stream of content-addressed event records.
 - `blobs/<sha256>.bin` stores canonical little-endian tensor bytes. This keeps complete logits and per-token state exact without embedding large numeric arrays in JSON.
 - `audits/pre/<sha256>.json` and `audits/post/<sha256>.json` store immutable safety evidence from both sides of execution.
 - `provenance/<sha256>.json` binds the exact prompt to its fixed corpus, published model, target token count, and prompt-builder executable.
 
-The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected. Any graph tensor in the reserved `dsv41.trace.*` namespace with an unknown component, malformed suffix, or unexpected layer fails the exporter. Every bundle also carries an exact accelerator attestation. The selected backend device must map through its PCI identity and Linux KFD topology to `gfx_target_version=110501` (`gfx1151`); device labels or environment strings are not accepted as architecture evidence.
+The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected. Any graph tensor in the reserved `dsv41.trace.*` namespace with an unknown component, malformed suffix, or unexpected layer fails the exporter.
+
+Every bundle carries one strict runtime-discriminated accelerator attestation. A llama.cpp candidate uses the `strix-rocm` kind: the selected backend device must map through its PCI identity and Linux KFD topology to `gfx_target_version=110501` (`gfx1151`). A ds4 oracle uses the `apple-metal` kind: the selected Metal device records its registry ID, reported architecture, unified-memory property, and recommended working-set size. Missing kinds, unknown kinds, cross-kind fields, duplicate JSON keys, and mixed evidence fail closed. Cross-runtime comparison does not require the two physical accelerators or PCI identities to match; each runtime proves its own execution environment, while the model, prompt, inference semantics, and complete output artifacts remain exact comparison inputs.
 
 Internal tensors use raw ggml dimension order, and every dimension must be positive. The validator requires Engram rows as i32 `[24, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, layer-0/1 raw attention-source rows as i32 `[128, token_count]`, compressed attention-source IDs as nonempty rank-2 i32 with width at most 512, layer-20 candidate blocks as nonempty rank-2 i32 with width at most 2048, propagated candidates as nonempty rank-2 i32 with width at most 512, and complete f32 logits as `[129280]`. Raw attention rows use physical ring IDs `0..127`, visible current-ubatch IDs `128..128+token_index`, and unavailable sentinel `128+token_count`; layers 0 and 1 must be byte-identical for each execution step. Original expert IDs must be within `0..383`.
 
@@ -71,17 +73,17 @@ build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o CPY
 
 Do not change host ROCm packages for this run. Vulkan can provide secondary coverage, but it cannot replace the required ROCm low-level and oracle evidence. The llama runner selects `ROCm0` explicitly, invokes the exact exporter for a pre-allocation device attestation, and rejects the run unless the backend PCI identity maps to exactly one KFD node reporting `gfx1151`. The native exporter repeats the query before model allocation and verifies that the loaded model still uses the same device.
 
-Set `HIP_LAUNCH_BLOCKING=1` on the canonical watchdog command that owns the complete matrix process group. The wrappers fail closed if this variable is absent or different, and every embedded memory, swap, and watchdog audit records it. Keep the same inherited value for ds4 and llama.cpp.
+Set `HIP_LAUNCH_BLOCKING=1` on the canonical watchdog command that owns the complete Strix matrix process group. The llama.cpp wrapper fails closed if this variable is absent or different, and every embedded Strix memory, swap, and watchdog audit records it. This Linux/ROCm setting is not an Apple Metal oracle requirement.
 
-## Strix execution gate
+## Strix candidate execution gate
 
-`run_ds4.py` verifies that the pinned ds4 checkout has no tracked or untracked changes and refuses model execution when swap is enabled, the canonical watchdog lease, heartbeat, or JSONL audit is missing or stale, another unrelated matching DS4 workload is active, or any model/prompt/trace path resolves under `/mnt/bigspace`.
+`run_llama.py` refuses model execution when swap is enabled, the canonical watchdog lease, heartbeat, or JSONL audit is missing or stale, another unrelated matching model workload is active, or any model/prompt/trace path fails the storage gate.
 
 The approved watchdog revision is exactly `778db6f50eae04e6c232c69b9575bdbd0747962b`, with `scripts/strix_memory_watchdog.py` SHA-256 `d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f`. Both Python validators and the native exporter reject every other revision or script hash.
 
 The approved watchdog must own the complete matrix process group and expose its canonical validation and process-group lease-guard APIs. The wrappers verify its pinned script identity, Python executable and argv position, PID and Linux start time, exact command bytes, 116/118/120 GiB thresholds, `/proc` source, watchdog/guardian/matrix topology, current process group, child command hash, atomic lease/heartbeat identities, heartbeat freshness and persistent-audit record hash, and the watchdog-held audit lock. The direct matrix payload starts the canonical process-group lease guard before inference. The wrappers repeat validation before and after each runtime.
 
-Use one empty directory on verified non-rotational NVMe for every input and output. The Python launchers and both native tools resolve symlinks and the nearest existing output parent through `/proc/self/mountinfo`, `/sys/dev/block`, and `/sys/class/block`. They require a resolvable local NVMe block device with `queue/rotational=0`; tmpfs, network filesystems, rotational disks, unknown devices, and `/mnt/bigspace` fail closed. Btrfs subvolume sources such as `/dev/nvme0n1p3[/home]` are resolved through the parent block device. `TMPDIR` is mandatory and has no `/tmp` fallback. These metadata commands do not execute the model:
+Use one empty directory on verified non-rotational NVMe for every Strix input and output. The Python launcher and both native tools resolve the nearest existing output parent through `/proc/self/mountinfo`, `/sys/dev/block`, and `/sys/class/block`. They require a resolvable local NVMe block device with `queue/rotational=0`; tmpfs, network filesystems, rotational disks, unknown devices, lexical or resolved `/mnt/bigspace` paths, and forbidden-root symlink escapes fail closed. Btrfs subvolume sources such as `/dev/nvme0n1p3[/home]` are resolved through the parent block device. `TMPDIR` is mandatory, must be an existing writable non-symlink directory on verified NVMe, and has no `/tmp` fallback. These metadata commands do not execute the model:
 
 ```sh
 MODEL=/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf
@@ -107,7 +109,7 @@ git -C /home/papa/src/ds4-v41 rev-parse HEAD
 test "$(awk 'NR > 1 { count++ } END { print count + 0 }' /proc/swaps)" = 0
 ```
 
-The expected model digest is `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`, the ds4 status output is empty, the ds4 revision is `bd66c402070042bf0a79ad6ece8242de4c93680c`, both selected block devices report `ROTA=0`, and `/proc/swaps` has zero entries. The observed planning snapshot had 76366495744 bytes free on `/mnt/models` and 679635001344 bytes free under `/home`; recheck before every run. Keep the unchanged 365713686528-byte GGUF in place on `/mnt/models`. Do not copy the model or place builds, logs, traces, audit files, or temporary files there. Put all of those under `/home`, and never use `/mnt/bigspace`.
+The expected model digest is `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`, both selected block devices report `ROTA=0`, and `/proc/swaps` has zero entries. The observed planning snapshot had 76366495744 bytes free on `/mnt/models` and 679635001344 bytes free under `/home`; recheck before every run. Keep the unchanged 365713686528-byte GGUF in place on `/mnt/models`. Do not copy the model or place builds, logs, traces, audit files, or temporary files there. Put all of those under `/home`, and never use `/mnt/bigspace`.
 
 The exporter is intentionally external to the canonical ds4 checkout. It must be built from the pinned revision and emit this trace format without changing the canonical checkout. The launcher requires its trusted SHA-256 and rejects a bundle unless the exporter reports the pinned revision and its build SHA-256 matches the executed file.
 
@@ -115,31 +117,34 @@ The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the no
 
 Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, and repository path. It rejects tracked or untracked checkout changes and rejects an exporter whose embedded build revision, executable hash, accelerator identity, or loaded model device does not match that attestation.
 
-`run_matrix.py` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, runs ds4 and llama.cpp with matched context/decode settings, compares each bundle immediately, and stops at the first divergence. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the final integration revision, immutable oracle revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass later contexts only after the 32K target passes.
+`run_matrix.py --llama-only` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, and captures the llama.cpp side. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the final integration revision, immutable oracle revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass later contexts only after the 32K target passes. The Apple oracle is captured separately with `run_ds4.py`; compare completed per-case bundles with `trace_format.py compare`.
 
-The external ds4 exporter is not present in the pinned `/home/papa/src/ds4-v41` checkout. It remains a blocker until a separately built executable is provided and attested. `run_ds4.py` currently has no approved exporter digest and fails closed before inference. After the exporter is implemented and reviewed on an authorized oracle host, add its exact executable SHA-256 and pinned ds4 revision to `APPROVED_EXPORTERS` in `run_ds4.py`; a caller-provided digest alone is not sufficient oracle provenance. Its bundle must include the same KFD-derived `gfx1151` accelerator identity as the llama.cpp trace. The exporter must accept the interface used by `run_ds4.py`:
+## Apple Metal oracle execution gate
+
+The external ds4 exporter is not present in the pinned canonical checkout. It remains blocked until a separately built executable is reviewed and its exact SHA-256 is added to the otherwise empty `APPROVED_EXPORTERS` map. Approval is checked before the exporter can run, including device-only preflight. `run_ds4.py` requires macOS arm64, at least 128 GiB of measured host memory, zero swap, no unrelated matching workload, an exact selected Metal device query, and an existing writable non-symlink `TMPDIR`. The model, prompt, output, harness repository, ds4 checkout, temporary directory, Python executable, runner script, and exporter must resolve through `df -P` to a volume that `diskutil info -plist` proves is internal solid-state local storage. Network volumes, disk images, external/non-internal devices, non-solid-state media, incomplete device identity, and lexical or resolved forbidden paths fail closed.
+
+The ds4 memory audit binds the exact Metal accelerator, host model/OS/memory identity, and every storage record. The runner audit binds the Python runner process, UID, executable/script paths and hashes, exporter path/hash, pinned checkout path/revision, and exact command hash. The runner script must be inside the attested harness repository. The preflight and postflight accelerator and host identities must remain unchanged. These Apple audits replace Linux KFD, `/proc`, HIP, and Strix watchdog claims; the oracle must never fabricate those fields.
+
+After the exporter is independently reviewed on an authorized 128 GiB or larger Apple oracle host, add its exact executable SHA-256 and pinned ds4 revision to `APPROVED_EXPORTERS` in `run_ds4.py`; a caller-provided digest alone is not sufficient oracle provenance. The exporter must answer `--dsv41-attest-device Metal0` without loading the model and emit the strict `apple-metal` attestation. Its trace command interface is:
 
 The unpublished `ds4gguf` documentation revision `e13893ffcb33e90c8852929303e188102df7a8f5` is provenance only. It is not an executable dependency, exporter approval, or fixture source. Executable tests and fixtures stay in this `strix-llama.cpp` stack.
 
 ```text
---model PATH --prompt-file PATH --output PATH --context N --decode-steps N --prefill-chunk 32
---memory-audit PATH --swap-audit PATH --watchdog-audit PATH
+--model PATH --prompt-file PATH --output PATH --context N --decode-steps N --prefill-chunk 32 --device Metal0
 ```
 
-It must emit a complete valid `dsv41-trace` bundle, report ds4 revision `bd66c402070042bf0a79ad6ece8242de4c93680c`, and put its own executable SHA-256 in `manifest.json`.
+It must emit a complete valid `dsv41-trace` bundle, report ds4 revision `bd66c402070042bf0a79ad6ece8242de4c93680c`, put its own executable SHA-256 in `manifest.json`, and report the same selected Metal device before and after execution. `run_ds4.py` embeds the platform-native memory, swap, runner, accelerator, host, storage, and exact-path evidence.
 
-After the exporter exists, set the immutable identities and run the first matrix under the watchdog:
+Capture the first llama.cpp matrix under the watchdog:
 
 ```sh
 REPO=/home/papa/src/strix-llama-integration
 MODEL=/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf
 RUN_ROOT=/home/papa/dsv41-correctness
 CASE_ROOT="$RUN_ROOT/c32768"
-DS4_EXPORTER=/home/papa/bin/dsv41-trace-exporter
 CANDIDATE_REV="$(git -C "$REPO" rev-parse HEAD)"
 BASE_REV=<full-immutable-oracle-revision>
 DIFF_SHA256="$(git -C "$REPO" diff --binary --no-ext-diff "$BASE_REV" "$CANDIDATE_REV" -- | sha256sum | awk '{print $1}')"
-DS4_EXPORTER_SHA256="$(sha256sum "$DS4_EXPORTER" | awk '{print $1}')"
 
 mkdir -p "$CASE_ROOT/watchdog"
 cd "$REPO"
@@ -164,10 +169,7 @@ HIP_LAUNCH_BLOCKING=1 python3 scripts/strix_memory_watchdog.py \
     --candidate-revision "$CANDIDATE_REV" \
     --base-revision "$BASE_REV" \
     --candidate-diff-sha256 "$DIFF_SHA256" \
-    --ds4-runner "$REPO/tools/deepseek-v41-trace/run_ds4.py" \
-    --ds4-checkout /home/papa/src/ds4-v41 \
-    --ds4-exporter "$DS4_EXPORTER" \
-    --ds4-exporter-sha256 "$DS4_EXPORTER_SHA256" \
+    --llama-only \
     --contexts 32768 \
     --ubatches 32 \
     --batch 2048 \
@@ -183,6 +185,29 @@ CASE_ROOT="$RUN_ROOT/c65536"  # then use --contexts 65536
 CASE_ROOT="$RUN_ROOT/c98304"  # then use --contexts 98304
 CASE_ROOT="$RUN_ROOT/c131072" # then use --contexts 131072
 ```
+
+On the separately authorized Apple oracle, place the unchanged GGUF, exact prompt, prompt-provenance record, harness checkout, pinned ds4 checkout, exporter, trace output, and `TMPDIR` on internal solid-state storage. Then run one case at a time:
+
+```sh
+export TMPDIR=/Users/oracle/dsv41/tmp
+python3 tools/deepseek-v41-trace/run_ds4.py \
+  --repo /Users/oracle/src/strix-llama.cpp \
+  --checkout /Users/oracle/src/ds4-v41 \
+  --exporter /Users/oracle/bin/dsv41-trace-exporter \
+  --exporter-sha256 <approved-exact-sha256> \
+  --model /Users/oracle/models/DeepSeek-V4.1-Flash-Q2.gguf \
+  --prompt /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt \
+  --prompt-provenance /Users/oracle/dsv41/inputs/correctness-prose-c32768.txt.provenance.json \
+  --output /Users/oracle/dsv41/traces/correctness-prose-c32768-ub32 \
+  --corpus-name correctness-prose.txt \
+  --corpus-sha256 2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2 \
+  --context 32768 \
+  --decode-steps 8 \
+  --prefill-chunk 32 \
+  --device Metal0
+```
+
+Compare the completed bundle with the matching Strix bundle using `trace_format.py compare`. Repeat for all four corpora before expanding the context matrix.
 
 ## Strix bring-up evidence lane
 
@@ -215,7 +240,7 @@ python3 tools/deepseek-v41-trace/verify_ds4_anchors.py \
   --checkout /home/papa/src/ds4-v41
 ```
 
-`run_matrix.py --llama-only` captures all four repository corpora without claiming cross-runtime success. Use the matrix command above, add `--llama-only`, and omit `--ds4-runner`, `--ds4-checkout`, `--ds4-exporter`, and `--ds4-exporter-sha256`. Run the final integration build twice with separate output directories, then run an equivalently instrumented immutable base build once. Keep every run under its own canonical watchdog invocation and use the exact ubatch/cache/ROCm arguments above.
+`run_matrix.py --llama-only` captures all four repository corpora without claiming cross-runtime success. Run the final integration build twice with separate output directories, then run an equivalently instrumented immutable base build once. Keep every run under its own canonical watchdog invocation and use the exact ubatch/cache/ROCm arguments above.
 
 For each case (`correctness-prose-c32768-ub32`, `correctness-code-c32768-ub32`, `correctness-structured-c32768-ub32`, and `correctness-numeric-c32768-ub32`), require both comparisons:
 

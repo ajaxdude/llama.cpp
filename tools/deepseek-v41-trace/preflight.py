@@ -4,12 +4,17 @@ import json
 import hashlib
 import importlib.util
 import os
+import platform
+import plistlib
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+from trace_format import TraceError, validate_watchdog_event
 
 FORBIDDEN_ROOT = Path("/mnt/bigspace")
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
@@ -32,6 +37,21 @@ _WATCHDOG_GUARD = None
 
 class PreflightError(RuntimeError):
     pass
+
+
+def strict_json_loads(data: str) -> object:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise PreflightError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(data, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as error:
+        raise PreflightError(f"invalid JSON: {error}") from error
 
 
 def resolved(path: Path) -> Path:
@@ -61,10 +81,18 @@ def storage_attestation(
         *,
         mountinfo_path: Path = Path("/proc/self/mountinfo"),
         sys_dev_block_root: Path = Path("/sys/dev/block"),
-        sys_class_block_root: Path = Path("/sys/class/block")) -> dict[str, object]:
-    path = resolved(path)
+        sys_class_block_root: Path = Path("/sys/class/block"),
+        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
+    lexical_path = path.expanduser().absolute()
     try:
-        path.relative_to(FORBIDDEN_ROOT)
+        lexical_path.relative_to(forbidden_root)
+    except ValueError:
+        pass
+    else:
+        raise PreflightError(f"{label} must not use /mnt/bigspace: {lexical_path}")
+    path = resolved(lexical_path)
+    try:
+        path.relative_to(forbidden_root)
     except ValueError:
         pass
     else:
@@ -135,6 +163,11 @@ def storage_attestation(
     if nvme_device is None:
         raise PreflightError(f"{label} must use an NVMe block device: {block_device}")
     return {
+        "format": "dsv41-storage-attestation",
+        "version": 2,
+        "runtime_kind": "strix-rocm",
+        "platform": "linux",
+        "storage_kind": "linux-nvme",
         "resolved_path": str(path),
         "existing_path": str(existing),
         "mount_point": str(mount_point),
@@ -144,6 +177,7 @@ def storage_attestation(
         "block_device_path": str(block_device),
         "nvme_device": nvme_device,
         "rotational": False,
+        "source": "linux-mountinfo-sysfs",
     }
 
 
@@ -164,6 +198,101 @@ def require_nvme_path(
     return _attested_resolved_path(attestation, label)
 
 
+def _diskutil_info(path: Path) -> dict[str, object]:
+    try:
+        df = subprocess.check_output(
+            ["df", "-P", str(path)],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).splitlines()
+        if len(df) < 2:
+            raise PreflightError(f"df cannot resolve a mounted volume for {path}")
+        fields = df[-1].split(maxsplit=5)
+        if len(fields) != 6 or not fields[5].startswith("/"):
+            raise PreflightError(f"df returned invalid mount evidence for {path}")
+        mount_point = fields[5]
+        data = subprocess.check_output(
+            ["diskutil", "info", "-plist", mount_point],
+            stderr=subprocess.STDOUT,
+        )
+        record = plistlib.loads(data)
+    except (OSError, subprocess.CalledProcessError, plistlib.InvalidFileException) as error:
+        raise PreflightError(f"diskutil cannot attest storage for {path}: {error}") from error
+    if not isinstance(record, dict):
+        raise PreflightError(f"diskutil returned invalid storage evidence for {path}")
+    record["_dsv41_mount_point"] = mount_point
+    return record
+
+
+def darwin_storage_attestation(
+        path: Path,
+        label: str,
+        *,
+        disk_info: Callable[[Path], dict[str, object]] = _diskutil_info,
+        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
+    lexical_path = path.expanduser().absolute()
+    try:
+        lexical_path.relative_to(forbidden_root)
+    except ValueError:
+        pass
+    else:
+        raise PreflightError(f"{label} must not use /mnt/bigspace: {lexical_path}")
+    path = resolved(lexical_path)
+    try:
+        path.relative_to(forbidden_root)
+    except ValueError:
+        pass
+    else:
+        raise PreflightError(f"{label} must not use /mnt/bigspace: {path}")
+    existing = _existing_ancestor(path)
+    record = dict(disk_info(existing))
+    mount_point = record.pop("_dsv41_mount_point", record.get("MountPoint"))
+    filesystem_type = record.get("FilesystemType")
+    device_identifier = record.get("DeviceIdentifier")
+    parent_whole_disk = record.get("ParentWholeDisk")
+    bus_protocol = record.get("BusProtocol")
+    if record.get("Internal") is not True or record.get("SolidState") is not True:
+        raise PreflightError(f"{label} must use internal non-rotational storage: {path}")
+    if record.get("VolumeNetwork") is True or record.get("DiskImage") is True:
+        raise PreflightError(f"{label} must use local storage: {path}")
+    for name, value in (
+            ("mount point", mount_point),
+            ("filesystem type", filesystem_type),
+            ("device identifier", device_identifier),
+            ("parent whole disk", parent_whole_disk),
+            ("bus protocol", bus_protocol)):
+        if not isinstance(value, str) or not value:
+            raise PreflightError(f"{label} {name} cannot be resolved: {path}")
+    if not mount_point.startswith("/"):
+        raise PreflightError(f"{label} mount point is invalid: {mount_point}")
+    if bus_protocol.lower() in {"network", "virtual", "disk image"}:
+        raise PreflightError(f"{label} bus protocol is not local: {bus_protocol}")
+    try:
+        filesystem_device = os.stat(existing).st_dev
+        if filesystem_device != os.stat(mount_point).st_dev:
+            raise PreflightError(f"{label} filesystem identity differs from its attested mount: {path}")
+    except OSError as error:
+        raise PreflightError(f"{label} filesystem identity cannot be read: {error}") from error
+    return {
+        "format": "dsv41-storage-attestation",
+        "version": 2,
+        "runtime_kind": "apple-metal",
+        "platform": "macos",
+        "storage_kind": "darwin-local-solid-state",
+        "resolved_path": str(path),
+        "existing_path": str(existing),
+        "mount_point": mount_point,
+        "filesystem_type": filesystem_type,
+        "device_identifier": device_identifier,
+        "parent_whole_disk": parent_whole_disk,
+        "bus_protocol": bus_protocol,
+        "filesystem_device": filesystem_device,
+        "internal": True,
+        "solid_state": True,
+        "source": "diskutil-info-plist",
+    }
+
+
 def _attested_resolved_path(attestation: dict[str, object], label: str) -> Path:
     resolved_path = attestation["resolved_path"]
     if not isinstance(resolved_path, str):
@@ -175,7 +304,7 @@ def safe_trace_path(root: Path, relative: Path | str) -> Path:
     root = root.expanduser().absolute()
     if root.is_symlink():
         raise PreflightError("trace output root must not be a symlink")
-    root = require_nvme_path(root, "trace output")
+    root = root.resolve()
     relative = Path(relative)
     if relative.is_absolute() or ".." in relative.parts:
         raise PreflightError(f"trace output path is outside the bundle: {relative}")
@@ -188,7 +317,6 @@ def safe_trace_path(root: Path, relative: Path | str) -> Path:
         candidate.resolve().relative_to(root)
     except ValueError as error:
         raise PreflightError(f"trace output path is outside the bundle: {relative}") from error
-    require_nvme_path(candidate, "trace output")
     return candidate
 
 
@@ -234,6 +362,86 @@ def memory_audit() -> dict[str, int]:
         raise PreflightError(
             f"host memory use is at or above the 116 GiB soft limit: {result['mem_used_bytes']}")
     return result
+
+
+def _command_text(*args: str) -> str:
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise PreflightError(f"{' '.join(args)} failed: {error}") from error
+
+
+def darwin_host_and_memory_audit(
+        *,
+        command_text: Callable[..., str] = _command_text,
+        system: str | None = None,
+        machine: str | None = None) -> tuple[dict[str, object], dict[str, int]]:
+    platform_name = platform.system() if system is None else system
+    machine_name = platform.machine() if machine is None else machine
+    if platform_name != "Darwin" or machine_name != "arm64":
+        raise PreflightError("ds4 oracle execution requires macOS on arm64")
+    try:
+        total = int(command_text("sysctl", "-n", "hw.memsize"))
+    except ValueError as error:
+        raise PreflightError("Darwin memory size is invalid") from error
+    if total < 128 * 1024 * 1024 * 1024:
+        raise PreflightError("ds4 oracle host must have at least 128 GiB of memory")
+    vm_stat = command_text("vm_stat")
+    page_size_match = re.search(r"page size of ([0-9]+) bytes", vm_stat)
+    if page_size_match is None:
+        raise PreflightError("vm_stat page size is missing")
+    page_size = int(page_size_match.group(1))
+    pages = {}
+    for name, value in re.findall(r"^([^:]+):\s+([0-9]+)\.$", vm_stat, flags=re.MULTILINE):
+        pages[name] = int(value)
+    available_pages = sum(pages.get(name, 0) for name in (
+        "Pages free",
+        "Pages inactive",
+        "Pages speculative",
+    ))
+    available = available_pages * page_size
+    if available <= 0 or available > total:
+        raise PreflightError("Darwin available memory evidence is invalid")
+    host = {
+        "format": "dsv41-host-attestation",
+        "version": 1,
+        "runtime_kind": "apple-metal",
+        "platform": "macos",
+        "machine": "arm64",
+        "hardware_model": command_text("sysctl", "-n", "hw.model"),
+        "os_version": command_text("sysctl", "-n", "kern.osproductversion"),
+        "memory_bytes": total,
+        "source": "darwin-sysctl",
+    }
+    if not host["hardware_model"] or not host["os_version"]:
+        raise PreflightError("Darwin host identity is incomplete")
+    return host, {
+        "mem_total_bytes": total,
+        "mem_available_bytes": available,
+        "mem_used_bytes": total - available,
+    }
+
+
+def darwin_swap_audit(
+        *,
+        command_text: Callable[..., str] = _command_text) -> dict[str, object]:
+    value = command_text("sysctl", "-n", "vm.swapusage")
+    match = re.fullmatch(
+        r"total = ([0-9]+(?:\.[0-9]+)?)M\s+used = ([0-9]+(?:\.[0-9]+)?)M\s+"
+        r"free = ([0-9]+(?:\.[0-9]+)?)M(?:\s+\(encrypted\))?",
+        value,
+    )
+    if match is None:
+        raise PreflightError("Darwin swap evidence is invalid")
+    total, used, free = (int(float(item) * 1024 * 1024) for item in match.groups())
+    if total != 0 or used != 0 or free != 0:
+        raise PreflightError("swap is enabled; model execution is blocked")
+    return {
+        "source": "darwin-sysctl-vm.swapusage",
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+    }
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -285,7 +493,7 @@ def read_heartbeat(
         now: int | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns) -> int:
     try:
-        record = json.loads(path.read_text(encoding="ascii"))
+        record = strict_json_loads(path.read_text(encoding="ascii"))
         updated = datetime.fromisoformat(str(record["updated_at"]).replace("Z", "+00:00"))
         heartbeat = int(updated.timestamp())
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
@@ -294,9 +502,9 @@ def read_heartbeat(
         raise PreflightError("watchdog heartbeat format is invalid")
     if record.get("lease_id") != lease_id or record.get("state") != "active":
         raise PreflightError("watchdog heartbeat lease identity or state is invalid")
-    if not isinstance(record.get("sequence"), int) or record["sequence"] < 0:
+    if type(record.get("sequence")) is not int or record["sequence"] < 0:
         raise PreflightError("watchdog heartbeat sequence is invalid")
-    if not isinstance(record.get("updated_monotonic_ns"), int) or record["updated_monotonic_ns"] <= 0:
+    if type(record.get("updated_monotonic_ns")) is not int or record["updated_monotonic_ns"] <= 0:
         raise PreflightError("watchdog heartbeat monotonic timestamp is invalid")
     if record.get("watchdog_pid") != watchdog_pid or (
             record.get("watchdog_start_time_ticks") != watchdog_start_time_ticks):
@@ -322,7 +530,7 @@ def _read_json_with_retry(
     last_error: Exception | None = None
     while True:
         try:
-            record = json.loads(path.read_text(encoding="ascii"))
+            record = strict_json_loads(path.read_text(encoding="ascii"))
             if not isinstance(record, dict):
                 raise ValueError("record is not an object")
             return record
@@ -341,11 +549,9 @@ def _read_watchdog_events(path: Path) -> list[dict[str, object]]:
     events = []
     for line_number, line in enumerate(lines, start=1):
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError as error:
+            event = validate_watchdog_event(strict_json_loads(line))
+        except (PreflightError, TraceError) as error:
             raise PreflightError(f"watchdog audit line {line_number} is invalid: {error}") from error
-        if not isinstance(event, dict) or not isinstance(event.get("event"), str):
-            raise PreflightError(f"watchdog audit line {line_number} is not an event")
         events.append(event)
     if not events:
         raise PreflightError("watchdog audit is empty")
@@ -457,7 +663,7 @@ def _canonical_watchdog_audit(
         sleeper=sleeper,
     )
     try:
-        heartbeat_record = json.loads(heartbeat_path.read_text(encoding="ascii"))
+        heartbeat_record = strict_json_loads(heartbeat_path.read_text(encoding="ascii"))
         updated = datetime.fromisoformat(str(heartbeat_record["updated_at"]).replace("Z", "+00:00"))
         heartbeat_unix = int(updated.timestamp())
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
@@ -719,7 +925,38 @@ def matching_workloads(
     return matches
 
 
-def run_preflight(
+def darwin_matching_workloads(
+        patterns: list[str],
+        *,
+        command_text: Callable[..., str] = _command_text,
+        current_pid: int | None = None) -> list[dict[str, object]]:
+    pid_to_parent = {}
+    pid_to_command = {}
+    for line in command_text("ps", "-axo", "pid=,ppid=,command=").splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid = int(fields[0])
+            parent = int(fields[1])
+        except ValueError:
+            continue
+        pid_to_parent[pid] = parent
+        pid_to_command[pid] = fields[2]
+    excluded = set()
+    pid = os.getpid() if current_pid is None else current_pid
+    while pid > 0 and pid not in excluded:
+        excluded.add(pid)
+        pid = pid_to_parent.get(pid, 0)
+    lowered = [pattern.lower() for pattern in patterns if pattern]
+    return [
+        {"pid": pid, "command": command}
+        for pid, command in pid_to_command.items()
+        if pid not in excluded and any(pattern in command.lower() for pattern in lowered)
+    ]
+
+
+def run_strix_preflight(
         *,
         model: Path,
         prompt: Path,
@@ -734,7 +971,13 @@ def run_preflight(
     tmpdir_value = os.environ.get("TMPDIR")
     if not tmpdir_value:
         raise PreflightError("TMPDIR is required for NVMe-only correctness runs")
-    tmp_storage = storage_attestation(Path(tmpdir_value), "temporary directory")
+    tmpdir_input = Path(tmpdir_value).expanduser().absolute()
+    if tmpdir_input.is_symlink():
+        raise PreflightError("TMPDIR must not be a symlink")
+    tmpdir = resolved(tmpdir_input)
+    if not tmpdir.is_dir() or not os.access(tmpdir, os.W_OK | os.X_OK):
+        raise PreflightError("TMPDIR must be an existing writable directory")
+    tmp_storage = storage_attestation(tmpdir, "temporary directory")
     model = _attested_resolved_path(model_storage, "model")
     prompt = _attested_resolved_path(prompt_storage, "prompt")
     output = _attested_resolved_path(output_storage, "trace output")
@@ -753,6 +996,7 @@ def run_preflight(
         raise PreflightError("active model workload detected: " + json.dumps(workloads, ensure_ascii=True))
     return {
         "created_unix": int(time.time()),
+        "runtime_kind": "strix-rocm",
         "model": str(model),
         "prompt": str(prompt),
         "output": str(output),
@@ -771,13 +1015,125 @@ def run_preflight(
     }
 
 
+def run_oracle_preflight(
+        *,
+        model: Path,
+        prompt: Path,
+        output: Path,
+        repo: Path,
+        checkout: Path,
+        busy_patterns: list[str],
+        accelerator: dict[str, object],
+        runner: dict[str, object],
+        disk_info: Callable[[Path], dict[str, object]] = _diskutil_info,
+        command_text: Callable[..., str] = _command_text,
+        system: str | None = None,
+        machine: str | None = None) -> dict[str, object]:
+    model_storage = darwin_storage_attestation(model, "model", disk_info=disk_info)
+    prompt_storage = darwin_storage_attestation(prompt, "prompt", disk_info=disk_info)
+    output_storage = darwin_storage_attestation(output, "trace output", disk_info=disk_info)
+    repo_storage = darwin_storage_attestation(repo, "repository", disk_info=disk_info)
+    checkout_storage = darwin_storage_attestation(checkout, "ds4 checkout", disk_info=disk_info)
+    runner_executable = Path(str(runner.get("runner_executable", "")))
+    runner_script = Path(str(runner.get("runner_script", "")))
+    exporter = Path(str(runner.get("exporter_path", "")))
+    runner_executable_storage = darwin_storage_attestation(
+        runner_executable, "runner executable", disk_info=disk_info)
+    runner_script_storage = darwin_storage_attestation(runner_script, "runner script", disk_info=disk_info)
+    exporter_storage = darwin_storage_attestation(exporter, "trace exporter", disk_info=disk_info)
+    tmpdir_value = os.environ.get("TMPDIR")
+    if not tmpdir_value:
+        raise PreflightError("TMPDIR is required for ds4 oracle correctness runs")
+    tmpdir_input = Path(tmpdir_value).expanduser().absolute()
+    if tmpdir_input.is_symlink():
+        raise PreflightError("TMPDIR must not be a symlink")
+    tmpdir = resolved(tmpdir_input)
+    if not tmpdir.is_dir() or not os.access(tmpdir, os.W_OK | os.X_OK):
+        raise PreflightError("TMPDIR must be an existing writable directory")
+    tmp_storage = darwin_storage_attestation(tmpdir, "temporary directory", disk_info=disk_info)
+    model = _attested_resolved_path(model_storage, "model")
+    prompt = _attested_resolved_path(prompt_storage, "prompt")
+    output = _attested_resolved_path(output_storage, "trace output")
+    repo = _attested_resolved_path(repo_storage, "repository")
+    checkout = _attested_resolved_path(checkout_storage, "ds4 checkout")
+    runner_executable = _attested_resolved_path(runner_executable_storage, "runner executable")
+    runner_script = _attested_resolved_path(runner_script_storage, "runner script")
+    exporter = _attested_resolved_path(exporter_storage, "trace exporter")
+    if not model.is_file():
+        raise PreflightError(f"model is not a file: {model}")
+    if not prompt.is_file():
+        raise PreflightError(f"prompt is not a file: {prompt}")
+    if not runner_executable.is_file() or not runner_script.is_file() or not exporter.is_file():
+        raise PreflightError("ds4 runner or exporter path is not a file")
+    try:
+        runner_script.relative_to(repo)
+    except ValueError as error:
+        raise PreflightError("ds4 runner script is outside the attested repository") from error
+    for key, path in (
+            ("runner_executable_sha256", runner_executable),
+            ("runner_script_sha256", runner_script),
+            ("exporter_sha256", exporter)):
+        try:
+            digest = sha256_bytes(path.read_bytes())
+        except OSError as error:
+            raise PreflightError(f"cannot hash ds4 {key} path: {error}") from error
+        if runner.get(key) != digest:
+            raise PreflightError(f"ds4 {key} differs from the executed file")
+    if runner.get("checkout_path") != str(checkout):
+        raise PreflightError("ds4 runner checkout path differs from the attested checkout")
+    host, memory = darwin_host_and_memory_audit(
+        command_text=command_text,
+        system=system,
+        machine=machine,
+    )
+    swap = darwin_swap_audit(command_text=command_text)
+    workloads = darwin_matching_workloads(busy_patterns, command_text=command_text)
+    if workloads:
+        raise PreflightError("active model workload detected: " + json.dumps(workloads, ensure_ascii=True))
+    return {
+        "created_unix": int(time.time()),
+        "runtime_kind": "apple-metal",
+        "model": str(model),
+        "prompt": str(prompt),
+        "output": str(output),
+        "memory": memory,
+        "swap": swap,
+        "runner": runner,
+        "host": host,
+        "accelerator": accelerator,
+        "active_workloads": [],
+        "environment": {},
+        "storage": {
+            "model": model_storage,
+            "prompt": prompt_storage,
+            "output": output_storage,
+            "repository": repo_storage,
+            "runtime_checkout": checkout_storage,
+            "temporary_directory": tmp_storage,
+            "runner_executable": runner_executable_storage,
+            "runner_script": runner_script_storage,
+            "exporter": exporter_storage,
+        },
+    }
+
+
 def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
     root = resolved(root)
     if root.exists() and any(root.iterdir()):
         raise PreflightError(f"audit directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     result = {}
-    for key in ("memory", "swap", "watchdog"):
+    runtime_kind = audit.get("runtime_kind")
+    kinds = (
+        ("memory", "swap", "watchdog")
+        if runtime_kind == "strix-rocm"
+        else ("memory", "swap", "runner")
+        if runtime_kind == "apple-metal"
+        else ()
+    )
+    if not kinds:
+        raise PreflightError("audit runtime kind is invalid")
+    for key in kinds:
         path = root / f"{key}.json"
         data = audit[key]
         if key == "watchdog":
@@ -791,7 +1147,7 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
             events = []
             for line_number, line in enumerate(audit_text.splitlines(), start=1):
                 try:
-                    event = json.loads(line)
+                    event = strict_json_loads(line)
                 except json.JSONDecodeError as error:
                     raise PreflightError(
                         f"watchdog audit line {line_number} is invalid while snapshotting: {error}") from error
@@ -815,8 +1171,9 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
         }
         if key == "memory":
             value["storage"] = audit["storage"]
-            if "accelerator" in audit:
-                value["accelerator"] = audit["accelerator"]
+            value["accelerator"] = audit["accelerator"]
+            if "host" in audit:
+                value["host"] = audit["host"]
         path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
         result[key] = str(path)
     summary = root / "preflight.json"
@@ -829,13 +1186,16 @@ def seal_audits(audits: dict[str, str]) -> dict[str, str]:
     digests = {}
     paths = []
     try:
-        for kind in ("memory", "swap", "watchdog"):
+        kinds = tuple(kind for kind in ("memory", "swap", "watchdog", "runner") if kind in audits)
+        if set(kinds) != set(audits) - {"preflight"}:
+            raise PreflightError("audit set has unsupported kinds")
+        for kind in kinds:
             path = resolved(Path(audits[kind]))
             paths.append(path)
             data = path.read_bytes()
             digests[kind] = sha256_bytes(data)
             if kind == "watchdog":
-                record = json.loads(data.decode("ascii"))
+                record = strict_json_loads(data.decode("ascii"))
                 jsonl_path = resolved(Path(record["data"]["audit_path"]))
                 paths.append(jsonl_path)
                 digests["watchdog_jsonl"] = sha256_bytes(jsonl_path.read_bytes())
@@ -857,11 +1217,14 @@ def embed_audits(trace_root: Path, phase: str, audits: dict[str, str]) -> dict[s
     embedded_root = safe_trace_path(trace_root, Path("audits") / phase)
     embedded_root.mkdir(parents=True, exist_ok=True)
     result = {}
-    for kind in ("memory", "swap", "watchdog"):
+    kinds = tuple(kind for kind in ("memory", "swap", "watchdog", "runner") if kind in audits)
+    if set(kinds) != set(audits) - {"preflight"}:
+        raise PreflightError("audit set has unsupported kinds")
+    for kind in kinds:
         source = resolved(Path(audits[kind]))
         data = source.read_bytes()
         try:
-            record = json.loads(data.decode("ascii"))
+            record = strict_json_loads(data.decode("ascii"))
         except (UnicodeError, json.JSONDecodeError) as error:
             raise PreflightError(f"cannot embed {kind} audit: {error}") from error
         if kind == "watchdog":
@@ -907,7 +1270,7 @@ def bind_embedded_audits(trace_root: Path, audit_sets: dict[str, dict[str, str]]
     trace_root = safe_trace_path(trace_root, ".")
     manifest_path = safe_trace_path(trace_root, "manifest.json")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"cannot bind trace audits: {error}") from error
     if set(audit_sets) != {"pre", "post"}:
@@ -929,11 +1292,12 @@ def validate_prompt_provenance(
     corpus_sha256: str,
     model_sha256: str,
     target_tokens: int,
+    path_resolver: Callable[[Path, str], Path] | None = None,
 ) -> dict[str, object]:
-    path = require_nvme_path(path, "prompt provenance")
+    path = (require_nvme_path if path_resolver is None else path_resolver)(path, "prompt provenance")
     try:
         data = path.read_bytes()
-        record = json.loads(data.decode("ascii"))
+        record = strict_json_loads(data.decode("ascii"))
         prompt_path = resolved(prompt)
         prompt_bytes = prompt_path.read_bytes()
         prompt_size = prompt_path.stat().st_size
@@ -965,7 +1329,7 @@ def bind_prompt_provenance(trace_root: Path, provenance: dict[str, object]) -> N
     trace_root = safe_trace_path(trace_root, ".")
     manifest_path = safe_trace_path(trace_root, "manifest.json")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"cannot bind prompt provenance: {error}") from error
     prompt = manifest.get("prompt")

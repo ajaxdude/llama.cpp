@@ -42,12 +42,14 @@ int main() {
         const fs::path ram = root / "ram";
         const fs::path network = root / "network";
         const fs::path missing = root / "missing";
+        const fs::path forbidden = root / "forbidden";
         fs::create_directories(xfs);
         fs::create_directories(btrfs);
         fs::create_directories(rotating);
         fs::create_directories(ram);
         fs::create_directories(network);
         fs::create_directories(missing);
+        fs::create_directories(forbidden);
         write_file(xfs / "model.gguf", "model");
         write_file(btrfs / "corpus.txt", "corpus");
         write_file(rotating / "data", "data");
@@ -55,6 +57,14 @@ int main() {
         write_file(network / "data", "data");
         write_file(missing / "data", "data");
         fs::create_directory_symlink(ram, xfs / "escape");
+        fs::create_directory_symlink(xfs, forbidden / "escape");
+        fs::create_directory_symlink(btrfs, root / "tmp-link");
+        dsv41::require_usable_directory(btrfs, "TMPDIR");
+        require_failure(
+            [&]() {
+                dsv41::require_usable_directory(root / "tmp-link", "TMPDIR");
+            },
+            "must not be a symlink");
 
         const fs::path sys = root / "sys";
         const fs::path nvme1 = sys / "devices" / "pci" / "block" / "nvme1n1";
@@ -135,6 +145,13 @@ int main() {
                     sys / "class" / "block");
             },
             "/mnt/bigspace");
+        require_failure(
+            [&]() {
+                dsv41::require_nvme_path(
+                    forbidden / "escape" / "model.gguf", "forbidden symlink", mountinfo,
+                    sys / "dev" / "block", sys / "class" / "block", forbidden);
+            },
+            "must not use");
 
         const fs::path kfd = root / "kfd";
         write_file(
