@@ -6,9 +6,10 @@
 
 #include <array>
 #include <cassert>
-#include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -62,7 +63,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_params cparams_copy = *cparams;
+    char architecture[128] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0 &&
+            strcmp(architecture, "deepseek41") == 0 &&
+            cparams_copy.n_ubatch != mparams_copy.dsv41_admission_ubatch) {
+        cparams_copy.n_ubatch = mparams_copy.dsv41_admission_ubatch;
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);

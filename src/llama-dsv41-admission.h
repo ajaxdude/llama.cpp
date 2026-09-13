@@ -53,6 +53,8 @@ struct llama_dsv41_admission_result {
     uint64_t graph_workspace_bytes = 0;
     uint64_t engram_staging_bytes = 0;
     uint64_t expert_staging_bytes = 0;
+    uint64_t expert_replacement_bytes = 0;
+    uint64_t direct_io_bounce_bytes = 0;
     uint64_t expert_cache_bytes = 0;
     uint64_t output_bytes = 0;
     uint64_t safety_margin_bytes = 0;

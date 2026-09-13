@@ -1337,6 +1337,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    char architecture[128] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0) {
+        common_context_params_apply_arch_defaults(architecture, params, cparams);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1708,7 +1713,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.dsv41_admission_sequences = params.n_parallel;
     mparams.dsv41_admission_ubatch = std::min(
             mparams.dsv41_admission_batch,
-            static_cast<uint32_t>(std::max(params.n_ubatch, 1)));
+            static_cast<uint32_t>(params.n_ubatch_explicit ? std::max(params.n_ubatch, 1) : 32));
     mparams.dsv41_admission_outputs = params.n_outputs_max <= 0 ?
             mparams.dsv41_admission_batch :
             std::min<uint32_t>(params.n_outputs_max, mparams.dsv41_admission_batch);
@@ -1741,6 +1746,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
+}
+
+void common_context_params_apply_arch_defaults(
+        const char * architecture,
+        const common_params & params,
+        llama_context_params & cparams) {
+    if (architecture != nullptr && strcmp(architecture, "deepseek41") == 0 && !params.n_ubatch_explicit) {
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 32);
+    }
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
