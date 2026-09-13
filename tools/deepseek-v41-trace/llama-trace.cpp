@@ -229,9 +229,9 @@ static std::set<fs::path> loaded_project_runtime_libraries() {
         throw std::runtime_error("cannot read loaded runtime modules");
     }
     do {
-        const fs::path path = canonical_path(entry.szExePath, "loaded runtime module");
-        if (is_project_runtime_library(path)) {
-            result.insert(path);
+        const fs::path reported_path = entry.szExePath;
+        if (is_project_runtime_library(reported_path)) {
+            result.insert(canonical_path(reported_path, "loaded runtime module"));
         }
     } while (Module32NextW(snapshot, &entry));
     CloseHandle(snapshot);
@@ -240,9 +240,9 @@ static std::set<fs::path> loaded_project_runtime_libraries() {
     for (uint32_t index = 0; index < count; ++index) {
         const char * name = _dyld_get_image_name(index);
         if (name != nullptr && name[0] != '\0') {
-            const fs::path path = canonical_path(name, "loaded runtime module");
-            if (is_project_runtime_library(path)) {
-                result.insert(path);
+            const fs::path reported_path = name;
+            if (is_project_runtime_library(reported_path)) {
+                result.insert(canonical_path(reported_path, "loaded runtime module"));
             }
         }
     }
@@ -257,9 +257,9 @@ static std::set<fs::path> loaded_project_runtime_libraries() {
         if (path_start == std::string::npos) {
             continue;
         }
-        const fs::path path = canonical_path(line.substr(path_start), "loaded runtime module");
-        if (is_project_runtime_library(path)) {
-            result.insert(path);
+        const fs::path reported_path = line.substr(path_start);
+        if (is_project_runtime_library(reported_path)) {
+            result.insert(canonical_path(reported_path, "loaded runtime module"));
         }
     }
 #endif
