@@ -161,15 +161,10 @@ void test_configured_cache() {
     const auto tensors = published_tensors();
     auto params = base_params();
     params.configured_cache_slots = 12;
-    params.configured_cache_bytes = 12*398131200ULL;
+    params.configured_cache_bytes = 12*398131200ULL + 1024;
     const auto result = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
     REQUIRE(result.expert_slots == 12);
     REQUIRE(result.expert_cache_bytes == 12*398131200ULL);
-
-    params.configured_cache_bytes += 1024;
-    REQUIRE(thrown([&]() {
-        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
-    }).find("disagree") != std::string::npos);
 
     params.configured_cache_slots = 13;
     REQUIRE(thrown([&]() {

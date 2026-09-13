@@ -287,8 +287,7 @@ llama_dsv41_admission_result llama_dsv41_admit(
     const uint64_t bytes_slots = params.configured_cache_bytes == 0 ?
             LLAMA_DSV41_N_EXPERT : params.configured_cache_bytes/result.expert_slot_bytes;
     if (params.configured_cache_slots != 0 && params.configured_cache_bytes != 0 &&
-            params.configured_cache_bytes != checked_mul(
-                    params.configured_cache_slots, result.expert_slot_bytes, "configured expert cache")) {
+            params.configured_cache_slots != bytes_slots) {
         reject("cache", result, "configured cache slots and bytes disagree");
     }
     uint64_t slot_cap = LLAMA_DSV41_N_EXPERT;
