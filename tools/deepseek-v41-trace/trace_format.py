@@ -506,8 +506,8 @@ def validate_watchdog_event(event: Any) -> dict[str, Any]:
             raise TraceError("watchdog JSONL error presence does not match classification")
         if "error" in event and (not isinstance(event["error"], str) or not event["error"]):
             raise TraceError("watchdog JSONL error is invalid")
-        secondary_errors = event.get("secondary_errors")
-        if secondary_errors is not None:
+        if "secondary_errors" in event:
+            secondary_errors = event["secondary_errors"]
             if classification != "signal_error" or "error" not in event:
                 raise TraceError("watchdog JSONL secondary errors require a primary signal error")
             if not isinstance(secondary_errors, list) or not secondary_errors:

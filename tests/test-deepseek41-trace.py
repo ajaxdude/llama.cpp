@@ -2288,42 +2288,61 @@ class TraceFormatTests(unittest.TestCase):
             "exit_code": 1,
             "error": "test internal error",
         })
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "trace"
-            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
-                add_required_events(writer)
-            for phase in ("pre", "post"):
-                replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, terminal])
-            trace.TraceBundle(root)
+
+        def assert_watchdog_final_rejected(candidate: dict[str, object], message: str) -> None:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                for phase in ("pre", "post"):
+                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.command_validate(Namespace(bundle=root))
+
+        def assert_watchdog_final_valid(candidate: dict[str, object]) -> None:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                    add_required_events(writer)
+                for phase in ("pre", "post"):
+                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
+                trace.TraceBundle(root)
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(trace.command_validate(Namespace(bundle=root)), 0)
+
+        assert_watchdog_final_valid(terminal)
 
         for classification, error in (
                 ("procfs_error", None),
                 ("procfs_error", "initial snapshot failed"),
                 ("signal_error", None),
                 ("signal_error", "cannot signal process group")):
-            with self.subTest(classification=classification, error=error), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp) / "trace"
-                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
-                    add_required_events(writer)
+            with self.subTest(classification=classification, error=error):
                 candidate = copy.deepcopy(terminal)
                 candidate["classification"] = classification
                 if error is None:
                     candidate.pop("error")
                 else:
                     candidate["error"] = error
-                for phase in ("pre", "post"):
-                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
-                trace.TraceBundle(root)
+                assert_watchdog_final_valid(candidate)
+
+        candidate = copy.deepcopy(terminal)
+        candidate.update({
+            "classification": "signal_error",
+            "error": "primary signal failure",
+            "secondary_errors": [{
+                "component": "audit",
+                "detail": "secondary audit failure",
+            }],
+        })
+        assert_watchdog_final_valid(candidate)
 
         for classification, error in (
                 ("internal_error", "internal failure"),
                 ("signal_error", None)):
-            with self.subTest(
-                    classification=classification,
-                    secondary=True), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp) / "trace"
-                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
-                    add_required_events(writer)
+            with self.subTest(classification=classification, secondary=True):
                 candidate = copy.deepcopy(terminal)
                 candidate["classification"] = classification
                 candidate["secondary_errors"] = [{
@@ -2334,28 +2353,37 @@ class TraceFormatTests(unittest.TestCase):
                     candidate.pop("error")
                 else:
                     candidate["error"] = error
-                for phase in ("pre", "post"):
-                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
-                with self.assertRaisesRegex(trace.TraceError, "require a primary signal error"):
-                    trace.TraceBundle(root)
+                assert_watchdog_final_rejected(candidate, "require a primary signal error")
+
+        for classification, error, secondary_errors, message in (
+                ("child_exit", None, None, "require a primary signal error"),
+                ("internal_error", "internal failure", None, "require a primary signal error"),
+                ("signal_error", None, None, "require a primary signal error"),
+                ("signal_error", "primary signal failure", None, "secondary errors are invalid"),
+                ("signal_error", "primary signal failure", [], "secondary errors are invalid")):
+            with self.subTest(
+                    classification=classification,
+                    secondary_errors=secondary_errors):
+                candidate = copy.deepcopy(terminal)
+                candidate["classification"] = classification
+                candidate["secondary_errors"] = secondary_errors
+                if error is None:
+                    candidate.pop("error")
+                else:
+                    candidate["error"] = error
+                assert_watchdog_final_rejected(candidate, message)
 
         for classification, error in (
                 ("internal_error", None),
                 ("child_exit", "fabricated error")):
-            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp) / "trace"
-                with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
-                    add_required_events(writer)
+            with self.subTest(classification=classification):
                 candidate = copy.deepcopy(terminal)
                 candidate["classification"] = classification
                 if error is None:
                     candidate.pop("error")
                 else:
                     candidate["error"] = error
-                for phase in ("pre", "post"):
-                    replace_watchdog_events(root, phase, [*WATCHDOG_EVENTS, candidate])
-                with self.assertRaisesRegex(trace.TraceError, "error presence does not match"):
-                    trace.TraceBundle(root)
+                assert_watchdog_final_rejected(candidate, "error presence does not match")
 
     def test_rejects_boolean_accelerator_identities(self) -> None:
         for runtime, field in (
