@@ -405,6 +405,168 @@ class TestWatchdogBehavior(unittest.TestCase):
         sys.platform.startswith("linux"),
         "Linux guardian lifecycle",
     )
+    def test_parent_signal_grace_outlives_guardian_pulse_timeout(
+        self,
+    ) -> None:
+        child_code = (
+            "import os,signal,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "open(sys.argv[1],'w').write(str(os.getpid()));"
+            "time.sleep(30)"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pid_file = root / "pid"
+            stderr_path = root / "stderr.jsonl"
+            self._write_procfs_fixture(root)
+            with stderr_path.open("w", encoding="utf-8") as audit:
+                wrapper = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--procfs-root",
+                        str(root),
+                        *self._lease_arguments(root),
+                        "--grace-seconds",
+                        "0.4",
+                        "--sample-interval-seconds",
+                        "0.05",
+                        "--heartbeat-max-age-seconds",
+                        "0.1",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(pid_file),
+                    ],
+                    stderr=audit,
+                    text=True,
+                )
+                child_pid = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while not pid_file.exists():
+                        if time.monotonic() >= deadline:
+                            self.fail("child process did not become ready")
+                        time.sleep(0.01)
+                    child_pid = int(
+                        pid_file.read_text(encoding="utf-8")
+                    )
+                    started = time.monotonic()
+                    wrapper.send_signal(signal.SIGTERM)
+                    wrapper.wait(timeout=5)
+                    elapsed = time.monotonic() - started
+                finally:
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+                    if child_pid is not None:
+                        try:
+                            os.killpg(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+            records = [
+                json.loads(line)
+                for line in stderr_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            signals = [
+                record["signal"]
+                for record in records
+                if record["event"] == "process_group_signal"
+            ]
+            self.assertGreaterEqual(elapsed, 0.35)
+            self.assertEqual(
+                wrapper.returncode,
+                128 + signal.SIGTERM,
+                records,
+            )
+            self.assertEqual(signals, ["SIGTERM", "SIGKILL"])
+            self.assertEqual(
+                records[-1]["classification"], "parent_signal"
+            )
+            self.assertFalse(self._process_is_running(child_pid))
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux guardian lifecycle",
+    )
+    def test_parent_signal_allows_exit_after_pulse_deadline(self) -> None:
+        child_code = (
+            "import os,signal,sys,time\n"
+            "def stop(_signal,_frame):\n"
+            " time.sleep(0.25)\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM,stop)\n"
+            "open(sys.argv[1],'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pid_file = root / "pid"
+            stderr_path = root / "stderr.jsonl"
+            self._write_procfs_fixture(root)
+            with stderr_path.open("w", encoding="utf-8") as audit:
+                wrapper = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--procfs-root",
+                        str(root),
+                        *self._lease_arguments(root),
+                        "--grace-seconds",
+                        "0.4",
+                        "--sample-interval-seconds",
+                        "0.05",
+                        "--heartbeat-max-age-seconds",
+                        "0.1",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(pid_file),
+                    ],
+                    stderr=audit,
+                    text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 5
+                    while not pid_file.exists():
+                        if time.monotonic() >= deadline:
+                            self.fail("child process did not become ready")
+                        time.sleep(0.01)
+                    started = time.monotonic()
+                    wrapper.send_signal(signal.SIGTERM)
+                    wrapper.wait(timeout=5)
+                    elapsed = time.monotonic() - started
+                finally:
+                    if wrapper.poll() is None:
+                        wrapper.kill()
+                        wrapper.wait(timeout=5)
+
+            records = [
+                json.loads(line)
+                for line in stderr_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            signals = [
+                record["signal"]
+                for record in records
+                if record["event"] == "process_group_signal"
+            ]
+            self.assertGreaterEqual(elapsed, 0.2)
+            self.assertLess(elapsed, 0.4)
+            self.assertEqual(wrapper.returncode, 128 + signal.SIGTERM)
+            self.assertEqual(signals, ["SIGTERM"])
+            self.assertEqual(records[-1]["child_returncode"], 0)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux guardian lifecycle",
+    )
     def test_guardian_pipe_close_kills_group_without_fd_leak(self) -> None:
         child_code = (
             "import json,os,subprocess,sys,time\n"
@@ -431,6 +593,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                 ),
                 os.environ.copy(),
                 0.5,
+                1.0,
                 signal.pthread_sigmask(signal.SIG_BLOCK, ()),
             )
             control_target = os.readlink(
@@ -478,6 +641,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                 ),
                 os.environ.copy(),
                 0.5,
+                1.0,
                 signal.pthread_sigmask(signal.SIG_BLOCK, ()),
             )
             deadline = time.monotonic() + 5
@@ -593,6 +757,96 @@ class TestWatchdogBehavior(unittest.TestCase):
                         )
                     if wrapper.stderr is not None:
                         wrapper.stderr.close()
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux guardian lifecycle",
+    )
+    def test_payload_guard_fails_closed_on_artifact_error(self) -> None:
+        child_code = (
+            "import importlib.util,os,pathlib,subprocess,sys,time\n"
+            "script=pathlib.Path(sys.argv[1])\n"
+            "spec=importlib.util.spec_from_file_location('guard_watchdog',script)\n"
+            "module=importlib.util.module_from_spec(spec)\n"
+            "sys.modules[spec.name]=module\n"
+            "spec.loader.exec_module(module)\n"
+            "module.start_process_group_lease_guard("
+            "script,expected_procfs_root=pathlib.Path(sys.argv[2]))\n"
+            "def fail(*_args,**_kwargs):\n"
+            " raise module.ArtifactError('script','unreadable')\n"
+            "module.validate_active_lease=fail\n"
+            "grandchild=subprocess.Popen([sys.executable,'-c',"
+            "'import time;time.sleep(30)'])\n"
+            "open(sys.argv[3],'w').write("
+            "f'{os.getpid()} {grandchild.pid}\\n')\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pid_path = root / "pids"
+            self._write_procfs_fixture(root)
+            wrapper = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--procfs-root",
+                    str(root),
+                    *self._lease_arguments(root),
+                    "--heartbeat-max-age-seconds",
+                    "0.3",
+                    "--sample-interval-seconds",
+                    "0.05",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(SCRIPT_PATH),
+                    str(root),
+                    str(pid_path),
+                ],
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            child_pid = None
+            grandchild_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while not pid_path.exists():
+                    if wrapper.poll() is not None:
+                        assert wrapper.stderr is not None
+                        self.fail(wrapper.stderr.read())
+                    if time.monotonic() >= deadline:
+                        self.fail("guarded payload did not become ready")
+                    time.sleep(0.01)
+                child_pid, grandchild_pid = (
+                    int(value)
+                    for value in pid_path.read_text(
+                        encoding="utf-8"
+                    ).split()
+                )
+                wrapper.wait(timeout=5)
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.wait(timeout=5)
+                if wrapper.stderr is not None:
+                    wrapper.stderr.close()
+                if child_pid is not None:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            assert child_pid is not None
+            assert grandchild_pid is not None
+            for process_id in (child_pid, grandchild_pid):
+                deadline = time.monotonic() + 2
+                while (
+                    self._process_is_running(process_id)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertFalse(self._process_is_running(process_id))
 
     def test_child_sigterm_handler_exits_without_escalation(self) -> None:
         child_code = (
@@ -869,6 +1123,143 @@ class TestWatchdogBehavior(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "grace period"):
             config.validate()
 
+    def test_configuration_rejects_weakened_liveness_timing(self) -> None:
+        cases = (
+            (
+                {"grace_seconds": 31.0},
+                "grace period",
+            ),
+            (
+                {"sample_interval_seconds": 1.1},
+                "sample interval",
+            ),
+            (
+                {
+                    "sample_interval_seconds": 1.0,
+                    "heartbeat_max_age_seconds": 5.1,
+                },
+                "heartbeat max age",
+            ),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                config = watchdog.WatchdogConfig(
+                    command=("fake-command",),
+                    **overrides,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    config.validate()
+
+    def test_stderr_failure_does_not_bypass_cleanup(self) -> None:
+        class FailingStderr(io.StringIO):
+            def write(self, value: str) -> int:
+                raise OSError("stderr closed")
+
+        process = FakeProcess()
+
+        def exit_on_kill(
+            target: FakeProcess, signal_number: int
+        ) -> None:
+            if signal_number == signal.SIGKILL:
+                target.returncode = -signal.SIGKILL
+
+        harness = Harness(
+            [snapshot(50)],
+            process,
+            signal_handler=exit_on_kill,
+        )
+        harness.audit = watchdog.AuditLogger(FailingStderr())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            persistent_path = Path(temp_dir) / "audit.jsonl"
+            harness.audit.open_persistent(persistent_path)
+            result = watchdog._graceful_cleanup(
+                harness.audit,
+                process,
+                snapshot(50),
+                50,
+                "internal_error",
+                watchdog.EXIT_INTERNAL_ERROR,
+                "test cleanup",
+                signal.SIGTERM,
+                0.1,
+                harness.signal_group,
+                harness.group_alive,
+                harness.clock.monotonic,
+                harness.clock.sleep,
+            )
+            harness.audit.close()
+            records = [
+                json.loads(line)
+                for line in persistent_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+
+        self.assertEqual(
+            harness.signals, [signal.SIGTERM, signal.SIGKILL]
+        )
+        self.assertEqual(result, watchdog.EXIT_LEASE_ERROR)
+        self.assertEqual(records[-1]["classification"], "lease_error")
+
+    def test_audit_write_and_close_failures_do_not_bypass_cleanup(
+        self,
+    ) -> None:
+        class FailingPersistent(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.close_called = False
+
+            def write(self, value: str) -> int:
+                raise OSError("persistent write failed")
+
+            def close(self) -> None:
+                if self.close_called:
+                    super().close()
+                    return
+                self.close_called = True
+                raise OSError("persistent close failed")
+
+        process = FakeProcess()
+
+        def exit_on_kill(
+            target: FakeProcess, signal_number: int
+        ) -> None:
+            if signal_number == signal.SIGKILL:
+                target.returncode = -signal.SIGKILL
+
+        harness = Harness(
+            [snapshot(50)],
+            process,
+            signal_handler=exit_on_kill,
+        )
+        persistent = FailingPersistent()
+        harness.audit.persistent_stream = persistent
+        result = watchdog._graceful_cleanup(
+            harness.audit,
+            process,
+            snapshot(50),
+            50,
+            "internal_error",
+            watchdog.EXIT_INTERNAL_ERROR,
+            "test cleanup",
+            signal.SIGTERM,
+            0.1,
+            harness.signal_group,
+            harness.group_alive,
+            harness.clock.monotonic,
+            harness.clock.sleep,
+        )
+
+        self.assertTrue(persistent.close_called)
+        self.assertEqual(
+            harness.signals, [signal.SIGTERM, signal.SIGKILL]
+        )
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertEqual(result, watchdog.EXIT_LEASE_ERROR)
+        self.assertEqual(
+            harness.records()[-1]["classification"], "lease_error"
+        )
+
     def test_final_record_survives_artifact_failures(self) -> None:
         class FailingLease:
             def finalize(self, record: dict[str, Any]) -> None:
@@ -1114,6 +1505,49 @@ class TestWatchdogBehavior(unittest.TestCase):
             str((root / "persistent-audit.jsonl").resolve()),
         )
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux guardian lifecycle",
+    )
+    def test_guardian_preserves_payload_signal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_procfs_fixture(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "--procfs-root",
+                    str(root),
+                    *self._lease_arguments(root),
+                    "--sample-interval-seconds",
+                    "0.01",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,signal,time;"
+                        "time.sleep(0.1);"
+                        "os.kill(os.getpid(),signal.SIGTERM)"
+                    ),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+            records = [
+                json.loads(line)
+                for line in result.stderr.splitlines()
+            ]
+
+        self.assertEqual(result.returncode, 128 + signal.SIGTERM)
+        self.assertEqual(records[-1]["classification"], "child_exit")
+        self.assertEqual(
+            records[-1]["child_returncode"], -signal.SIGTERM
+        )
+        self.assertEqual(records[-1]["child_status"], "signaled")
+
     def test_existing_lease_fails_closed_and_stops_child(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1249,6 +1683,10 @@ class TestWatchdogBehavior(unittest.TestCase):
                 "soft_bytes": watchdog.DEFAULT_SOFT_BYTES,
                 "emergency_bytes": watchdog.DEFAULT_EMERGENCY_BYTES,
                 "strict_ceiling_bytes": watchdog.STRICT_CEILING_BYTES,
+                "grace_seconds": watchdog.DEFAULT_GRACE_SECONDS,
+                "sample_interval_seconds": (
+                    watchdog.DEFAULT_SAMPLE_INTERVAL_SECONDS
+                ),
                 "guardian_pid": guardian_pid,
                 "child_pid": child_pid,
                 "child_process_group_id": guardian_pid,
@@ -1387,6 +1825,18 @@ class TestWatchdogBehavior(unittest.TestCase):
                     with self.assertRaisesRegex(
                         watchdog.LeaseValidationError,
                         "command-line policy",
+                    ):
+                        watchdog.validate_active_lease(
+                            lease_path, **validation_args
+                        )
+
+                with self.subTest("wrong lease timing policy"):
+                    bad_lease = dict(lease)
+                    bad_lease["grace_seconds"] = 29.0
+                    publish_lease(bad_lease)
+                    with self.assertRaisesRegex(
+                        watchdog.LeaseValidationError,
+                        "lease timing policy",
                     ):
                         watchdog.validate_active_lease(
                             lease_path, **validation_args

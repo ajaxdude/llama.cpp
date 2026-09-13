@@ -32,11 +32,14 @@ DEFAULT_EMERGENCY_BYTES = 118 * GIB
 DEFAULT_GRACE_SECONDS = 30.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 1.0
 DEFAULT_HEARTBEAT_MAX_AGE_SECONDS = 5.0
+MAX_GRACE_SECONDS = 30.0
+MAX_SAMPLE_INTERVAL_SECONDS = 1.0
+MAX_HEARTBEAT_MAX_AGE_SECONDS = 5.0
 
 LEASE_FORMAT = "strix-memory-watchdog-lease"
-LEASE_VERSION = 1
+LEASE_VERSION = 2
 HEARTBEAT_FORMAT = "strix-memory-watchdog-heartbeat"
-HEARTBEAT_VERSION = 1
+HEARTBEAT_VERSION = 2
 PR_SET_PDEATHSIG = 1
 LEASE_GUARD_SIGNAL = signal.SIGUSR1
 
@@ -106,8 +109,14 @@ class GuardianProcess:
         return self.process.wait(timeout=timeout)
 
     def pulse(self) -> None:
+        self._write_control(b"P")
+
+    def begin_grace(self) -> None:
+        self._write_control(b"G")
+
+    def _write_control(self, value: bytes) -> None:
         try:
-            os.write(self.pulse_fd, b"\0")
+            os.write(self.pulse_fd, value)
         except BlockingIOError as exc:
             raise ProcessGroupError(
                 "guardian pulse pipe is blocked"
@@ -175,20 +184,32 @@ class WatchdogConfig:
             raise ValueError("emergency threshold must be greater than soft threshold")
         if self.emergency_bytes >= STRICT_CEILING_BYTES:
             raise ValueError("emergency threshold must be below 120 GiB")
-        if not math.isfinite(self.grace_seconds) or self.grace_seconds <= 0:
-            raise ValueError("grace period must be greater than zero")
+        if (
+            not math.isfinite(self.grace_seconds)
+            or self.grace_seconds <= 0
+            or self.grace_seconds > MAX_GRACE_SECONDS
+        ):
+            raise ValueError(
+                "grace period must be greater than zero and at most 30 seconds"
+            )
         if (
             not math.isfinite(self.sample_interval_seconds)
             or self.sample_interval_seconds <= 0
+            or self.sample_interval_seconds > MAX_SAMPLE_INTERVAL_SECONDS
         ):
-            raise ValueError("sample interval must be greater than zero")
+            raise ValueError(
+                "sample interval must be greater than zero and at most 1 second"
+            )
         if (
             not math.isfinite(self.heartbeat_max_age_seconds)
             or self.heartbeat_max_age_seconds
             <= self.sample_interval_seconds
+            or self.heartbeat_max_age_seconds
+            > MAX_HEARTBEAT_MAX_AGE_SECONDS
         ):
             raise ValueError(
-                "heartbeat max age must be greater than sample interval"
+                "heartbeat max age must be greater than sample interval "
+                "and at most 5 seconds"
             )
         lease_paths = (
             self.lease_path,
@@ -348,6 +369,7 @@ def _guardian_main(
     control_fd: int,
     status_fd: int,
     pulse_timeout_seconds: float,
+    grace_timeout_seconds: float,
     command: tuple[str, ...],
 ) -> int:
     if not sys.platform.startswith("linux"):
@@ -386,6 +408,7 @@ def _guardian_main(
         control_fd,
         select.POLLIN | select.POLLHUP | select.POLLERR,
     )
+    current_timeout_seconds = pulse_timeout_seconds
     deadline = time.monotonic() + pulse_timeout_seconds
     while True:
         remaining = max(0.0, deadline - time.monotonic())
@@ -399,16 +422,20 @@ def _guardian_main(
                 pulse = b""
             if not pulse:
                 _kill_own_process_group()
-            deadline = time.monotonic() + pulse_timeout_seconds
+            if b"G" in pulse:
+                current_timeout_seconds = grace_timeout_seconds
+            deadline = time.monotonic() + current_timeout_seconds
         if time.monotonic() >= deadline:
             _kill_own_process_group()
         returncode = payload.poll()
         if returncode is not None:
-            return (
-                128 - returncode
-                if returncode < 0
-                else returncode
-            )
+            if returncode >= 0:
+                return returncode
+            signal_number = -returncode
+            if signal_number not in (signal.SIGKILL, signal.SIGSTOP):
+                signal.signal(signal_number, signal.SIG_DFL)
+            os.kill(os.getpid(), signal_number)
+            return 128 + signal_number
 
 
 def _read_guardian_status(
@@ -450,6 +477,7 @@ def _launch_guardian(
     command: tuple[str, ...],
     environment: dict[str, str],
     pulse_timeout_seconds: float,
+    grace_timeout_seconds: float,
     launch_mask: set[signal.Signals],
 ) -> GuardianProcess:
     control_read, control_write = os.pipe()
@@ -469,6 +497,7 @@ def _launch_guardian(
         str(control_read),
         str(status_write),
         str(pulse_timeout_seconds),
+        str(grace_timeout_seconds),
         "--",
         *command,
     )
@@ -712,6 +741,8 @@ class LeaseManager:
             "soft_bytes": self.config.soft_bytes,
             "emergency_bytes": self.config.emergency_bytes,
             "strict_ceiling_bytes": STRICT_CEILING_BYTES,
+            "grace_seconds": self.config.grace_seconds,
+            "sample_interval_seconds": self.config.sample_interval_seconds,
             "guardian_pid": child.pid,
             "child_pid": payload_pid,
             "child_process_group_id": child.pid,
@@ -955,6 +986,16 @@ def validate_active_lease(
     ):
         raise LeaseValidationError(
             "watchdog command-line policy does not match"
+        )
+    if (
+        lease.get("grace_seconds") != live_config.grace_seconds
+        or lease.get("sample_interval_seconds")
+        != live_config.sample_interval_seconds
+        or lease.get("max_heartbeat_age_seconds")
+        != live_config.heartbeat_max_age_seconds
+    ):
+        raise LeaseValidationError(
+            "watchdog lease timing policy does not match"
         )
     if (
         live_paths is None
@@ -1246,7 +1287,7 @@ def start_process_group_lease_guard(
                 process_procfs_root=process_procfs_root,
             )
             break
-        except LeaseValidationError:
+        except Exception:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
@@ -1272,7 +1313,7 @@ def start_process_group_lease_guard(
                     expected_max_heartbeat_age_seconds=max_age_seconds,
                     process_procfs_root=process_procfs_root,
                 )
-            except LeaseValidationError:
+            except Exception:
                 _kill_own_process_group()
 
     guard = threading.Thread(
@@ -1291,6 +1332,7 @@ class AuditLogger:
         wall_clock: Callable[[], datetime] | None = None,
     ):
         self.stream = stream
+        self.stream_enabled = True
         self.wall_clock = wall_clock
         self.persistent_stream: IO[str] | None = None
         self.lease_manager: LeaseManager | None = None
@@ -1337,15 +1379,21 @@ class AuditLogger:
         }
 
     def close(self) -> None:
-        if self.persistent_stream is not None:
-            self.persistent_stream.close()
-            self.persistent_stream = None
+        persistent_stream = self.persistent_stream
+        self.persistent_stream = None
+        if persistent_stream is not None:
+            try:
+                persistent_stream.close()
+            except (OSError, ValueError):
+                pass
 
     def disable_component(self, component: str) -> None:
         if component == "audit":
             self.close()
         elif component == "lease":
             self.lease_manager = None
+        elif component == "stderr":
+            self.stream_enabled = False
 
     def emit(self, event: str, **fields: object) -> dict[str, object]:
         record = {
@@ -1357,8 +1405,16 @@ class AuditLogger:
             json.dumps(record, sort_keys=True, separators=(",", ":"))
             + "\n"
         )
-        self.stream.write(line)
-        self.stream.flush()
+        if self.stream_enabled:
+            try:
+                self.stream.write(line)
+                self.stream.flush()
+            except (OSError, ValueError) as exc:
+                detail = getattr(exc, "strerror", None) or str(exc)
+                raise ArtifactError(
+                    "stderr",
+                    f"cannot write standard error audit: {detail}",
+                ) from exc
         self.last_record_sha256 = _sha256_bytes(line.encode("utf-8"))
         if self.persistent_stream is not None:
             try:
@@ -1654,6 +1710,11 @@ def _graceful_cleanup(
             process_group_status = signal_group(
                 child.pid, graceful_signal
             )
+            if (
+                isinstance(child, GuardianProcess)
+                and child.poll() is None
+            ):
+                child.begin_grace()
             try:
                 audit.emit(
                     "process_group_signal",
@@ -1675,6 +1736,11 @@ def _graceful_cleanup(
             child.poll()
             if not group_alive(child.pid):
                 break
+            if (
+                isinstance(child, GuardianProcess)
+                and child.poll() is None
+            ):
+                child.pulse()
             sleeper(min(0.05, deadline - monotonic()))
         child.poll()
         if group_alive(child.pid):
@@ -1908,6 +1974,20 @@ def _monitor_child(
                     str(exc),
                 )
             soft_deadline = now + config.grace_seconds
+            if isinstance(child, GuardianProcess):
+                try:
+                    child.begin_grace()
+                except ProcessGroupError as exc:
+                    return _kill_and_finish(
+                        audit,
+                        child,
+                        state.snapshot,
+                        state.peak_used_bytes,
+                        "signal_error",
+                        EXIT_SIGNAL_ERROR,
+                        str(exc),
+                        signal_group,
+                    )
             soft_signal_fields = {
                 **_state_fields(
                     state.snapshot,
@@ -1923,6 +2003,8 @@ def _monitor_child(
         try:
             pulse_guardian()
         except ProcessGroupError as exc:
+            if child.poll() is not None:
+                continue
             return _kill_and_finish(
                 audit,
                 child,
@@ -1950,6 +2032,21 @@ def _monitor_child(
             )
         )
         audit.heartbeat(sample_record)
+        try:
+            pulse_guardian()
+        except ProcessGroupError as exc:
+            if child.poll() is not None:
+                continue
+            return _kill_and_finish(
+                audit,
+                child,
+                state.snapshot,
+                state.peak_used_bytes,
+                "signal_error",
+                EXIT_SIGNAL_ERROR,
+                str(exc),
+                signal_group,
+            )
 
         sleep_seconds = config.sample_interval_seconds
         if soft_deadline is not None:
@@ -2107,6 +2204,7 @@ def run_watchdog(
                     config.command,
                     child_environment,
                     config.heartbeat_max_age_seconds,
+                    config.grace_seconds + 1.0,
                     launch_mask,
                 )
             elif lease_manager is not None:
@@ -2168,8 +2266,7 @@ def run_watchdog(
         )
     except ArtifactError as exc:
         _set_parent_signal_handlers(signal.SIG_IGN)
-        if exc.component == "audit":
-            audit.disable_component(exc.component)
+        audit.disable_component(exc.component)
         if child is None:
             return _emit_final(
                 audit,
@@ -2369,14 +2466,15 @@ def parse_args(argv: Sequence[str]) -> WatchdogConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = tuple(argv if argv is not None else sys.argv[1:])
     if arguments and arguments[0] == "--internal-guardian":
-        if len(arguments) < 6 or arguments[4] != "--":
+        if len(arguments) < 7 or arguments[5] != "--":
             return EXIT_LAUNCH_ERROR
         try:
             return _guardian_main(
                 int(arguments[1]),
                 int(arguments[2]),
                 _positive_float(arguments[3]),
-                tuple(arguments[5:]),
+                _positive_float(arguments[4]),
+                tuple(arguments[6:]),
             )
         except (OSError, ValueError):
             return EXIT_LAUNCH_ERROR

@@ -21,7 +21,7 @@ The wrapper performs these checks and actions:
 
 The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 120 GiB ceiling. The default sample interval is one second. This margin cannot guarantee the ceiling for a workload that can allocate more than 2 GiB between samples. Lower `--emergency-gib` or shorten `--sample-interval-seconds` for such a workload.
 
-Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB.
+Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB. The fail-closed timing bounds are a maximum 30-second grace, maximum one-second sample interval, and maximum five-second heartbeat age.
 
 The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Signal records are written immediately after each process-group signal. Child standard input, standard output, and standard error are inherited unchanged.
 
@@ -40,28 +40,28 @@ Use all three artifact options together when another process must prove that it 
 
 The watchdog creates and exclusively locks the persistent audit before launch. It then starts an internal guardian as the new session and process-group leader; the guardian starts the supplied command in that same group without inheriting the private control pipe. After the guardian reports the payload PID, the watchdog atomically creates the lease and heartbeat. Existing artifact paths are rejected rather than overwritten. The payload receives the resolved paths through `STRIX_MEMORY_WATCHDOG_LEASE_PATH`, `STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH`, and `STRIX_MEMORY_WATCHDOG_AUDIT_PATH`. It also receives `STRIX_MEMORY_WATCHDOG_HEARTBEAT_MAX_AGE_SECONDS`.
 
-The child can run before the first atomic lease rename. A matching preflight must retry the inherited lease path for a bounded interval and fail closed if a complete valid lease does not appear. It must not accept a lease path supplied separately by the operator.
+The child can run before the first atomic lease rename. A matching preflight must retry the inherited lease path for a bounded interval and fail closed if a complete valid lease does not appear. It must not accept a lease path supplied separately by the operator. Consumers must require version 2; version 1 does not describe the guardian topology or timing policy and is rejected.
 
-Lease format `strix-memory-watchdog-lease`, version 1, contains:
+Lease format `strix-memory-watchdog-lease`, version 2, contains:
 
 - `lease_id` and active/final `state`
 - `watchdog_pid`, `watchdog_start_time_utc`, Linux `watchdog_start_time_ticks`, `watchdog_executable_path`, `watchdog_command_sha256`, `watchdog_script_path`, and `watchdog_script_sha256`
-- exact `soft_bytes`, `emergency_bytes`, and `strict_ceiling_bytes`
+- exact `soft_bytes`, `emergency_bytes`, `strict_ceiling_bytes`, `grace_seconds`, and `sample_interval_seconds`
 - `procfs_root`
 - `guardian_pid`, payload `child_pid`, `child_process_group_id`, `command`, and `child_command_sha256`
 - `heartbeat_path`, `max_heartbeat_age_seconds`, and `audit_path`
 - device, inode, owner, and mode identity for atomic JSON artifacts, plus the watchdog-held audit descriptor identity
 - the authoritative `final` audit record after termination
 
-Heartbeat format `strix-memory-watchdog-heartbeat`, version 1, binds `lease_id`, watchdog PID/start ticks, child PID/process group, sequence, state, and update timestamps. Every memory sample first checks swap and memory thresholds, pulses the guardian through the private nonblocking pipe, then atomically replaces the heartbeat with the complete sample audit record and its persistent-audit record hash. A blocked audit or heartbeat write cannot delay the emergency signal. A final heartbeat and final lease update remain on disk with the persistent JSONL audit; the watchdog does not delete this evidence.
+Heartbeat format `strix-memory-watchdog-heartbeat`, version 2, binds `lease_id`, watchdog PID/start ticks, child PID/process group, sequence, state, and update timestamps. Every memory sample first checks swap and memory thresholds, pulses the guardian through the private nonblocking pipe, then atomically replaces the heartbeat with the complete sample audit record and its persistent-audit record hash. It pulses again after persistence succeeds. A blocked audit or heartbeat write cannot delay the emergency signal; if persistence stalls past the guardian deadline, the guardian fails closed. A final heartbeat and final lease update remain on disk with the persistent JSONL audit; the watchdog does not delete this evidence.
 
-The guardian uses Linux `PR_SET_PDEATHSIG` with a parent-race check. It kills its process group on watchdog death, control-pipe EOF/error, or a missed pulse deadline, including a stopped or wedged watchdog. The payload must call `start_process_group_lease_guard()` before it starts exporter descendants. This validates the lease with bounded startup retries, arms a second parent-death link to the guardian, and starts a thread that kills the process group if the watchdog evidence becomes stale or invalid.
+The guardian uses Linux `PR_SET_PDEATHSIG` with a parent-race check. It kills its process group on watchdog death, control-pipe EOF/error, or a missed pulse deadline, including a stopped or wedged watchdog. When the watchdog sends a graceful signal, it also puts the guardian into a bounded grace mode and continues private pulses while it waits. This lets the watchdog own the configured grace deadline and record any `SIGKILL` escalation instead of letting the shorter heartbeat deadline preempt cleanup. The payload must call `start_process_group_lease_guard()` before it starts exporter descendants. This validates the lease with bounded startup retries, arms a second parent-death link to the guardian, and starts a thread that kills the process group if any validation or artifact operation fails or the watchdog evidence becomes stale.
 
 A matching Linux preflight must verify all of the following:
 
 - The inherited lease, heartbeat, and audit paths match the paths inside the lease.
 - `/proc/<watchdog_pid>/exe` is the exact expected Python executable and argv position 1 is the exact repository watchdog script. `-c`, `-m`, helper-script, inert-argument, and interpreter-option substitutions are rejected.
-- The watchdog command line itself supplies the exact 116/118 GiB thresholds, `/proc`, inherited artifact paths, and command after `--`; the lease cannot override those expectations.
+- The watchdog command line itself supplies the exact 116/118 GiB thresholds, `/proc`, inherited artifact paths, timing policy, and command after `--`; the lease cannot override those expectations.
 - `/proc/<watchdog_pid>/stat` start ticks and `/proc/<watchdog_pid>/cmdline` SHA-256 match the lease and remain stable across validation. A pidfd is held during validation when Linux provides `pidfd_open`.
 - The topology is watchdog parent -> guardian process-group leader -> payload child. The current process must be inside `child_process_group_id`.
 - The command identity is expected, the procfs root is `/proc`, and thresholds are exactly 116 GiB soft, 118 GiB emergency, and 120 GiB strict ceiling for the final run.
