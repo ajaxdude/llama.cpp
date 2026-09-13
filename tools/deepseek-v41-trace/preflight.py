@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from trace_format import TraceError, validate_watchdog_event
+from trace_format import NO_EXTERNAL_STATE_STORAGE, TraceError, validate_watchdog_event
 
 FORBIDDEN_ROOT = Path("/mnt/bigspace")
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
@@ -58,6 +58,35 @@ def resolved(path: Path) -> Path:
     return path.expanduser().resolve()
 
 
+def require_no_symlink_components(path: Path, label: str) -> Path:
+    absolute = path.expanduser().absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise PreflightError(f"{label} must not be a symlink or contain symlink components")
+        if not current.exists():
+            break
+    return absolute
+
+
+def reject_forbidden_path(
+        path: Path,
+        label: str,
+        forbidden_root: Path = FORBIDDEN_ROOT) -> Path:
+    absolute = path.expanduser().absolute()
+    try:
+        absolute.relative_to(forbidden_root)
+    except ValueError:
+        return absolute
+    raise PreflightError(f"{label} must not use /mnt/bigspace: {absolute}")
+
+
+def require_safe_tmpdir_path(path: Path) -> Path:
+    lexical_path = reject_forbidden_path(path, "TMPDIR")
+    return require_no_symlink_components(lexical_path, "TMPDIR")
+
+
 def _decode_mount_field(value: str) -> str:
     return re.sub(
         r"\\([0-7]{3})",
@@ -83,13 +112,7 @@ def storage_attestation(
         sys_dev_block_root: Path = Path("/sys/dev/block"),
         sys_class_block_root: Path = Path("/sys/class/block"),
         forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
-    lexical_path = path.expanduser().absolute()
-    try:
-        lexical_path.relative_to(forbidden_root)
-    except ValueError:
-        pass
-    else:
-        raise PreflightError(f"{label} must not use /mnt/bigspace: {lexical_path}")
+    lexical_path = reject_forbidden_path(path, label, forbidden_root)
     path = resolved(lexical_path)
     try:
         path.relative_to(forbidden_root)
@@ -230,13 +253,7 @@ def darwin_storage_attestation(
         *,
         disk_info: Callable[[Path], dict[str, object]] = _diskutil_info,
         forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
-    lexical_path = path.expanduser().absolute()
-    try:
-        lexical_path.relative_to(forbidden_root)
-    except ValueError:
-        pass
-    else:
-        raise PreflightError(f"{label} must not use /mnt/bigspace: {lexical_path}")
+    lexical_path = reject_forbidden_path(path, label, forbidden_root)
     path = resolved(lexical_path)
     try:
         path.relative_to(forbidden_root)
@@ -265,8 +282,8 @@ def darwin_storage_attestation(
             raise PreflightError(f"{label} {name} cannot be resolved: {path}")
     if not mount_point.startswith("/"):
         raise PreflightError(f"{label} mount point is invalid: {mount_point}")
-    if bus_protocol.lower() in {"network", "virtual", "disk image"}:
-        raise PreflightError(f"{label} bus protocol is not local: {bus_protocol}")
+    if bus_protocol.lower() not in {"nvme", "apple fabric"}:
+        raise PreflightError(f"{label} storage is not NVMe-backed: {bus_protocol}")
     try:
         filesystem_device = os.stat(existing).st_dev
         if filesystem_device != os.stat(mount_point).st_dev:
@@ -971,13 +988,11 @@ def run_strix_preflight(
     tmpdir_value = os.environ.get("TMPDIR")
     if not tmpdir_value:
         raise PreflightError("TMPDIR is required for NVMe-only correctness runs")
-    tmpdir_input = Path(tmpdir_value).expanduser().absolute()
-    if tmpdir_input.is_symlink():
-        raise PreflightError("TMPDIR must not be a symlink")
-    tmpdir = resolved(tmpdir_input)
+    tmpdir_input = require_safe_tmpdir_path(Path(tmpdir_value))
+    tmp_storage = storage_attestation(tmpdir_input, "temporary directory")
+    tmpdir = _attested_resolved_path(tmp_storage, "temporary directory")
     if not tmpdir.is_dir() or not os.access(tmpdir, os.W_OK | os.X_OK):
         raise PreflightError("TMPDIR must be an existing writable directory")
-    tmp_storage = storage_attestation(tmpdir, "temporary directory")
     model = _attested_resolved_path(model_storage, "model")
     prompt = _attested_resolved_path(prompt_storage, "prompt")
     output = _attested_resolved_path(output_storage, "trace output")
@@ -1005,6 +1020,7 @@ def run_strix_preflight(
         "watchdog": watchdog,
         "active_workloads": [],
         "environment": {"HIP_LAUNCH_BLOCKING": "1"},
+        "storage_policy": dict(NO_EXTERNAL_STATE_STORAGE),
         "storage": {
             "model": model_storage,
             "prompt": prompt_storage,
@@ -1044,13 +1060,11 @@ def run_oracle_preflight(
     tmpdir_value = os.environ.get("TMPDIR")
     if not tmpdir_value:
         raise PreflightError("TMPDIR is required for ds4 oracle correctness runs")
-    tmpdir_input = Path(tmpdir_value).expanduser().absolute()
-    if tmpdir_input.is_symlink():
-        raise PreflightError("TMPDIR must not be a symlink")
-    tmpdir = resolved(tmpdir_input)
+    tmpdir_input = require_safe_tmpdir_path(Path(tmpdir_value))
+    tmp_storage = darwin_storage_attestation(tmpdir_input, "temporary directory", disk_info=disk_info)
+    tmpdir = _attested_resolved_path(tmp_storage, "temporary directory")
     if not tmpdir.is_dir() or not os.access(tmpdir, os.W_OK | os.X_OK):
         raise PreflightError("TMPDIR must be an existing writable directory")
-    tmp_storage = darwin_storage_attestation(tmpdir, "temporary directory", disk_info=disk_info)
     model = _attested_resolved_path(model_storage, "model")
     prompt = _attested_resolved_path(prompt_storage, "prompt")
     output = _attested_resolved_path(output_storage, "trace output")
@@ -1103,6 +1117,7 @@ def run_oracle_preflight(
         "accelerator": accelerator,
         "active_workloads": [],
         "environment": {},
+        "storage_policy": dict(NO_EXTERNAL_STATE_STORAGE),
         "storage": {
             "model": model_storage,
             "prompt": prompt_storage,
@@ -1147,13 +1162,10 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
             events = []
             for line_number, line in enumerate(audit_text.splitlines(), start=1):
                 try:
-                    event = strict_json_loads(line)
-                except json.JSONDecodeError as error:
+                    event = validate_watchdog_event(strict_json_loads(line))
+                except (PreflightError, TraceError) as error:
                     raise PreflightError(
                         f"watchdog audit line {line_number} is invalid while snapshotting: {error}") from error
-                if not isinstance(event, dict) or not isinstance(event.get("event"), str):
-                    raise PreflightError(
-                        f"watchdog audit line {line_number} is not an event while snapshotting")
                 events.append(event)
             if not events:
                 raise PreflightError("watchdog audit snapshot is empty")
@@ -1171,6 +1183,7 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
         }
         if key == "memory":
             value["storage"] = audit["storage"]
+            value["storage_policy"] = audit["storage_policy"]
             value["accelerator"] = audit["accelerator"]
             if "host" in audit:
                 value["host"] = audit["host"]
@@ -1322,6 +1335,9 @@ def validate_prompt_provenance(
     builder_sha256 = record.get("builder_sha256", "")
     if not isinstance(builder_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", builder_sha256) is None:
         raise PreflightError("prompt provenance builder SHA-256 is invalid")
+    required_keys = set(expected) | {"builder_sha256"}
+    if set(record) != required_keys:
+        raise PreflightError("prompt provenance fields are invalid")
     return {"path": str(path), "bytes": data, "record": record}
 
 

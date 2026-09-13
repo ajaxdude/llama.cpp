@@ -104,10 +104,27 @@ static inline fs::path existing_ancestor(const fs::path & path) {
     return fs::canonical(current);
 }
 
-static inline void require_usable_directory(const fs::path & path, const char * label) {
-    if (fs::is_symlink(path)) {
-        throw std::runtime_error(std::string(label) + " must not be a symlink");
+static inline void reject_symlink_components(const fs::path & path, const char * label) {
+    fs::path current;
+    for (const fs::path & part : fs::absolute(path)) {
+        current /= part;
+        std::error_code error;
+        const fs::file_status status = fs::symlink_status(current, error);
+        if (!error && fs::is_symlink(status)) {
+            throw std::runtime_error(std::string(label) + " must not be a symlink or contain symlink components");
+        }
+        if (error == std::errc::no_such_file_or_directory) {
+            break;
+        }
+        if (error) {
+            throw std::runtime_error(
+                std::string(label) + " symlink status cannot be read: " + error.message());
+        }
     }
+}
+
+static inline void require_usable_directory(const fs::path & path, const char * label) {
+    reject_symlink_components(path, label);
     if (!fs::is_directory(path)) {
         throw std::runtime_error(std::string(label) + " must be an existing directory");
     }
@@ -132,6 +149,7 @@ static inline storage_attestation require_nvme_path(
     if (path_is_within(absolute, forbidden)) {
         throw std::runtime_error(std::string(label) + " must not use /mnt/bigspace");
     }
+    reject_symlink_components(path, label);
     const fs::path resolved = fs::weakly_canonical(absolute);
     const fs::path existing = existing_ancestor(resolved);
     if (path_is_within(resolved, forbidden)) {

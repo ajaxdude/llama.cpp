@@ -41,6 +41,10 @@ extern "C" {
 #include <unistd.h>
 #endif
 
+#if !defined(_WIN32)
+#include <sys/utsname.h>
+#endif
+
 namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 
@@ -340,6 +344,12 @@ static void validate_watchdog(const json & data) {
 }
 #endif
 
+static void bind_memory_audit_metadata(json & result, const json & audit) {
+    result["accelerator"] = audit.value("accelerator", json::object());
+    result["storage"] = audit.value("storage", json::object());
+    result["storage_policy"] = audit.value("storage_policy", json::object());
+}
+
 static json audit_reference(const char * environment_name, const char * expected_kind) {
     const fs::path path = required_environment(environment_name);
     dsv41::require_nvme_path(path, "audit");
@@ -377,8 +387,7 @@ static json audit_reference(const char * environment_name, const char * expected
     if (std::string(expected_kind) == "watchdog") {
         result["data"] = audit["data"];
     } else if (std::string(expected_kind) == "memory") {
-        result["accelerator"] = audit.value("accelerator", json::object());
-        result["storage"] = audit.value("storage", json::object());
+        bind_memory_audit_metadata(result, audit);
     }
     return result;
 }
@@ -620,6 +629,28 @@ static std::vector<std::string> command_line(int argc, char ** argv) {
     return result;
 }
 
+static std::string command_line_json(int argc, char ** argv) {
+    return json(command_line(argc, argv)).dump();
+}
+
+static bool flash_attention_enabled(enum llama_flash_attn_type value) {
+    return value == LLAMA_FLASH_ATTN_TYPE_ENABLED;
+}
+
+static std::string runtime_system_info(const common_params & params) {
+#if defined(_WIN32)
+    const std::string platform = "Windows";
+#else
+    struct utsname info = {};
+    if (uname(&info) != 0) {
+        throw std::runtime_error("cannot query operating system identity");
+    }
+    const std::string platform =
+        std::string(info.sysname) + " " + info.release + " " + info.machine;
+#endif
+    return platform + "; " + common_params_get_system_info(params);
+}
+
 static json accelerator_json(const dsv41::accelerator_attestation & accelerator) {
     return {
         {"format", "dsv41-accelerator-attestation"},
@@ -658,9 +689,42 @@ static json storage_json(const dsv41::storage_attestation & storage) {
     };
 }
 
+static json storage_policy_json() {
+    return {
+        {"format", "dsv41-state-storage-policy"},
+        {"version", 1},
+        {"expert_cache", "memory-resident"},
+        {"kv_cache", "memory-resident"},
+        {"external_cache_paths", json::array()},
+        {"external_state_paths", json::array()},
+    };
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
+        if (argc >= 2 && std::string(argv[1]) == "--dsv41-manifest-type-probe") {
+            common_params params;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            json probe = {
+                {"environment", {
+                    {"system_info", runtime_system_info(params)},
+                    {"command", command_line_json(argc, argv)},
+                }},
+                {"config", {
+                    {"flash_attention", flash_attention_enabled(params.flash_attn_type)},
+                }},
+            };
+            json audit_reference_probe;
+            bind_memory_audit_metadata(audit_reference_probe, {
+                {"accelerator", json::object()},
+                {"storage", json::object()},
+                {"storage_policy", storage_policy_json()},
+            });
+            probe["storage_policy"] = audit_reference_probe["storage_policy"];
+            std::cout << probe.dump() << '\n';
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {
             common_init();
             ggml_backend_load_all();
@@ -711,6 +775,9 @@ int main(int argc, char ** argv) {
         const json memory_audit = audit_reference("DSV41_TRACE_MEMORY_AUDIT", "memory");
         if (memory_audit.value("accelerator", json::object()) != accelerator_json(configured_accelerator)) {
             throw std::runtime_error("preflight accelerator audit does not match the selected execution device");
+        }
+        if (memory_audit.value("storage_policy", json::object()) != storage_policy_json()) {
+            throw std::runtime_error("preflight external cache/state storage policy is invalid");
         }
         const json audited_storage = memory_audit.value("storage", json::object());
         if (audited_storage.value("model", json::object()) != storage_json(model_storage) ||
@@ -803,6 +870,7 @@ int main(int argc, char ** argv) {
                 {"repository", audited_storage["repository"].value("resolved_path", "")},
                 {"temporary_directory", temporary_storage.resolved_path.string()},
             }},
+            {"storage_policy", storage_policy_json()},
             {"config", {
                 {"context", llama_n_ctx(ctx)},
                 {"batch", params.n_batch},
@@ -813,7 +881,7 @@ int main(int argc, char ** argv) {
                 {"decode_steps", params.n_predict},
                 {"kv_type_k", ggml_type_name(params.cache_type_k)},
                 {"kv_type_v", ggml_type_name(params.cache_type_v)},
-                {"flash_attention", static_cast<int>(params.flash_attn_type)},
+                {"flash_attention", flash_attention_enabled(params.flash_attn_type)},
                 {"gpu_layers", params.n_gpu_layers},
                 {"load_mode", static_cast<int>(params.load_mode)},
                 {"expert_cache_slots", params.expert_cache_slots},
@@ -845,8 +913,8 @@ int main(int argc, char ** argv) {
                 {"logits", "byte-identical-f32"},
             }},
             {"environment", {
-                {"system_info", common_params_get_system_info(params)},
-                {"command", command_line(argc, argv)},
+                {"system_info", runtime_system_info(params)},
+                {"command", command_line_json(argc, argv)},
             }},
             {"audits", {
                 {"memory", memory_audit},

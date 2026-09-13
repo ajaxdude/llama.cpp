@@ -32,7 +32,7 @@ static void require_failure(Function function, const std::string & expected) {
 }
 
 int main() {
-    const fs::path root = fs::temp_directory_path() /
+    const fs::path root = fs::canonical(fs::temp_directory_path()) /
         ("dsv41-host-attestation-" +
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
@@ -63,6 +63,22 @@ int main() {
         require_failure(
             [&]() {
                 dsv41::require_usable_directory(root / "tmp-link", "TMPDIR");
+            },
+            "must not be a symlink");
+        require_failure(
+            [&]() {
+                dsv41::require_usable_directory(fs::path((root / "tmp-link").string() + "/"), "TMPDIR");
+            },
+            "must not be a symlink");
+        require_failure(
+            [&]() {
+                dsv41::require_usable_directory(root / "tmp-link" / ".", "TMPDIR");
+            },
+            "must not be a symlink");
+        fs::create_directories(btrfs / "child");
+        require_failure(
+            [&]() {
+                dsv41::require_usable_directory(root / "tmp-link" / "child", "TMPDIR");
             },
             "must not be a symlink");
 
@@ -110,6 +126,13 @@ int main() {
         require_failure(
             [&]() {
                 dsv41::require_nvme_path(
+                    root / "tmp-link" / "child", "symlink traversal", mountinfo,
+                    sys / "dev" / "block", sys / "class" / "block");
+            },
+            "must not be a symlink");
+        require_failure(
+            [&]() {
+                dsv41::require_nvme_path(
                     rotating / "data", "rotating", mountinfo, sys / "dev" / "block", sys / "class" / "block");
             },
             "non-rotational");
@@ -137,7 +160,7 @@ int main() {
                     xfs / "escape" / "data", "symlink escape", mountinfo, sys / "dev" / "block",
                     sys / "class" / "block");
             },
-            "local block device");
+            "must not be a symlink");
         require_failure(
             [&]() {
                 dsv41::require_nvme_path(

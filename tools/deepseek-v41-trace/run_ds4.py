@@ -24,6 +24,7 @@ from trace_format import (
     ADMITTED_UBATCH,
     CORPUS_SHA256,
     MODEL_SHA256,
+    NO_EXTERNAL_STATE_STORAGE,
     TraceBundle,
     TraceError,
     canonical_json,
@@ -185,6 +186,12 @@ def bind_oracle_attestation(
     if "paths" in manifest and manifest["paths"] != paths:
         raise PreflightError("ds4 trace execution paths differ from preflight")
     manifest["paths"] = paths
+    storage_policy = audit.get("storage_policy")
+    if storage_policy != NO_EXTERNAL_STATE_STORAGE:
+        raise PreflightError("ds4 external cache/state storage policy is invalid")
+    if "storage_policy" in manifest and manifest["storage_policy"] != storage_policy:
+        raise PreflightError("ds4 trace external cache/state storage policy differs from preflight")
+    manifest["storage_policy"] = storage_policy
     host = audit.get("host")
     if not isinstance(host, dict):
         raise PreflightError("ds4 host attestation is missing")

@@ -58,16 +58,23 @@ def prepare_prompt(
     if result.returncode != 0:
         raise RuntimeError(f"prompt builder failed: {result.stderr.strip()}")
     try:
-        record = strict_json_loads(result.stdout)
+        native_record = strict_json_loads(result.stdout)
     except TraceError as error:
         raise RuntimeError(f"prompt builder returned invalid JSON: {error}") from error
-    if record.get("actual_tokens") != target_tokens:
+    if not isinstance(native_record, dict) or set(native_record) != {
+            "target_tokens", "actual_tokens", "byte_count", "add_bos", "temporary_directory"}:
+        raise RuntimeError("prompt builder returned an invalid result schema")
+    if native_record.get("target_tokens") != target_tokens or native_record.get("actual_tokens") != target_tokens:
         raise RuntimeError("prompt builder did not produce the requested token count")
-    temporary_directory = record.pop("temporary_directory", None)
+    if type(native_record.get("byte_count")) is not int or native_record["byte_count"] != output.stat().st_size:
+        raise RuntimeError("prompt builder byte count does not match its output")
+    if type(native_record.get("add_bos")) is not bool:
+        raise RuntimeError("prompt builder add_bos result is invalid")
+    temporary_directory = native_record["temporary_directory"]
     expected_temporary_directory = os.environ.get("TMPDIR")
     if not expected_temporary_directory or temporary_directory != str(resolved(Path(expected_temporary_directory))):
         raise RuntimeError("prompt builder did not attest the selected temporary directory")
-    record.update({
+    record = {
         "format": "dsv41-prompt-provenance",
         "version": 1,
         "corpus_name": corpus_name,
@@ -76,7 +83,9 @@ def prepare_prompt(
         "prompt_sha256": sha256_file(output),
         "prompt_byte_count": output.stat().st_size,
         "builder_sha256": sha256_file(builder),
-    })
+        "target_tokens": target_tokens,
+        "actual_tokens": target_tokens,
+    }
     provenance_path = output.with_suffix(output.suffix + ".provenance.json")
     provenance_path.write_text(
         json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",

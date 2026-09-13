@@ -3,6 +3,8 @@
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import struct
 import sys
 import tempfile
@@ -20,6 +22,7 @@ trace = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(trace)
 import run_llama
 import run_ds4
+import run_matrix
 import preflight
 import verify_ds4_anchors
 
@@ -203,6 +206,7 @@ AUDIT_RECORDS = {
         "environment": {"HIP_LAUNCH_BLOCKING": "1"},
         "data": {"mem_total_bytes": 128, "mem_available_bytes": 64, "mem_used_bytes": 64},
         "storage": STORAGE_ATTESTATION,
+        "storage_policy": json.loads(json.dumps(trace.NO_EXTERNAL_STATE_STORAGE)),
         "accelerator": dict(ACCELERATOR_ATTESTATION),
     },
     "swap": {
@@ -219,8 +223,10 @@ AUDIT_RECORDS = {
             "format": trace.WATCHDOG_LEASE_FORMAT,
             "version": trace.WATCHDOG_VERSION,
             "lease_id": "1" * 32,
+            "state": "active",
             "lease_path": "/run/user/123/watchdog.lease",
             "watchdog_pid": 123,
+            "watchdog_start_time_utc": "1970-01-01T00:00:01.000Z",
             "watchdog_start_time_ticks": 456,
             "watchdog_command": "python3 /repo/scripts/strix_memory_watchdog.py",
             "watchdog_command_sha256": "7" * 64,
@@ -268,6 +274,7 @@ DS4_AUDIT_RECORDS = {
             "mem_used_bytes": 128 * 1024 * 1024 * 1024,
         },
         "storage": DS4_STORAGE_ATTESTATION,
+        "storage_policy": json.loads(json.dumps(trace.NO_EXTERNAL_STATE_STORAGE)),
         "accelerator": dict(METAL_ACCELERATOR_ATTESTATION),
         "host": DS4_HOST_ATTESTATION,
     },
@@ -400,6 +407,7 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 label: record["resolved_path"]
                 for label, record in storage.items()
         },
+        "storage_policy": json.loads(json.dumps(trace.NO_EXTERNAL_STATE_STORAGE)),
         "comparison": {
             "tokens": "exact",
             "engram_rows": "exact",
@@ -1049,7 +1057,7 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_darwin_storage_and_host_preflight_are_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             for name in ("repo", "ds4", "tmp", "output"):
                 (root / name).mkdir()
             model = root / "model.gguf"
@@ -1125,7 +1133,8 @@ class TraceFormatTests(unittest.TestCase):
                     ({"SolidState": False}, "internal non-rotational"),
                     ({"VolumeNetwork": True}, "local storage"),
                     ({"DiskImage": True}, "local storage"),
-                    ({"BusProtocol": "Network"}, "bus protocol")):
+                    ({"BusProtocol": "Network"}, "NVMe-backed"),
+                    ({"BusProtocol": "SATA"}, "NVMe-backed")):
                 def invalid_info(path: Path, mutation: dict[str, object] = mutation) -> dict[str, object]:
                     result = disk_info(path)
                     result.update(mutation)
@@ -1169,6 +1178,21 @@ class TraceFormatTests(unittest.TestCase):
         self.assertEqual(result["_dsv41_mount_point"], "/System/Volumes/Data")
         self.assertEqual({key: value for key, value in result.items() if not key.startswith("_")}, disk_info)
 
+    def test_tmpdir_rejects_symlink_components(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            actual = root / "actual"
+            child = actual / "child"
+            child.mkdir(parents=True)
+            link = root / "link"
+            link.symlink_to(actual, target_is_directory=True)
+            for path in (link, Path(str(link) + "/"), link / ".", link / "child"):
+                with self.subTest(path=path), self.assertRaisesRegex(
+                        preflight.PreflightError, "symlink"):
+                    preflight.require_safe_tmpdir_path(path)
+            with self.assertRaisesRegex(preflight.PreflightError, "must not use /mnt/bigspace"):
+                preflight.require_safe_tmpdir_path(Path("/mnt/bigspace/escape"))
+
     def test_preflight_requires_explicit_nvme_tmpdir(self) -> None:
         with mock.patch.object(
                 preflight,
@@ -1184,7 +1208,8 @@ class TraceFormatTests(unittest.TestCase):
                         busy_patterns=[],
                     )
             with tempfile.TemporaryDirectory() as temp:
-                missing = Path(temp) / "missing"
+                root = Path(temp).resolve()
+                missing = root / "missing"
                 with mock.patch.dict(
                         preflight.os.environ,
                         {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(missing)},
@@ -1197,22 +1222,23 @@ class TraceFormatTests(unittest.TestCase):
                             repo=Path("/home/repo"),
                             busy_patterns=[],
                         )
-                actual = Path(temp) / "actual"
-                actual.mkdir()
-                link = Path(temp) / "link"
+                actual = root / "actual"
+                (actual / "child").mkdir(parents=True)
+                link = root / "link"
                 link.symlink_to(actual, target_is_directory=True)
-                with mock.patch.dict(
-                        preflight.os.environ,
-                        {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(link)},
-                        clear=True):
-                    with self.assertRaisesRegex(preflight.PreflightError, "must not be a symlink"):
-                        preflight.run_strix_preflight(
-                            model=Path("/home/model.gguf"),
-                            prompt=Path("/home/prompt.txt"),
-                            output=Path("/home/trace"),
-                            repo=Path("/home/repo"),
-                            busy_patterns=[],
-                        )
+                for path in (link, Path(str(link) + "/"), link / ".", link / "child"):
+                    with self.subTest(path=path), mock.patch.dict(
+                            preflight.os.environ,
+                            {"HIP_LAUNCH_BLOCKING": "1", "TMPDIR": str(path)},
+                            clear=True):
+                        with self.assertRaisesRegex(preflight.PreflightError, "must not be a symlink"):
+                            preflight.run_strix_preflight(
+                                model=Path("/home/model.gguf"),
+                                prompt=Path("/home/prompt.txt"),
+                                output=Path("/home/trace"),
+                                repo=Path("/home/repo"),
+                                busy_patterns=[],
+                            )
 
     def test_watchdog_lease_rejects_arbitrary_heartbeat_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1591,6 +1617,18 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(trace.TraceError, "missing accelerator"):
                 trace.TraceBundle(root)
 
+    def test_rejects_ds4_sata_storage_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            for phase in ("pre", "post"):
+                record = json.loads(json.dumps(DS4_AUDIT_RECORDS["memory"]))
+                record["storage"]["model"]["bus_protocol"] = "SATA"
+                replace_audit_record(root, phase, "memory", record)
+            with self.assertRaisesRegex(trace.TraceError, "not NVMe-backed"):
+                trace.TraceBundle(root)
+
     def test_rejects_cross_runtime_host_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
@@ -1686,6 +1724,131 @@ class TraceFormatTests(unittest.TestCase):
                 add_required_events(writer)
             with self.assertRaisesRegex(trace.TraceError, "environment is not macOS"):
                 trace.TraceBundle(root)
+
+    def test_native_exporter_manifest_field_types_validate(self) -> None:
+        binary = Path(os.environ.get(
+            "DSV41_NATIVE_TRACE_BINARY",
+            Path(__file__).parents[1] / "build-harness" / "bin" / "llama-deepseek-v41-trace",
+        ))
+        if not binary.is_file():
+            self.skipTest("native trace exporter is not built")
+        command = [str(binary), "--dsv41-manifest-type-probe", "argument with space"]
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        native = trace.strict_json_loads(result.stdout)
+        self.assertIsInstance(native["environment"]["command"], str)
+        self.assertEqual(json.loads(native["environment"]["command"]), command)
+        self.assertIs(native["config"]["flash_attention"], True)
+        self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("llama.cpp")
+            if sys.platform.startswith("linux"):
+                trace_manifest["environment"]["system_info"] = native["environment"]["system_info"]
+            trace_manifest["environment"]["command"] = native["environment"]["command"]
+            trace_manifest["config"]["flash_attention"] = native["config"]["flash_attention"]
+            trace_manifest["storage_policy"] = native["storage_policy"]
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            trace.TraceBundle(root)
+
+    def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            builder = root / "prompt-builder"
+            model = root / "model.gguf"
+            corpus = root / "corpus.txt"
+            output = root / "prompt.txt"
+            tmpdir = root / "tmp"
+            builder.write_bytes(b"builder")
+            model.write_bytes(b"model")
+            corpus.write_bytes(b"corpus")
+            tmpdir.mkdir()
+
+            def run_builder(command, **_kwargs):
+                output.write_bytes(b"prompt")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps({
+                        "target_tokens": 2,
+                        "actual_tokens": 2,
+                        "byte_count": 6,
+                        "add_bos": True,
+                        "temporary_directory": str(tmpdir.resolve()),
+                    }),
+                    "",
+                )
+
+            with mock.patch.dict(os.environ, {"TMPDIR": str(tmpdir)}, clear=True), mock.patch.object(
+                    run_matrix.subprocess, "run", side_effect=run_builder), mock.patch.object(
+                    sys, "stderr", io.StringIO()):
+                result = run_matrix.prepare_prompt(
+                    builder=builder,
+                    model=model,
+                    corpus=corpus,
+                    corpus_name="correctness-prose.txt",
+                    corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
+                    output=output,
+                    target_tokens=2,
+                )
+            provenance_path = Path(result["provenance_path"])
+            provenance = trace.strict_json_loads(provenance_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                set(provenance),
+                {
+                    "format", "version", "corpus_name", "corpus_sha256", "model_sha256",
+                    "prompt_sha256", "prompt_byte_count", "builder_sha256", "target_tokens", "actual_tokens",
+                },
+            )
+            preflight.validate_prompt_provenance(
+                provenance_path,
+                prompt=output,
+                corpus_name="correctness-prose.txt",
+                corpus_sha256=trace.CORPUS_SHA256["correctness-prose.txt"],
+                model_sha256=trace.MODEL_SHA256,
+                target_tokens=2,
+                path_resolver=lambda path, _label: path.resolve(),
+            )
+
+    def test_rejects_cross_runtime_and_unknown_audit_envelopes(self) -> None:
+        for mutation, message in (
+                (lambda value: value["audits"].update({"unknown": {}}), "audit envelope"),
+                (lambda value: value["audits"]["pre"].update({"watchdog": {}}), "audit kinds")):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                trace_manifest = manifest("ds4")
+                mutation(trace_manifest)
+                with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
+
+    def test_requires_no_external_cache_or_state_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["storage_policy"]["external_cache_paths"] = ["/Users/oracle/cache"]
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "storage policy"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            record = json.loads(json.dumps(DS4_AUDIT_RECORDS["memory"]))
+            del record["storage_policy"]
+            replace_audit_record(root, "pre", "memory", record)
+            with self.assertRaisesRegex(trace.TraceError, "storage_policy"):
+                trace.TraceBundle(root)
+
+    def test_accepts_authentic_watchdog_lease_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            trace.TraceBundle(root)
 
     def test_rejects_boolean_accelerator_identities(self) -> None:
         for runtime, field in (

@@ -25,6 +25,14 @@ WATCHDOG_VERSION = 2
 WATCHDOG_REVISION = "778db6f50eae04e6c232c69b9575bdbd0747962b"
 WATCHDOG_SCRIPT_SHA256 = "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f"
 APPROVED_WATCHDOGS = {WATCHDOG_SCRIPT_SHA256: WATCHDOG_REVISION}
+NO_EXTERNAL_STATE_STORAGE = {
+    "format": "dsv41-state-storage-policy",
+    "version": 1,
+    "expert_cache": "memory-resident",
+    "kv_cache": "memory-resident",
+    "external_cache_paths": [],
+    "external_state_paths": [],
+}
 ADMITTED_UBATCH = 32
 ADMITTED_BATCH = 2048
 EXPERT_COUNT = 384
@@ -328,8 +336,8 @@ def validate_storage_attestation(runtime: str, item: Any) -> dict[str, Any]:
         for key in ("device_identifier", "parent_whole_disk", "bus_protocol"):
             if not isinstance(item.get(key), str) or not item[key]:
                 raise TraceError(f"ds4 storage {key} is invalid")
-        if item["bus_protocol"].lower() in {"network", "virtual", "disk image"}:
-            raise TraceError("ds4 storage bus protocol is not local")
+        if item["bus_protocol"].lower() not in {"nvme", "apple fabric"}:
+            raise TraceError("ds4 storage is not NVMe-backed")
         if type(item.get("filesystem_device")) is not int or item["filesystem_device"] < 0:
             raise TraceError("ds4 storage filesystem device identity is invalid")
     else:
@@ -766,6 +774,7 @@ class TraceBundle:
             "comparison",
             "environment",
             "paths",
+            "storage_policy",
             "audits",
             "expected",
         }
@@ -846,6 +855,8 @@ class TraceBundle:
             raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
         if self.manifest["model"].get("architecture") != "deepseek41":
             raise TraceError("model architecture must be deepseek41")
+        if self.manifest["storage_policy"] != NO_EXTERNAL_STATE_STORAGE:
+            raise TraceError("manifest external cache/state storage policy is invalid")
         accelerator = validate_accelerator_attestation(self.manifest["runtime"], self.manifest["accelerator"])
         if self.manifest["runtime"] == "ds4":
             if "host" not in self.manifest:
@@ -1020,6 +1031,7 @@ class TraceBundle:
             if config.get("device_backend") != "Metal" or (
                     config.get("device_registry_id") != accelerator["metal_registry_id"]):
                 raise TraceError("ds4 trace device identity is not bound to the accelerator attestation")
+        _require_exact_keys(self.manifest["audits"], {"pre", "post"}, "manifest audit envelope")
         for audit_phase in ("pre", "post"):
             phase_audits = self.manifest["audits"].get(audit_phase)
             if not isinstance(phase_audits, dict):
@@ -1068,7 +1080,7 @@ class TraceBundle:
             raise TraceError(f"{phase} {kind} audit evidence metadata mismatch")
         record_keys = {"created_unix", "kind", "environment", "data"}
         if kind == "memory":
-            record_keys |= {"storage", "accelerator"}
+            record_keys |= {"storage", "storage_policy", "accelerator"}
             if self.manifest["runtime"] == "ds4":
                 record_keys.add("host")
         _require_exact_keys(record, record_keys, f"{phase} {kind} audit evidence")
@@ -1099,6 +1111,8 @@ class TraceBundle:
                     type(available) is not int or available <= 0 or available > total or used > total):
                 raise TraceError(f"{phase} ds4 memory audit evidence is invalid")
             storage = record.get("storage")
+            if record.get("storage_policy") != self.manifest["storage_policy"]:
+                raise TraceError(f"{phase} memory audit storage policy mismatch")
             required_storage = {
                 "model", "prompt", "output", "repository", "temporary_directory",
             }
@@ -1188,8 +1202,10 @@ class TraceBundle:
                 "format",
                 "version",
                 "lease_id",
+                "state",
                 "lease_path",
                 "watchdog_pid",
+                "watchdog_start_time_utc",
                 "watchdog_start_time_ticks",
                 "watchdog_command",
                 "watchdog_command_sha256",
@@ -1223,12 +1239,18 @@ class TraceBundle:
             data = record["data"]
             if data["format"] != WATCHDOG_LEASE_FORMAT or data["version"] != WATCHDOG_VERSION:
                 raise TraceError(f"{phase} watchdog audit format is invalid")
+            if data["state"] != "active":
+                raise TraceError(f"{phase} watchdog audit state is invalid")
             if not isinstance(data["lease_id"], str) or re.fullmatch(r"[0-9a-f]{32,64}", data["lease_id"]) is None:
                 raise TraceError(f"{phase} watchdog audit lease ID is invalid")
             if type(data["watchdog_pid"]) is not int or data["watchdog_pid"] <= 1:
                 raise TraceError(f"{phase} watchdog audit PID is invalid")
             if type(data["watchdog_start_time_ticks"]) is not int or data["watchdog_start_time_ticks"] <= 0:
                 raise TraceError(f"{phase} watchdog audit start time is invalid")
+            if not isinstance(data["watchdog_start_time_utc"], str) or re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+                    data["watchdog_start_time_utc"]) is None:
+                raise TraceError(f"{phase} watchdog audit UTC start time is invalid")
             for key in ("watchdog_command_sha256", "watchdog_script_sha256"):
                 if not isinstance(data[key], str) or re.fullmatch(r"[0-9a-f]{64}", data[key]) is None:
                     raise TraceError(f"{phase} watchdog audit {key} is invalid")
