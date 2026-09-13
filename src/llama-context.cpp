@@ -130,7 +130,8 @@ llama_context::llama_context(
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
-    cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    const uint32_t n_ctx_default = model.default_context_size();
+    cparams.n_ctx            = params.n_ctx           == 0    ? (n_ctx_default == 0 ? hparams.n_ctx_train : n_ctx_default) : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -254,6 +255,8 @@ llama_context::llama_context(
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
+
+    model.validate_context_params(cparams);
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -707,6 +710,14 @@ void llama_context::sched_reserve() {
     }
     if (memory) {
         memory->set_graph_workspace_size(graph_workspace_size);
+        uint64_t state_bytes = 0;
+        for (const auto & entry : memory->memory_breakdown()) {
+            if (entry.second > std::numeric_limits<uint64_t>::max() - state_bytes) {
+                throw std::runtime_error("memory state allocation byte count overflow");
+            }
+            state_bytes += entry.second;
+        }
+        model.validate_memory_accounting(state_bytes, graph_workspace_size);
     }
 
     if (n_nodes_pp == n_nodes_tg) {
@@ -1189,6 +1200,11 @@ void llama_context::set_eval_callback(ggml_backend_sched_eval_callback cb_eval, 
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
+        return;
+    }
     cparams.embeddings = value;
 
     // TODO: not sure yet if we want to reserve here
@@ -1198,6 +1214,11 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    if (value && model.arch == LLM_ARCH_DEEPSEEK41) {
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support next-token embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
+        return;
+    }
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
@@ -1207,6 +1228,11 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
+    if (enable && model.arch == LLM_ARCH_DEEPSEEK41) {
+        pending_config_error = "DeepSeek V4.1 bounded admission does not support layer embedding outputs";
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
+        return;
+    }
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
@@ -1215,6 +1241,15 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+bool llama_context::consume_pending_config_error() {
+    if (pending_config_error.empty()) {
+        return false;
+    }
+    LLAMA_LOG_ERROR("%s: %s\n", __func__, pending_config_error.c_str());
+    pending_config_error.clear();
+    return true;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1481,6 +1516,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    if (consume_pending_config_error()) {
+        return -1;
+    }
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1718,6 +1757,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    if (consume_pending_config_error()) {
+        return -1;
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);

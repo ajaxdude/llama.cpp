@@ -2808,9 +2808,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_NGRAM_DIRECT_IO"));
     add_opt(common_arg(
         {"--expert-cache-slots"}, "N",
-        "DeepSeek V4.1 routed experts resident per layer; requires --expert-cache-mib",
+        "maximum DeepSeek V4.1 routed experts resident per layer; 0 auto-fits",
         [](common_params & params, int value) {
-            if (value <= 0) {
+            if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
             params.expert_cache_slots = value;
@@ -2818,14 +2818,64 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_EXPERT_CACHE_SLOTS"));
     add_opt(common_arg(
         {"--expert-cache-mib"}, "MiB",
-        "aggregate DeepSeek V4.1 fixed expert slot-tensor capacity; requires --expert-cache-slots",
+        "exact aggregate DeepSeek V4.1 expert cache capacity; 0 auto-fits",
         [](common_params & params, int value) {
-            if (value <= 0) {
+            if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
             params.expert_cache_mib = value;
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--dsv41-memory-soft-mib"}, "MiB",
+        string_format("DeepSeek V4.1 total host-use startup target (default: %d)", params.dsv41_memory_soft_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dsv41_memory_soft_mib = value;
+        }
+    ).set_env("LLAMA_ARG_DSV41_MEMORY_SOFT_MIB"));
+    add_opt(common_arg(
+        {"--dsv41-memory-watchdog-mib"}, "MiB",
+        string_format("DeepSeek V4.1 external watchdog emergency threshold (default: %d)", params.dsv41_memory_watchdog_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dsv41_memory_watchdog_mib = value;
+        }
+    ).set_env("LLAMA_ARG_DSV41_MEMORY_WATCHDOG_MIB"));
+    add_opt(common_arg(
+        {"--dsv41-memory-hard-mib"}, "MiB",
+        string_format("DeepSeek V4.1 strict host-use ceiling (default: %d)", params.dsv41_memory_hard_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dsv41_memory_hard_mib = value;
+        }
+    ).set_env("LLAMA_ARG_DSV41_MEMORY_HARD_MIB"));
+    add_opt(common_arg(
+        {"--dsv41-memory-safety-margin-mib"}, "MiB",
+        string_format("DeepSeek V4.1 explicit startup safety margin (default: %d)", params.dsv41_memory_safety_margin_mib),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dsv41_memory_safety_margin_mib = value;
+        }
+    ).set_env("LLAMA_ARG_DSV41_MEMORY_SAFETY_MARGIN_MIB"));
+    add_opt(common_arg(
+        {"--dsv41-procfs-root"}, "PATH",
+        "procfs root used by DeepSeek V4.1 host-memory admission (default: /proc)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dsv41_procfs_root = value;
+        }
+    ).set_env("LLAMA_ARG_DSV41_PROCFS_ROOT"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
