@@ -394,11 +394,12 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                 "target": "arm64-apple-darwin",
                 "path": "/home/repo/build/bin/llama-deepseek-v41-trace",
                 "sha256": "3" * 64,
-                "runtime_libraries": [
+                "runtime_libraries": sorted([
                     {
-                        "role": role,
+                        "roles": [role],
                         "path": f"/home/repo/build/bin/{name}",
                         "sha256": digest * 64,
+                        "revision": "a" * 40 if role in {"build-info", "ggml"} else None,
                     }
                     for role, name, digest in (
                         ("build-info", "libllama-common.so", "4"),
@@ -406,7 +407,7 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
                         ("ggml", "libggml.so", "6"),
                         ("selected-backend", "libggml-hip.so", "7"),
                     )
-                ],
+                ], key=lambda library: library["path"]),
             }
         ),
         "model": {
@@ -1988,6 +1989,50 @@ class TraceFormatTests(unittest.TestCase):
             "/home/repo/build/bin/../substituted/libllama-common.so")
         cases.append((library_path_manifest, "runtime library path is not canonical"))
 
+        external_library_manifest = manifest()
+        external_library_manifest["build"]["runtime_libraries"][0]["path"] = (
+            "/Users/attacker/libggml-injected.dylib")
+        external_library_manifest["build"]["runtime_libraries"].sort(key=lambda item: item["path"])
+        cases.append((external_library_manifest, "outside the exporter runtime directory"))
+
+        omitted_library_manifest = manifest()
+        omitted_library_manifest["build"]["runtime_libraries"] = [
+            library
+            for library in omitted_library_manifest["build"]["runtime_libraries"]
+            if "selected-backend" not in library["roles"]
+        ]
+        cases.append((omitted_library_manifest, "runtime library identities are incomplete"))
+
+        duplicate_path_manifest = manifest()
+        duplicate_path_manifest["build"]["runtime_libraries"][1]["path"] = (
+            duplicate_path_manifest["build"]["runtime_libraries"][0]["path"])
+        cases.append((duplicate_path_manifest, "runtime library path is duplicated"))
+
+        duplicate_role_manifest = manifest()
+        duplicate_role_manifest["build"]["runtime_libraries"][1]["roles"] = (
+            duplicate_role_manifest["build"]["runtime_libraries"][0]["roles"])
+        cases.append((duplicate_role_manifest, "runtime library role is duplicated"))
+
+        unsorted_role_manifest = manifest()
+        unsorted_role_manifest["build"]["runtime_libraries"][0]["roles"] = ["llama", "build-info"]
+        cases.append((unsorted_role_manifest, "runtime library roles are not sorted"))
+
+        revision_library_manifest = manifest()
+        revision_library = next(
+            library
+            for library in revision_library_manifest["build"]["runtime_libraries"]
+            if "build-info" in library["roles"])
+        revision_library["revision"] = "b" * 40
+        cases.append((revision_library_manifest, "runtime library revision is invalid"))
+
+        unexpected_revision_manifest = manifest()
+        unexpected_revision = next(
+            library
+            for library in unexpected_revision_manifest["build"]["runtime_libraries"]
+            if not set(library["roles"]) & {"build-info", "ggml"})
+        unexpected_revision["revision"] = "a" * 40
+        cases.append((unexpected_revision_manifest, "runtime library revision is unexpected"))
+
         for trace_manifest, message in cases:
             with self.subTest(message=message), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp) / "trace"
@@ -2184,12 +2229,16 @@ class TraceFormatTests(unittest.TestCase):
                 trace.TraceBundle(root)
 
     def test_native_complete_manifest_writer_validates(self) -> None:
-        binary = Path(os.environ.get(
+        production_binary = Path(os.environ.get(
             "DSV41_NATIVE_TRACE_BINARY",
             Path(__file__).parents[1] / "build-harness" / "bin" / "llama-deepseek-v41-trace",
         ))
-        if not binary.is_file():
-            self.skipTest("native trace exporter is not built")
+        manifest_binary = Path(os.environ.get(
+            "DSV41_NATIVE_MANIFEST_BINARY",
+            Path(__file__).parents[1] / "build-harness" / "bin" / "test-deepseek41-trace-manifest",
+        ))
+        if not production_binary.is_file() or not manifest_binary.is_file():
+            self.skipTest("native trace exporter and manifest harness are not built")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace with space"
             with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
@@ -2198,9 +2247,8 @@ class TraceFormatTests(unittest.TestCase):
             fixture = trace.strict_json_loads(manifest_path.read_text(encoding="ascii"))
             writer_input = {
                 key: fixture[key]
-                for key in ("model", "prompt", "accelerator", "paths", "config", "audits", "expected", "event_count")
+                for key in ("model", "prompt", "audits", "expected", "event_count")
             }
-            writer_input["system_info"] = "Linux model-free manifest writer test"
             input_path = Path(temp) / "manifest-input.json"
             input_path.write_text(
                 json.dumps(writer_input, sort_keys=True, separators=(",", ":")) + "\n",
@@ -2208,8 +2256,8 @@ class TraceFormatTests(unittest.TestCase):
             )
             manifest_path.unlink()
             command = [
-                str(binary.resolve()),
-                "--dsv41-manifest-writer-probe",
+                str(manifest_binary.resolve()),
+                "--write-test-manifest",
                 str(input_path),
                 str(manifest_path),
             ]
@@ -2221,51 +2269,207 @@ class TraceFormatTests(unittest.TestCase):
                 text=True,
             ).strip()
             version = subprocess.run(
-                [str(binary.resolve()), "--version"],
+                [str(production_binary.resolve()), "--version"],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             self.assertIn(f"commit {revision}", version.stdout)
             self.assertEqual(native["revision"], revision)
-            self.assertEqual(native["build"]["path"], str(binary.resolve()))
+            self.assertEqual(native["build"]["path"], str(manifest_binary.resolve()))
+            self.assertIn("test-only manifest harness", native["build"]["info"])
             self.assertEqual(
-                {library["role"] for library in native["build"]["runtime_libraries"]},
+                {
+                    role
+                    for library in native["build"]["runtime_libraries"]
+                    for role in library["roles"]
+                },
                 {"build-info", "llama", "ggml", "selected-backend"},
             )
+            self.assertEqual(
+                [library["path"] for library in native["build"]["runtime_libraries"]],
+                sorted(library["path"] for library in native["build"]["runtime_libraries"]),
+            )
+            for library in native["build"]["runtime_libraries"]:
+                expected_revision = (
+                    revision
+                    if set(library["roles"]) & {"build-info", "ggml"}
+                    else None
+                )
+                self.assertEqual(library["revision"], expected_revision)
             self.assertIsInstance(native["environment"]["command"], str)
             self.assertEqual(json.loads(native["environment"]["command"]), command)
             self.assertIs(native["config"]["flash_attention"], True)
             self.assertEqual(native["storage_policy"], trace.NO_EXTERNAL_STATE_STORAGE)
             attestation = fixture["candidate"]
             attestation["revision"] = revision
-            attestation["executable_path"] = str(binary.resolve())
-            attestation["executable_sha256"] = trace.sha256_file(binary)
-            run_llama.bind_candidate_attestation(
-                root,
-                attestation,
-                native["accelerator"],
-                binary,
-                trace.sha256_file(binary),
-            )
-            trace.TraceBundle(root)
+            attestation["executable_path"] = str(manifest_binary.resolve())
+            attestation["executable_sha256"] = trace.sha256_file(manifest_binary)
+            with self.assertRaisesRegex(run_llama.PreflightError, "test-only manifest harness"):
+                run_llama.bind_candidate_attestation(
+                    root,
+                    attestation,
+                    native["accelerator"],
+                    manifest_binary,
+                    trace.sha256_file(manifest_binary),
+                )
+            with self.assertRaisesRegex(trace.TraceError, "candidate executable path"):
+                trace.TraceBundle(root)
 
-            library = next(
-                item for item in native["build"]["runtime_libraries"]
-                if item["role"] == "build-info")
-            substituted = Path(temp) / "substituted"
-            substituted.mkdir()
-            substituted_library = substituted / Path(library["path"]).name
-            shutil.copy2(library["path"], substituted_library)
+            for protected_field in (
+                    "accelerator", "build", "candidate", "comparison", "config",
+                    "environment", "paths", "revision", "runtime", "storage_policy"):
+                protected_input = dict(writer_input)
+                protected_input[protected_field] = fixture.get(protected_field, {})
+                input_path.write_text(
+                    json.dumps(protected_input, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                rejected = subprocess.run(command, check=False, capture_output=True, text=True)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(f"unexpected field: {protected_field}", rejected.stderr)
+
+            for option in ("--dsv41-manifest-writer-probe", "--dsv41-runtime-module-path-probe"):
+                rejected = subprocess.run(
+                    [str(production_binary.resolve()), option],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(rejected.returncode, 0)
+
             rejected = subprocess.run(
-                [
-                    str(binary.resolve()),
-                    "--dsv41-runtime-module-path-probe",
-                    str(substituted_library),
-                ],
+                [str(production_binary.resolve()), "--dsv41-attest-device", "CPU"],
                 check=False,
                 capture_output=True,
                 text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("selected device is not a GPU backend", rejected.stderr)
+
+    def test_runtime_build_validator_rejects_closure_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary_directory = root / "build" / "bin"
+            library_directory = root / "build" / "lib"
+            binary_directory.mkdir(parents=True)
+            library_directory.mkdir()
+            exporter = binary_directory / "llama-deepseek-v41-trace"
+            exporter.write_bytes(b"exporter")
+            records = []
+            for name, roles, content in (
+                    ("libggml-hip.so", ["selected-backend"], b"backend"),
+                    ("libggml.so", ["ggml"], b"ggml"),
+                    ("libllama-common.so", ["build-info"], b"build"),
+                    ("libllama.so", ["llama"], b"llama"),
+                    ("libggml-blas.so", [], b"blas")):
+                path = library_directory / name
+                path.write_bytes(content)
+                records.append({
+                    "path": str(path.resolve()),
+                    "sha256": trace.sha256_file(path),
+                    "roles": roles,
+                    "revision": "a" * 40 if set(roles) & {"build-info", "ggml"} else None,
+                })
+            records.sort(key=lambda record: record["path"])
+            build_manifest = {
+                "revision": "a" * 40,
+                "build": {
+                    "path": str(exporter.resolve()),
+                    "sha256": trace.sha256_file(exporter),
+                    "info": "test",
+                    "runtime_libraries": records,
+                },
+            }
+            digest = run_llama.validate_runtime_build(
+                build_manifest,
+                exporter=exporter,
+                exporter_sha256=trace.sha256_file(exporter),
+                candidate_revision="a" * 40,
+            )
+            self.assertEqual(
+                digest,
+                trace.sha256_bytes(trace.canonical_json(records).encode("ascii")),
+            )
+
+            cases = []
+            omitted = copy.deepcopy(build_manifest)
+            omitted["build"]["runtime_libraries"] = [
+                library
+                for library in omitted["build"]["runtime_libraries"]
+                if "selected-backend" not in library["roles"]
+            ]
+            cases.append((omitted, "identities are incomplete"))
+
+            changed_hash = copy.deepcopy(build_manifest)
+            changed_hash["build"]["runtime_libraries"][0]["sha256"] = "f" * 64
+            cases.append((changed_hash, "SHA-256 mismatch"))
+
+            changed_revision = copy.deepcopy(build_manifest)
+            revision_record = next(
+                library
+                for library in changed_revision["build"]["runtime_libraries"]
+                if "build-info" in library["roles"])
+            revision_record["revision"] = "b" * 40
+            cases.append((changed_revision, "revision mismatch"))
+
+            duplicate_role = copy.deepcopy(build_manifest)
+            role_records = duplicate_role["build"]["runtime_libraries"]
+            next(library for library in role_records if not library["roles"])["roles"] = ["llama"]
+            cases.append((duplicate_role, "role is invalid"))
+
+            external = root / "external" / "libggml-injected.so"
+            external.parent.mkdir()
+            external.write_bytes(b"injected")
+            external_manifest = copy.deepcopy(build_manifest)
+            external_manifest["build"]["runtime_libraries"].append({
+                "path": str(external.resolve()),
+                "sha256": trace.sha256_file(external),
+                "roles": [],
+                "revision": None,
+            })
+            external_manifest["build"]["runtime_libraries"].sort(key=lambda record: record["path"])
+            cases.append((external_manifest, "outside the exporter runtime directory"))
+
+            duplicate_path = copy.deepcopy(build_manifest)
+            duplicate_path["build"]["runtime_libraries"][1]["path"] = (
+                duplicate_path["build"]["runtime_libraries"][0]["path"])
+            cases.append((duplicate_path, "duplicated or unsorted"))
+
+            for candidate, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(
+                        run_llama.PreflightError, message):
+                    run_llama.validate_runtime_build(
+                        candidate,
+                        exporter=exporter,
+                        exporter_sha256=trace.sha256_file(exporter),
+                        candidate_revision="a" * 40,
+                    )
+
+    @unittest.skipUnless(sys.platform.startswith(("darwin", "linux")), "loader injection test")
+    def test_native_rejects_injected_project_library(self) -> None:
+        binary = Path(os.environ.get(
+            "DSV41_NATIVE_TRACE_BINARY",
+            Path(__file__).parents[1] / "build-harness" / "bin" / "llama-deepseek-v41-trace",
+        ))
+        injected = Path(os.environ.get(
+            "DSV41_NATIVE_INJECT_LIBRARY",
+            Path(__file__).parents[1] / "build-harness" / "bin" / "libggml-injected.module",
+        ))
+        if not binary.is_file() or not injected.is_file():
+            self.skipTest("native trace exporter and injected test library are not built")
+        with tempfile.TemporaryDirectory() as temp:
+            external = Path(temp) / injected.name
+            shutil.copy2(injected, external)
+            environment = dict(os.environ)
+            variable = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
+            environment[variable] = str(external)
+            rejected = subprocess.run(
+                [str(binary.resolve()), "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
             )
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("outside the exporter runtime directory", rejected.stderr)
@@ -2923,6 +3127,11 @@ class TraceFormatTests(unittest.TestCase):
             base_manifest = manifest("llama.cpp")
             base_manifest["revision"] = "b" * 40
             base_manifest["candidate"]["revision"] = "b" * 40
+            for library in base_manifest["build"]["runtime_libraries"]:
+                if set(library["roles"]) & {"build-info", "ggml"}:
+                    library["revision"] = "b" * 40
+            base_manifest["candidate"]["runtime_libraries_sha256"] = trace.sha256_bytes(
+                trace.canonical_json(base_manifest["build"]["runtime_libraries"]).encode("ascii"))
             with trace.TraceBundleWriter(base, base_manifest) as writer:
                 add_required_events(writer)
             with trace.TraceBundleWriter(integrated, manifest("llama.cpp")) as writer:

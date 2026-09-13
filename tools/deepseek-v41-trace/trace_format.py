@@ -834,25 +834,63 @@ class TraceBundle:
             raise TraceError("manifest build path is not canonical")
         if self.manifest["runtime"] == "llama.cpp":
             libraries = self.manifest["build"]["runtime_libraries"]
-            if not isinstance(libraries, list) or len(libraries) != 4:
+            if not isinstance(libraries, list) or not libraries:
                 raise TraceError("manifest runtime library identities are invalid")
             roles = set()
+            paths = set()
+            previous_path = None
+            expected_roles = {"build-info", "llama", "ggml", "selected-backend"}
+            executable_path = PurePosixPath(build_path)
+            binary_directory = executable_path.parent
+            library_directory = binary_directory.parent / "lib"
             for library in libraries:
-                _require_exact_keys(library, {"role", "path", "sha256"}, "manifest runtime library")
-                role = library.get("role")
+                _require_exact_keys(
+                    library,
+                    {"path", "sha256", "roles", "revision"},
+                    "manifest runtime library",
+                )
                 path = library.get("path")
                 digest = library.get("sha256")
-                if role not in {"build-info", "llama", "ggml", "selected-backend"}:
-                    raise TraceError("manifest runtime library role is invalid")
-                if role in roles:
+                library_roles = library.get("roles")
+                revision = library.get("revision")
+                if not isinstance(library_roles, list) or any(
+                        not isinstance(role, str) or role not in expected_roles
+                        for role in library_roles):
+                    raise TraceError("manifest runtime library roles are invalid")
+                if len(library_roles) != len(set(library_roles)):
                     raise TraceError("manifest runtime library role is duplicated")
-                roles.add(role)
+                if library_roles != sorted(library_roles):
+                    raise TraceError("manifest runtime library roles are not sorted")
+                for role in library_roles:
+                    if role in roles:
+                        raise TraceError("manifest runtime library role is duplicated")
+                    roles.add(role)
                 if not isinstance(path, str) or not path.startswith("/") or ".." in PurePosixPath(path).parts or (
                         str(PurePosixPath(path)) != path):
                     raise TraceError("manifest runtime library path is not canonical")
+                if path in paths:
+                    raise TraceError("manifest runtime library path is duplicated")
+                if previous_path is not None and path <= previous_path:
+                    raise TraceError("manifest runtime library paths are not sorted")
+                runtime_path = PurePosixPath(path)
+                try:
+                    runtime_path.relative_to(library_directory)
+                    in_library_directory = True
+                except ValueError:
+                    in_library_directory = False
+                if runtime_path != executable_path and runtime_path.parent != binary_directory and (
+                        not in_library_directory):
+                    raise TraceError("manifest runtime library is outside the exporter runtime directory")
+                paths.add(path)
+                previous_path = path
                 if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                     raise TraceError("manifest runtime library SHA-256 is invalid")
-            if roles != {"build-info", "llama", "ggml", "selected-backend"}:
+                if set(library_roles) & {"build-info", "ggml"}:
+                    if revision != self.manifest["revision"]:
+                        raise TraceError("manifest runtime library revision is invalid")
+                elif revision is not None:
+                    raise TraceError("manifest runtime library revision is unexpected")
+            if roles != expected_roles:
                 raise TraceError("manifest runtime library identities are incomplete")
         for section in ("model", "prompt"):
             if not isinstance(self.manifest[section], dict):

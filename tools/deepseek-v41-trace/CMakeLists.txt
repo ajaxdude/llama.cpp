@@ -28,11 +28,28 @@ if(LLAMA_TOOLS_INSTALL)
 endif()
 
 if(LLAMA_BUILD_TESTS)
-    if(TEST test-deepseek41-trace)
-        set_property(
-            TEST test-deepseek41-trace
-            APPEND PROPERTY ENVIRONMENT "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:${TARGET}>")
-    endif()
+    set(MANIFEST_TEST_TARGET test-deepseek41-trace-manifest)
+    add_executable(${MANIFEST_TEST_TARGET} llama-trace.cpp)
+    target_link_libraries(
+        ${MANIFEST_TEST_TARGET}
+        PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+    target_include_directories(${MANIFEST_TEST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(${MANIFEST_TEST_TARGET} PRIVATE cxx_std_17)
+    target_compile_definitions(
+        ${MANIFEST_TEST_TARGET}
+        PRIVATE
+            DSV41_BUILD_REVISION="${DSV41_BUILD_REVISION}"
+            DSV41_MANIFEST_TEST_HARNESS=1)
+
+    set(INJECTED_TEST_TARGET test-deepseek41-trace-injected)
+    add_library(${INJECTED_TEST_TARGET} SHARED test-injected-library.cpp)
+    set_target_properties(
+        ${INJECTED_TEST_TARGET}
+        PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "libggml-injected"
+            SUFFIX ".module")
+
     set(HOST_TEST_TARGET test-deepseek41-trace-host)
     add_executable(${HOST_TEST_TARGET} test-host-attestation.cpp)
     target_link_libraries(${HOST_TEST_TARGET} PRIVATE ggml)

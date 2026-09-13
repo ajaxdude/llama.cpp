@@ -124,27 +124,45 @@ def validate_runtime_build(
         raise PreflightError("llama trace build SHA-256 does not match the executed exporter")
     if manifest.get("revision") != candidate_revision:
         raise PreflightError("llama trace build revision does not match the exact candidate revision")
+    if "test-only manifest harness" in str(build.get("info", "")):
+        raise PreflightError("llama trace was produced by the test-only manifest harness")
     libraries = build.get("runtime_libraries")
-    if not isinstance(libraries, list):
+    if not isinstance(libraries, list) or not libraries:
         raise PreflightError("llama trace runtime library identities are missing")
     expected_roles = {"build-info", "llama", "ggml", "selected-backend"}
     roles = set()
+    paths = set()
+    previous_path = None
     binary_directory = exporter.parent
     library_directory = binary_directory.parent / "lib"
     for library in libraries:
         if not isinstance(library, dict):
             raise PreflightError("llama trace runtime library identity is invalid")
-        role = library.get("role")
         path_value = library.get("path")
         digest = library.get("sha256")
-        if role not in expected_roles or role in roles:
-            raise PreflightError("llama trace runtime library role is invalid")
-        roles.add(role)
+        library_roles = library.get("roles")
+        revision = library.get("revision")
+        if not isinstance(library_roles, list) or library_roles != sorted(library_roles) or any(
+                role not in expected_roles for role in library_roles):
+            raise PreflightError("llama trace runtime library roles are invalid")
+        for role in library_roles:
+            if role in roles:
+                raise PreflightError("llama trace runtime library role is invalid")
+            roles.add(role)
+        if bool(set(library_roles) & {"build-info", "ggml"}):
+            if revision != candidate_revision:
+                raise PreflightError("llama trace runtime library revision mismatch")
+        elif revision is not None:
+            raise PreflightError("llama trace runtime library revision is unexpected")
         if not isinstance(path_value, str):
             raise PreflightError("llama trace runtime library path is invalid")
         path = resolved(Path(path_value))
         if path_value != str(path):
             raise PreflightError("llama trace runtime library path is not canonical")
+        if path in paths or (previous_path is not None and str(path) <= str(previous_path)):
+            raise PreflightError("llama trace runtime library paths are duplicated or unsorted")
+        paths.add(path)
+        previous_path = path
         if path != exporter and path.parent != binary_directory and not _path_is_within(path, library_directory):
             raise PreflightError("llama trace runtime library is outside the exporter runtime directory")
         if not path.is_file() or not isinstance(digest, str) or sha256_file(path) != digest:

@@ -27,6 +27,7 @@ extern "C" {
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -35,6 +36,7 @@ extern "C" {
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#include <tlhelp32.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -197,17 +199,120 @@ static void require_runtime_module_location(const fs::path & executable, const f
     }
 }
 
-static json runtime_module_json(
-        const std::string & role,
+static bool is_project_runtime_library(const fs::path & path) {
+    std::string name = path.filename().string();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+#if defined(_WIN32)
+    return name.rfind("llama", 0) == 0 || name.rfind("ggml", 0) == 0 ||
+        name.rfind("libllama", 0) == 0 || name.rfind("libggml", 0) == 0;
+#else
+    return name.rfind("libllama", 0) == 0 || name.rfind("libggml", 0) == 0 ||
+        name.rfind("ggml", 0) == 0;
+#endif
+}
+
+static std::set<fs::path> loaded_project_runtime_libraries() {
+    std::set<fs::path> result;
+#if defined(_WIN32)
+    const HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+        GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("cannot enumerate loaded runtime modules");
+    }
+    MODULEENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    if (!Module32FirstW(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        throw std::runtime_error("cannot read loaded runtime modules");
+    }
+    do {
+        const fs::path path = canonical_path(entry.szExePath, "loaded runtime module");
+        if (is_project_runtime_library(path)) {
+            result.insert(path);
+        }
+    } while (Module32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+#elif defined(__APPLE__)
+    const uint32_t count = _dyld_image_count();
+    for (uint32_t index = 0; index < count; ++index) {
+        const char * name = _dyld_get_image_name(index);
+        if (name != nullptr && name[0] != '\0') {
+            const fs::path path = canonical_path(name, "loaded runtime module");
+            if (is_project_runtime_library(path)) {
+                result.insert(path);
+            }
+        }
+    }
+#elif defined(__linux__)
+    std::ifstream maps("/proc/self/maps");
+    if (!maps) {
+        throw std::runtime_error("cannot enumerate loaded runtime modules");
+    }
+    std::string line;
+    while (std::getline(maps, line)) {
+        const size_t path_start = line.find('/');
+        if (path_start == std::string::npos) {
+            continue;
+        }
+        const fs::path path = canonical_path(line.substr(path_start), "loaded runtime module");
+        if (is_project_runtime_library(path)) {
+            result.insert(path);
+        }
+    }
+#endif
+    return result;
+}
+
+static json runtime_libraries_json(
         const fs::path & executable,
-        const void * address) {
-    const fs::path path = module_path(address);
-    require_runtime_module_location(executable, path);
-    return {
-        {"role", role},
-        {"path", path.string()},
-        {"sha256", sha256_file(path)},
-    };
+        ggml_backend_dev_t selected_device,
+        const std::string & revision) {
+    if (selected_device == nullptr) {
+        throw std::runtime_error("cannot bind a null selected backend device");
+    }
+    ggml_backend_reg_t selected_backend = ggml_backend_dev_backend_reg(selected_device);
+    if (selected_backend == nullptr) {
+        throw std::runtime_error("selected backend device has no runtime registry");
+    }
+    const fs::path build_info_module = module_path(function_address(&llama_commit));
+    const fs::path llama_module = module_path(function_address(&llama_model_load_from_file));
+    const fs::path ggml_module = module_path(function_address(&ggml_init));
+    const fs::path selected_backend_module = module_path(selected_backend);
+    std::set<fs::path> libraries = loaded_project_runtime_libraries();
+    libraries.insert(build_info_module);
+    libraries.insert(llama_module);
+    libraries.insert(ggml_module);
+    libraries.insert(selected_backend_module);
+
+    json result = json::array();
+    for (const fs::path & library : libraries) {
+        require_runtime_module_location(executable, library);
+        std::vector<std::string> roles;
+        if (library == build_info_module) {
+            roles.push_back("build-info");
+        }
+        if (library == llama_module) {
+            roles.push_back("llama");
+        }
+        if (library == ggml_module) {
+            roles.push_back("ggml");
+        }
+        if (library == selected_backend_module) {
+            roles.push_back("selected-backend");
+        }
+        std::sort(roles.begin(), roles.end());
+        const bool revision_bearing = library == build_info_module || library == ggml_module;
+        result.push_back({
+            {"path", library.string()},
+            {"sha256", sha256_file(library)},
+            {"roles", std::move(roles)},
+            {"revision", revision_bearing ? json(revision) : json(nullptr)},
+        });
+    }
+    return result;
 }
 
 static json runtime_build_json(
@@ -226,30 +331,24 @@ static json runtime_build_json(
     }
     const std::string linked_revision = llama_commit();
     const std::string ggml_revision = ggml_commit();
-    if (linked_revision.empty() || revision.compare(0, linked_revision.size(), linked_revision) != 0 ||
-            ggml_revision.empty() || revision.compare(0, ggml_revision.size(), ggml_revision) != 0) {
-        throw std::runtime_error("loaded runtime library revision differs from the exporter revision");
+    if (linked_revision != revision || ggml_revision != revision) {
+        throw std::runtime_error(
+            "loaded runtime library revision differs from the exporter revision: llama=" +
+            linked_revision + ", ggml=" + ggml_revision + ", exporter=" + revision);
     }
-    if (selected_device == nullptr) {
-        throw std::runtime_error("cannot bind a null selected backend device");
-    }
-    ggml_backend_reg_t selected_backend = ggml_backend_dev_backend_reg(selected_device);
-    if (selected_backend == nullptr) {
-        throw std::runtime_error("selected backend device has no runtime registry");
-    }
+#if defined(DSV41_MANIFEST_TEST_HARNESS)
+    const std::string build_info = std::string(llama_build_info()) + " [test-only manifest harness]";
+#else
+    const std::string build_info = llama_build_info();
+#endif
     return {
         {"number", llama_build_number()},
-        {"info", llama_build_info()},
+        {"info", build_info},
         {"compiler", llama_compiler()},
         {"target", llama_build_target()},
         {"path", executable.string()},
         {"sha256", sha256_file(executable)},
-        {"runtime_libraries", {
-            runtime_module_json("build-info", executable, function_address(&llama_commit)),
-            runtime_module_json("llama", executable, function_address(&llama_model_load_from_file)),
-            runtime_module_json("ggml", executable, function_address(&ggml_init)),
-            runtime_module_json("selected-backend", executable, selected_backend),
-        }},
+        {"runtime_libraries", runtime_libraries_json(executable, selected_device, revision)},
     };
 }
 
@@ -905,6 +1004,7 @@ static void write_manifest_file(const fs::path & path, const json & manifest) {
     fs::rename(temp, path);
 }
 
+#if defined(DSV41_MANIFEST_TEST_HARNESS)
 static void write_manifest_probe(
         const fs::path & input_path,
         const fs::path & output_path,
@@ -912,15 +1012,79 @@ static void write_manifest_probe(
         char ** argv) {
     const std::vector<uint8_t> bytes = read_file(input_path);
     json input = json::parse(bytes.begin(), bytes.end());
-    if (!input.is_object() || !input.contains("system_info") || !input["system_info"].is_string() ||
-            input["system_info"].get<std::string>().empty()) {
-        throw std::runtime_error("manifest writer probe system_info is invalid");
+    static const std::array<const char *, 5> allowed = {
+        "model", "prompt", "audits", "expected", "event_count",
+    };
+    if (!input.is_object()) {
+        throw std::runtime_error("manifest writer test input is not a JSON object");
     }
-    const std::string system_info = input["system_info"];
-    input.erase("system_info");
-    common_params params;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    input["config"]["flash_attention"] = flash_attention_enabled(params.flash_attn_type);
+    for (const char * key : allowed) {
+        if (!input.contains(key)) {
+            throw std::runtime_error(std::string("manifest writer test input is missing ") + key);
+        }
+    }
+    for (const auto & item : input.items()) {
+        if (std::find_if(allowed.begin(), allowed.end(), [&](const char * key) {
+                return item.key() == key;
+            }) == allowed.end()) {
+            throw std::runtime_error("manifest writer test input has unexpected field: " + item.key());
+        }
+    }
+    input["accelerator"] = {
+        {"format", "dsv41-accelerator-attestation"},
+        {"version", 2},
+        {"runtime_kind", "strix-rocm"},
+        {"platform", "linux"},
+        {"backend", "ROCm"},
+        {"backend_device", "ROCm0"},
+        {"backend_description", "AMD Radeon Graphics"},
+        {"pci_device_id", "0000:c1:00.0"},
+        {"kfd_node", 1},
+        {"gpu_id", 42},
+        {"gfx_target_version", 110501},
+        {"architecture", "gfx1151"},
+        {"source", "linux-kfd-sysfs"},
+    };
+    input["paths"] = {
+        {"model", "/mnt/models/model.gguf"},
+        {"prompt", "/home/prompt.txt"},
+        {"output", "/home"},
+        {"repository", "/home/repo"},
+        {"temporary_directory", "/home/tmp"},
+    };
+    input["config"] = {
+        {"context", 3},
+        {"batch", 2048},
+        {"ubatch", 32},
+        {"device", "ROCm0"},
+        {"device_architecture", "gfx1151"},
+        {"device_pci_id", "0000:c1:00.0"},
+        {"decode_steps", 1},
+        {"kv_type_k", "f16"},
+        {"kv_type_v", "f16"},
+        {"flash_attention", true},
+        {"gpu_layers", 99},
+        {"load_mode", 0},
+        {"expert_cache_slots", 192},
+        {"expert_cache_bytes", UINT64_C(76441190400)},
+        {"tokenizer_add_bos", true},
+        {"tokenizer_parse_special", true},
+        {"deepseek41", {
+            {"layer_count", 40},
+            {"vocab_size", 129280},
+            {"engram_layers", {1, 14}},
+            {"engram_rows_per_token", 24},
+            {"expert_count", 384},
+            {"experts_used", 6},
+            {"candidate_source_layer", 20},
+            {"candidate_topk_blocks", 2048},
+            {"candidate_block_size", 8},
+            {"index_top_k", 512},
+            {"raw_attention_layers", {0, 1}},
+            {"raw_attention_width", 128},
+            {"candidate_propagation_layers", {24, 28, 32, 36}},
+        }},
+    };
     common_init();
     ggml_backend_load_all();
     ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -930,11 +1094,25 @@ static void write_manifest_probe(
             std::move(input),
             current_executable_path(),
             device,
-            system_info,
+            "Linux model-free manifest writer test",
             argc,
             argv));
 }
 
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+    try {
+        if (argc != 4 || std::string(argv[1]) != "--write-test-manifest") {
+            throw std::runtime_error("test manifest writer requires input and output paths");
+        }
+        write_manifest_probe(argv[2], argv[3], argc, argv);
+        return 0;
+    } catch (const std::exception & error) {
+        std::fprintf(stderr, "test-deepseek-v41-manifest: %s\n", error.what());
+        return 1;
+    }
+}
+#else
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
@@ -949,23 +1127,6 @@ int main(int argc, char ** argv) {
                       << ", commit " << BUILD_REVISION << ")\n";
             std::cout << "built with " << build["compiler"].get<std::string>()
                       << " for " << build["target"].get<std::string>() << '\n';
-            return 0;
-        }
-        if (argc >= 2 && std::string(argv[1]) == "--dsv41-runtime-module-path-probe") {
-            if (argc != 3) {
-                throw std::runtime_error("--dsv41-runtime-module-path-probe requires a module path");
-            }
-            require_runtime_module_location(
-                current_executable_path(),
-                canonical_path(argv[2], "runtime module probe"));
-            return 0;
-        }
-        if (argc >= 2 && std::string(argv[1]) == "--dsv41-manifest-writer-probe") {
-            if (argc != 4) {
-                throw std::runtime_error(
-                    "--dsv41-manifest-writer-probe requires input and output paths");
-            }
-            write_manifest_probe(argv[2], argv[3], argc, argv);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {
@@ -1214,3 +1375,4 @@ int main(int argc, char ** argv) {
         return 1;
     }
 }
+#endif
