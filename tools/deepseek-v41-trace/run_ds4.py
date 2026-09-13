@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,24 @@ from trace_format import (
 
 EXPORTER_ATTESTATION_TIMEOUT_SECONDS = 60
 EXPORTER_TRACE_TIMEOUT_SECONDS = 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class InvocationSecondaryFailure:
+    component: str
+    error: BaseException
+
+
+class InvocationIntegrityError(PreflightError):
+    def __init__(
+            self,
+            message: str,
+            *,
+            primary_error: BaseException,
+            secondary_errors: list[InvocationSecondaryFailure]):
+        super().__init__(message)
+        self.primary_error = primary_error
+        self.secondary_errors = tuple(secondary_errors)
 
 
 def git_output(checkout: Path, *args: str) -> str:
@@ -202,6 +221,8 @@ def run_exporter_with_post_attestation(
         exporter_policy: dict[str, Any],
         expected_runtime_build: dict[str, Any],
         timeout_seconds: int,
+        decode_stdout_label: str | None = None,
+        decode_stderr_label: str | None = None,
         **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     result = None
     primary_error = None
@@ -216,10 +237,22 @@ def run_exporter_with_post_attestation(
         )
     except BaseException as error:
         primary_error = error
-    if isinstance(primary_error, ExecutionIntegrityError) and any(
-            failure.component.startswith(("process-tree-", "direct-child-", "containment-"))
-            for failure in primary_error.secondary_errors):
+    if primary_error is not None and (
+            not isinstance(primary_error, ExecutionIntegrityError)
+            or not primary_error.quiescence_proven):
         raise primary_error
+    if result is not None and primary_error is None:
+        try:
+            stdout = (
+                decode_exporter_output(result.stdout, label=decode_stdout_label)
+                if decode_stdout_label is not None else result.stdout)
+            stderr = (
+                decode_exporter_output(result.stderr, label=decode_stderr_label)
+                if decode_stderr_label is not None else result.stderr)
+            result = subprocess.CompletedProcess(
+                result.args, result.returncode, stdout, stderr)
+        except BaseException as error:
+            primary_error = error
     nonzero_error = None
     if result is not None and result.returncode != 0:
         nonzero_error = PreflightError(f"{operation} failed: exit {result.returncode}")
@@ -237,10 +270,14 @@ def run_exporter_with_post_attestation(
     reported_primary = primary_error or nonzero_error
     if reported_primary is not None:
         if secondary_error is not None:
-            raise PreflightError(
+            raise InvocationIntegrityError(
                 f"{operation} primary failure [{type(reported_primary).__name__}: {reported_primary}]; "
                 f"secondary post-invocation runtime-build attestation failure "
-                f"[{type(secondary_error).__name__}: {secondary_error}]") from reported_primary
+                f"[{type(secondary_error).__name__}: {secondary_error}]",
+                primary_error=reported_primary,
+                secondary_errors=[InvocationSecondaryFailure(
+                    "post-invocation-runtime-build-attestation", secondary_error)],
+            ) from reported_primary
         if primary_error is not None:
             raise primary_error
     if secondary_error is not None:
@@ -267,17 +304,17 @@ def query_accelerator_attestation(
         timeout_seconds=EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
         check=False,
         capture_output=True,
+        decode_stdout_label="selected accelerator query stdout",
+        decode_stderr_label="selected accelerator query stderr",
     )
     validation_error = None
     attestation = None
     if result.returncode != 0:
-        detail = decode_exporter_output(
-            result.stderr, label="selected accelerator query stderr").strip() or f"exit {result.returncode}"
+        detail = result.stderr.strip() or f"exit {result.returncode}"
         validation_error = PreflightError(f"selected accelerator query failed: {detail}")
     else:
         try:
-            record = strict_json_loads(decode_exporter_output(
-                result.stdout, label="selected accelerator query stdout"))
+            record = strict_json_loads(result.stdout)
             attestation = validate_accelerator_attestation(record, expected_device=device)
         except (TraceError, PreflightError) as error:
             validation_error = PreflightError(

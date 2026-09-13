@@ -13,7 +13,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -140,6 +142,8 @@ PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS = 5
 PROCESS_TREE_TERM_GRACE_SECONDS = 1
 WINDOWS_CREATE_SUSPENDED = 0x00000004
 WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+LINUX_PR_SET_CHILD_SUBREAPER = 36
+LINUX_PR_GET_CHILD_SUBREAPER = 37
 
 
 @dataclass(frozen=True)
@@ -154,17 +158,23 @@ class ExecutionIntegrityError(TraceError):
             message: str,
             *,
             primary_error: BaseException | None,
-            secondary_errors: list[_IntegrityFailure]):
+            secondary_errors: list[_IntegrityFailure],
+            quiescence_proven: bool = False):
         super().__init__(message)
         self.primary_error = primary_error
         self.secondary_errors = tuple(secondary_errors)
+        self.quiescence_proven = quiescence_proven
 
 
 @dataclass
 class _ProcessContainment:
     process: subprocess.Popen[bytes]
-    process_group_id: int | None = None
+    linux_root_pidfd: int | None = None
+    linux_lock_held: bool = False
+    test_process_group_id: int | None = None
     job_handle: int | None = None
+    windows_job_assigned: bool = False
+    windows_process_resumed: bool = False
 
 
 @dataclass
@@ -173,6 +183,18 @@ class _ContainedRun:
     primary_error: BaseException | None
     integrity_failures: list[_IntegrityFailure]
     containment: _ProcessContainment | None
+    quiescence_proven: bool = False
+    process_started: bool = False
+
+
+@dataclass
+class _ContainmentCleanup:
+    failures: list[_IntegrityFailure]
+    quiescence_proven: bool
+
+
+_LINUX_SUBREAPER_LOCK = threading.Lock()
+_TEST_PROCESS_GROUP_CONTAINMENT = threading.local()
 
 
 @dataclass(frozen=True)
@@ -798,20 +820,29 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
     process = subprocess.Popen(command, creationflags=creationflags, **launch)
     job = None
     thread = None
+    job_assigned = False
+    process_resumed = False
     try:
         job = _create_windows_kill_job()
         kernel32 = _windows_kernel32()
         process_handle = int(process._handle)
         if not kernel32.AssignProcessToJobObject(job, process_handle):
             raise _windows_error("cannot assign suspended process to containment job")
+        job_assigned = True
         thread = _open_windows_process_thread(process.pid)
         if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
             raise _windows_error("cannot resume contained process")
+        process_resumed = True
         thread_closed = kernel32.CloseHandle(thread)
         thread = None
         if not thread_closed:
             raise _windows_error("cannot close resumed process thread")
-        return _ProcessContainment(process=process, job_handle=job)
+        return _ProcessContainment(
+            process=process,
+            job_handle=job,
+            windows_job_assigned=job_assigned,
+            windows_process_resumed=process_resumed,
+        )
     except BaseException as primary_error:
         kernel32 = _windows_kernel32()
         failures = []
@@ -820,15 +851,11 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
                 failures.append(_IntegrityFailure(
                     "windows-thread-handle-close",
                     _windows_error("cannot close suspended process thread")))
-        if job is not None:
+        if job_assigned and job is not None:
             if not kernel32.TerminateJobObject(job, 1):
                 failures.append(_IntegrityFailure(
                     "windows-job-termination",
                     _windows_error("cannot terminate failed process containment job")))
-            if not kernel32.CloseHandle(job):
-                failures.append(_IntegrityFailure(
-                    "windows-job-handle-close",
-                    _windows_error("cannot close failed process containment job")))
         else:
             try:
                 process.kill()
@@ -838,6 +865,14 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
             process.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
         except BaseException as error:
             failures.append(_IntegrityFailure("windows-process-reap", error))
+        try:
+            _close_windows_process_handle(process)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("windows-process-handle-close", error))
+        if job is not None and not kernel32.CloseHandle(job):
+            failures.append(_IntegrityFailure(
+                "windows-job-handle-close",
+                _windows_error("cannot close failed process containment job")))
         if failures:
             raise ExecutionIntegrityError(
                 f"Windows containment startup primary failure "
@@ -845,6 +880,189 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
                 f"secondary integrity failures: {_format_integrity_failures(failures)}",
                 primary_error=primary_error,
                 secondary_errors=failures,
+                quiescence_proven=False,
+            ) from primary_error
+        raise ExecutionIntegrityError(
+            f"Windows containment startup primary failure "
+            f"[{type(primary_error).__name__}: {primary_error}]",
+            primary_error=primary_error,
+            secondary_errors=[],
+            quiescence_proven=False,
+        ) from primary_error
+
+
+@contextmanager
+def _test_only_process_group_containment() -> Iterable[None]:
+    previous = getattr(_TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False)
+    _TEST_PROCESS_GROUP_CONTAINMENT.enabled = True
+    try:
+        yield
+    finally:
+        _TEST_PROCESS_GROUP_CONTAINMENT.enabled = previous
+
+
+def _linux_direct_children() -> set[int]:
+    children = set()
+    task_root = Path("/proc/self/task")
+    if not task_root.is_dir():
+        raise TraceError("Linux subreaper containment requires procfs task children")
+    for task in task_root.iterdir():
+        child_file = task / "children"
+        try:
+            values = child_file.read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise TraceError(f"cannot read Linux subreaper child ownership: {error}") from error
+        for value in values:
+            try:
+                children.add(int(value))
+            except ValueError as error:
+                raise TraceError("Linux subreaper child ownership is invalid") from error
+    return children
+
+
+def _linux_task_ids() -> set[int]:
+    task_root = Path("/proc/self/task")
+    if not task_root.is_dir():
+        raise TraceError("Linux subreaper containment requires procfs task identities")
+    try:
+        return {int(task.name) for task in task_root.iterdir()}
+    except (OSError, ValueError) as error:
+        raise TraceError(f"cannot read Linux subreaper task identities: {error}") from error
+
+
+def _linux_enable_child_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(LINUX_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise TraceError(f"cannot enable Linux child subreaper: {os.strerror(error_number)}")
+    enabled = ctypes.c_int()
+    if libc.prctl(LINUX_PR_GET_CHILD_SUBREAPER, ctypes.byref(enabled), 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise TraceError(f"cannot verify Linux child subreaper: {os.strerror(error_number)}")
+    if enabled.value != 1:
+        raise TraceError("Linux child subreaper did not remain enabled")
+
+
+def _linux_open_pidfd(process_id: int) -> int:
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if opener is None or sender is None:
+        raise TraceError("Linux subreaper containment requires pidfd signaling")
+    try:
+        return int(opener(process_id, 0))
+    except ProcessLookupError:
+        raise
+    except OSError as error:
+        raise TraceError(f"cannot open stable Linux process identity: {error}") from error
+
+
+def _linux_require_pidfd_support() -> None:
+    if getattr(os, "pidfd_open", None) is None or getattr(signal, "pidfd_send_signal", None) is None:
+        raise TraceError("Linux subreaper containment requires pidfd signaling")
+
+
+def _linux_signal_pidfd(pidfd: int, requested_signal: int) -> None:
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is None:
+        raise TraceError("Linux subreaper containment requires pidfd signaling")
+    sender(pidfd, requested_signal)
+
+
+def _linux_reap_owned_descendants(root_pid: int) -> list[_IntegrityFailure]:
+    failures = []
+    for process_id in sorted(_linux_direct_children()):
+        if process_id == root_pid:
+            continue
+        try:
+            os.waitpid(process_id, os.WNOHANG)
+        except ChildProcessError:
+            continue
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-descendant-reap", error))
+    return failures
+
+
+def _linux_signal_owned_children(
+        containment: _ProcessContainment,
+        requested_signal: int,
+) -> list[_IntegrityFailure]:
+    failures = []
+    root_pid = containment.process.pid
+    try:
+        process_ids = _linux_direct_children()
+    except BaseException as error:
+        return [_IntegrityFailure("linux-child-ownership", error)]
+    for process_id in sorted(process_ids):
+        pidfd = containment.linux_root_pidfd if process_id == root_pid else None
+        close_pidfd = False
+        try:
+            if pidfd is None:
+                pidfd = _linux_open_pidfd(process_id)
+                close_pidfd = True
+            _linux_signal_pidfd(pidfd, requested_signal)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-process-termination", error))
+        finally:
+            if close_pidfd and pidfd is not None:
+                try:
+                    os.close(pidfd)
+                except BaseException as error:
+                    failures.append(_IntegrityFailure("linux-pidfd-close", error))
+    return failures
+
+
+def _start_linux_subreaper_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
+    if not _LINUX_SUBREAPER_LOCK.acquire(blocking=False):
+        raise TraceError("Linux subreaper containment is already active")
+    process = None
+    pidfd = None
+    try:
+        _linux_enable_child_subreaper()
+        _linux_require_pidfd_support()
+        if len(_linux_task_ids()) != 1:
+            raise TraceError("Linux subreaper containment requires a single-threaded supervisor")
+        if _linux_direct_children():
+            raise TraceError("Linux subreaper containment process owns unrelated children")
+        process = subprocess.Popen(command, **launch)
+        pidfd = _linux_open_pidfd(process.pid)
+        return _ProcessContainment(
+            process=process,
+            linux_root_pidfd=pidfd,
+            linux_lock_held=True,
+        )
+    except BaseException as primary_error:
+        failures = []
+        if process is not None:
+            failed_containment = _ProcessContainment(
+                process=process,
+                linux_root_pidfd=pidfd,
+                linux_lock_held=True,
+            )
+            cleanup = _terminate_process_tree(failed_containment)
+            failures.extend(cleanup.failures)
+            failures.extend(_close_process_containment(failed_containment))
+        else:
+            _LINUX_SUBREAPER_LOCK.release()
+        if failures:
+            raise ExecutionIntegrityError(
+                f"Linux containment startup primary failure "
+                f"[{type(primary_error).__name__}: {primary_error}]; "
+                f"secondary integrity failures: {_format_integrity_failures(failures)}",
+                primary_error=primary_error,
+                secondary_errors=failures,
+                quiescence_proven=False,
+            ) from primary_error
+        if process is not None:
+            raise ExecutionIntegrityError(
+                f"Linux containment startup primary failure "
+                f"[{type(primary_error).__name__}: {primary_error}]",
+                primary_error=primary_error,
+                secondary_errors=[],
+                quiescence_proven=False,
             ) from primary_error
         raise
 
@@ -852,12 +1070,16 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
 def _start_contained_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
     if sys.platform == "win32":
         return _start_windows_job_process(command, launch)
-    launch["start_new_session"] = True
-    process = subprocess.Popen(command, **launch)
-    return _ProcessContainment(process=process, process_group_id=process.pid)
+    if sys.platform == "linux":
+        return _start_linux_subreaper_process(command, launch)
+    if sys.platform == "darwin" and getattr(_TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False):
+        launch["start_new_session"] = True
+        process = subprocess.Popen(command, **launch)
+        return _ProcessContainment(process=process, test_process_group_id=process.pid)
+    raise TraceError("proven process containment is unavailable on this platform")
 
 
-def _posix_process_group_exists(process_group_id: int) -> bool:
+def _test_process_group_exists(process_group_id: int) -> bool:
     try:
         os.killpg(process_group_id, 0)
         return True
@@ -890,12 +1112,26 @@ def _windows_job_active_processes(job_handle: int) -> int:
     return int(accounting.ActiveProcesses)
 
 
+def _close_windows_process_handle(process: subprocess.Popen[bytes]) -> None:
+    process_handle = getattr(process, "_handle", None)
+    if process_handle is None:
+        return
+    if not _windows_kernel32().CloseHandle(int(process_handle)):
+        raise _windows_error("cannot close process handle")
+    process._handle = None
+
+
 def _process_tree_is_quiescent(containment: _ProcessContainment) -> bool:
     if containment.job_handle is not None:
         return _windows_job_active_processes(containment.job_handle) == 0
-    if containment.process_group_id is None:
-        raise TraceError("process containment identity is missing")
-    return not _posix_process_group_exists(containment.process_group_id)
+    if containment.linux_lock_held:
+        reap_failures = _linux_reap_owned_descendants(containment.process.pid)
+        if reap_failures:
+            raise reap_failures[0].error
+        return containment.process.poll() is not None and not _linux_direct_children()
+    if containment.test_process_group_id is not None:
+        return not _test_process_group_exists(containment.test_process_group_id)
+    raise TraceError("process containment identity is missing")
 
 
 def _wait_for_process_tree_quiescence(containment: _ProcessContainment, deadline: float) -> None:
@@ -905,42 +1141,86 @@ def _wait_for_process_tree_quiescence(containment: _ProcessContainment, deadline
         time.sleep(0.01)
 
 
-def _terminate_process_tree(containment: _ProcessContainment) -> list[_IntegrityFailure]:
+def _terminate_process_tree(containment: _ProcessContainment) -> _ContainmentCleanup:
     failures = []
     deadline = time.monotonic() + PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS
     process = containment.process
-    try:
-        if containment.job_handle is not None:
+    if containment.job_handle is not None:
+        try:
             if not _windows_kernel32().TerminateJobObject(containment.job_handle, 1):
                 raise _windows_error("cannot terminate process containment job")
-        elif containment.process_group_id is not None and _posix_process_group_exists(containment.process_group_id):
+        except BaseException as error:
+            failures.append(_IntegrityFailure("windows-job-termination", error))
+        try:
+            process.communicate(timeout=max(0.01, deadline - time.monotonic()))
+        except BaseException as error:
+            failures.append(_IntegrityFailure("windows-process-reap", error))
+    elif containment.linux_lock_held:
+        failures.extend(_linux_signal_owned_children(containment, signal.SIGTERM))
+        try:
+            process.communicate(timeout=PROCESS_TREE_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
             try:
-                os.killpg(containment.process_group_id, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            term_deadline = min(deadline, time.monotonic() + PROCESS_TREE_TERM_GRACE_SECONDS)
-            try:
-                _wait_for_process_tree_quiescence(containment, term_deadline)
-            except TraceError:
-                if _posix_process_group_exists(containment.process_group_id):
-                    try:
-                        os.killpg(containment.process_group_id, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-        else:
-            raise TraceError("process containment identity is missing")
-    except BaseException as error:
-        failures.append(_IntegrityFailure("process-tree-termination", error))
-    try:
-        remaining = max(0.01, deadline - time.monotonic())
-        process.communicate(timeout=remaining)
-    except BaseException as error:
-        failures.append(_IntegrityFailure("direct-child-reap", error))
+                process.communicate(timeout=max(0.01, deadline - time.monotonic()))
+            except BaseException as error:
+                failures.append(_IntegrityFailure("direct-child-reap", error))
+        except BaseException as error:
+            failures.append(_IntegrityFailure("direct-child-reap", error))
+        descendant_term_deadline = min(
+            deadline, time.monotonic() + PROCESS_TREE_TERM_GRACE_SECONDS)
+        failures.extend(_linux_signal_owned_children(containment, signal.SIGTERM))
+        try:
+            _wait_for_process_tree_quiescence(containment, descendant_term_deadline)
+        except BaseException:
+            failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
+            while time.monotonic() < deadline:
+                failures.extend(_linux_reap_owned_descendants(process.pid))
+                try:
+                    if _process_tree_is_quiescent(containment):
+                        break
+                except BaseException as error:
+                    failures.append(_IntegrityFailure("linux-child-ownership", error))
+                    break
+                failures.extend(_linux_signal_owned_children(containment, signal.SIGKILL))
+                time.sleep(0.01)
+    elif containment.test_process_group_id is not None:
+        try:
+            if _test_process_group_exists(containment.test_process_group_id):
+                try:
+                    os.killpg(containment.test_process_group_id, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                term_deadline = min(deadline, time.monotonic() + PROCESS_TREE_TERM_GRACE_SECONDS)
+                try:
+                    _wait_for_process_tree_quiescence(containment, term_deadline)
+                except TraceError:
+                    if _test_process_group_exists(containment.test_process_group_id):
+                        try:
+                            os.killpg(containment.test_process_group_id, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+        except BaseException as error:
+            failures.append(_IntegrityFailure("process-tree-termination", error))
+        try:
+            process.communicate(timeout=max(0.01, deadline - time.monotonic()))
+        except BaseException as error:
+            failures.append(_IntegrityFailure("direct-child-reap", error))
+    else:
+        failures.append(_IntegrityFailure(
+            "process-tree-termination", TraceError("process containment identity is missing")))
     try:
         _wait_for_process_tree_quiescence(containment, deadline)
     except BaseException as error:
         failures.append(_IntegrityFailure("process-tree-quiescence", error))
-    return failures
+    quiescence_proven = not failures
+    if quiescence_proven:
+        try:
+            quiescence_proven = _process_tree_is_quiescent(containment)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("process-tree-quiescence", error))
+            quiescence_proven = False
+    return _ContainmentCleanup(failures, quiescence_proven)
 
 
 def _run_contained_process(
@@ -960,38 +1240,58 @@ def _run_contained_process(
             error.primary_error or error,
             list(error.secondary_errors),
             None,
+            error.quiescence_proven,
+            True,
         )
     except BaseException as error:
-        return _ContainedRun(None, error, [], None)
+        return _ContainedRun(None, error, [], None, False, False)
     try:
         stdout, stderr = containment.process.communicate(input=input_data, timeout=timeout)
         result = subprocess.CompletedProcess(
             command, containment.process.returncode, stdout, stderr)
     except BaseException as error:
-        failures = _terminate_process_tree(containment)
-        return _ContainedRun(None, error, failures, containment)
+        cleanup = _terminate_process_tree(containment)
+        return _ContainedRun(
+            None, error, cleanup.failures, containment, cleanup.quiescence_proven, True)
     try:
         if _process_tree_is_quiescent(containment):
-            return _ContainedRun(result, None, [], containment)
+            return _ContainedRun(result, None, [], containment, True, True)
     except BaseException as error:
         failures = [_IntegrityFailure("process-tree-quiescence", error)]
     else:
         error = TraceError(f"{label} process tree remained active after direct child exit")
         failures = []
-    failures.extend(_terminate_process_tree(containment))
-    return _ContainedRun(None, error, failures, containment)
+    cleanup = _terminate_process_tree(containment)
+    failures.extend(cleanup.failures)
+    return _ContainedRun(
+        None, error, failures, containment, cleanup.quiescence_proven, True)
 
 
 def _close_process_containment(containment: _ProcessContainment | None) -> list[_IntegrityFailure]:
-    if containment is None or containment.job_handle is None:
+    if containment is None:
         return []
-    try:
-        if not _windows_kernel32().CloseHandle(containment.job_handle):
-            raise _windows_error("cannot close process containment job")
-        containment.job_handle = None
-        return []
-    except BaseException as error:
-        return [_IntegrityFailure("containment-handle-close", error)]
+    failures = []
+    if containment.job_handle is not None:
+        try:
+            if not _windows_kernel32().CloseHandle(containment.job_handle):
+                raise _windows_error("cannot close process containment job")
+            containment.job_handle = None
+        except BaseException as error:
+            failures.append(_IntegrityFailure("containment-handle-close", error))
+        try:
+            _close_windows_process_handle(containment.process)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("windows-process-handle-close", error))
+    if containment.linux_root_pidfd is not None:
+        try:
+            os.close(containment.linux_root_pidfd)
+            containment.linux_root_pidfd = None
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-root-pidfd-close", error))
+    if containment.linux_lock_held:
+        containment.linux_lock_held = False
+        _LINUX_SUBREAPER_LOCK.release()
+    return failures
 
 
 def _format_integrity_failures(failures: list[_IntegrityFailure]) -> str:
@@ -1005,23 +1305,27 @@ def _raise_execution_integrity_failures(
         label: str,
         primary_error: BaseException | None,
         integrity_failures: list[_IntegrityFailure],
+        containment_started: bool,
+        quiescence_proven: bool,
 ) -> None:
-    if primary_error is not None and integrity_failures:
+    if primary_error is not None and containment_started:
+        suffix = ""
+        if integrity_failures:
+            suffix = f"; secondary integrity failures: {_format_integrity_failures(integrity_failures)}"
         raise ExecutionIntegrityError(
-            f"{label} primary failure [{type(primary_error).__name__}: {primary_error}]; "
-            f"secondary integrity failures: {_format_integrity_failures(integrity_failures)}",
+            f"{label} primary failure [{type(primary_error).__name__}: {primary_error}]{suffix}",
             primary_error=primary_error,
             secondary_errors=integrity_failures,
+            quiescence_proven=quiescence_proven,
         ) from primary_error
     if primary_error is not None:
         raise primary_error
-    if len(integrity_failures) == 1:
-        raise integrity_failures[0].error
     if integrity_failures:
         raise ExecutionIntegrityError(
             f"{label} integrity failures: {_format_integrity_failures(integrity_failures)}",
             primary_error=None,
             secondary_errors=integrity_failures,
+            quiescence_proven=quiescence_proven,
         ) from integrity_failures[0].error
 
 
@@ -1091,8 +1395,11 @@ def run_approved_executable(
     runtime_files: list[tuple[ExecutableFileReceipt, int]] = []
     containment = None
     result = None
+    decoded_result = None
     primary_error = None
     integrity_failures: list[_IntegrityFailure] = []
+    containment_started = False
+    quiescence_proven = False
     try:
         for component in runtime_policy["runtime_receipt"]["components"]:
             runtime_path = Path(runtime_policy["install_root"]) / "lib" / component["filename"]
@@ -1126,6 +1433,8 @@ def run_approved_executable(
             launch=launch,
         )
         containment = contained.containment
+        containment_started = contained.process_started
+        quiescence_proven = contained.quiescence_proven
         result = contained.result
         primary_error = contained.primary_error
         integrity_failures.extend(contained.integrity_failures)
@@ -1209,18 +1518,25 @@ def run_approved_executable(
         except BaseException as error:
             integrity_failures.append(_IntegrityFailure("executable-descriptor-close", error))
         integrity_failures.extend(_close_process_containment(containment))
+    if result is not None and primary_error is None:
+        try:
+            stdout = _decode_subprocess_stream(
+                result.stdout, text=text, encoding=encoding, errors=errors)
+            stderr = _decode_subprocess_stream(
+                result.stderr, text=text, encoding=encoding, errors=errors)
+            decoded_result = subprocess.CompletedProcess(
+                result.args, result.returncode, stdout, stderr)
+        except BaseException as error:
+            primary_error = error
     _raise_execution_integrity_failures(
         label=label,
         primary_error=primary_error,
         integrity_failures=integrity_failures,
+        containment_started=containment_started,
+        quiescence_proven=quiescence_proven,
     )
-    if result is None:
+    if decoded_result is None:
         raise TraceError(f"{label} execution did not return a result")
-    stdout = _decode_subprocess_stream(
-        result.stdout, text=text, encoding=encoding, errors=errors)
-    stderr = _decode_subprocess_stream(
-        result.stderr, text=text, encoding=encoding, errors=errors)
-    decoded_result = subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
     return decoded_result, identity
 
 

@@ -681,7 +681,7 @@ def fixture_runtime_build(policy: dict[str, object]) -> dict[str, object]:
 
 
 @contextlib.contextmanager
-def isolated_test_install_trust():
+def isolated_test_install_trust(*, process_containment: bool = True):
     modules = (trace, sys.modules["trace_format"])
     with contextlib.ExitStack() as stack:
         for module in modules:
@@ -694,6 +694,8 @@ def isolated_test_install_trust():
                 module, "_path_is_writable_by_execution_identity", return_value=False))
             stack.enter_context(mock.patch.object(
                 module, "_has_access_control_entries", return_value=False))
+            if process_containment and sys.platform == "darwin":
+                stack.enter_context(module._test_only_process_group_containment())
         yield
 
 
@@ -1993,7 +1995,7 @@ class TraceFormatTests(unittest.TestCase):
                 },
             }
             completed = subprocess.CompletedProcess([str(executable)], 0, b"", b"")
-            contained = trace._ContainedRun(completed, None, [], None)
+            contained = trace._ContainedRun(completed, None, [], None, True, True)
             with isolated_test_install_trust(), mock.patch.object(
                     trace.sys, "platform", "linux"), mock.patch.object(
                     trace, "_run_contained_process", return_value=contained) as execute:
@@ -2029,7 +2031,7 @@ class TraceFormatTests(unittest.TestCase):
             }
             events = []
             completed = subprocess.CompletedProcess([str(executable)], 0, b"\xff", b"")
-            contained = trace._ContainedRun(completed, None, [], None)
+            contained = trace._ContainedRun(completed, None, [], None, True, True)
             original_verify = trace.verify_approved_executable_identity
             original_decode = trace._decode_subprocess_stream
 
@@ -2044,7 +2046,8 @@ class TraceFormatTests(unittest.TestCase):
             with isolated_test_install_trust(), mock.patch.object(
                     trace, "_run_contained_process", return_value=contained), mock.patch.object(
                     trace, "verify_approved_executable_identity", side_effect=verify), mock.patch.object(
-                    trace, "_decode_subprocess_stream", side_effect=decode), self.assertRaises(UnicodeDecodeError):
+                    trace, "_decode_subprocess_stream", side_effect=decode), self.assertRaises(
+                    trace.ExecutionIntegrityError) as raised:
                 trace.run_approved_executable(
                     [str(executable)],
                     path=executable,
@@ -2056,6 +2059,8 @@ class TraceFormatTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
+            self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+            self.assertTrue(raised.exception.quiescence_proven)
             self.assertGreater(events.count("verify"), 1)
             self.assertLess(max(index for index, event in enumerate(events) if event == "verify"), events.index("decode"))
 
@@ -2210,7 +2215,7 @@ class TraceFormatTests(unittest.TestCase):
                     replacement.rename(exporter)
                     exporter.parent.chmod(0o555)
                     result = subprocess.CompletedProcess([str(exporter)], 0, b"replacement\n", b"")
-                    return trace._ContainedRun(result, None, [], None)
+                    return trace._ContainedRun(result, None, [], None, True, True)
 
                 with mock.patch.object(
                         sys.modules["trace_format"],
@@ -2252,7 +2257,7 @@ class TraceFormatTests(unittest.TestCase):
                     replacement.rename(exporter)
                     exporter.parent.chmod(0o555)
                     error = subprocess.TimeoutExpired([str(exporter)], 7)
-                    return trace._ContainedRun(None, error, [], None)
+                    return trace._ContainedRun(None, error, [], None, True, True)
 
                 with mock.patch.object(
                         sys.modules["trace_format"],
@@ -2298,7 +2303,7 @@ class TraceFormatTests(unittest.TestCase):
                     Path(policy["install_root"]).chmod(0o777)
                     cleanup = trace._IntegrityFailure(
                         "process-tree-quiescence", trace.TraceError("cleanup deadline expired"))
-                    return trace._ContainedRun(None, primary, [cleanup], None)
+                    return trace._ContainedRun(None, primary, [cleanup], None, False, True)
 
                 with mock.patch.object(
                         sys.modules["trace_format"],
@@ -2324,22 +2329,40 @@ class TraceFormatTests(unittest.TestCase):
             self.assertTrue(any(item.startswith("runtime-descriptor:") for item in components))
             self.assertTrue(any(item.startswith("runtime-path-root:") for item in components))
 
-    @unittest.skipUnless(os.name == "posix", "POSIX process-group test")
-    def test_approved_executable_timeout_kills_descendant_before_return(self) -> None:
+    @unittest.skipUnless(os.name == "posix", "POSIX containment test")
+    def test_approved_executable_timeout_contains_setsid_descendant(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             policy, exporter = materialize_ds4_exporter_policy(root)
             marker = root / "descendant-survived"
             exporter.chmod(0o755)
-            exporter.write_text(
-                "#!/bin/sh\n"
-                "( sleep 1; printf survived > \"$1\" ) </dev/null >/dev/null 2>&1 &\n"
-                "sleep 30\n",
-                encoding="ascii",
-            )
+            if sys.platform == "linux":
+                exporter.write_text(
+                    f"#!{sys.executable}\n"
+                    "import os\n"
+                    "import signal\n"
+                    "import sys\n"
+                    "import time\n"
+                    "if os.fork() == 0:\n"
+                    "    os.setsid()\n"
+                    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    "    time.sleep(1)\n"
+                    "    open(sys.argv[1], 'w', encoding='ascii').write('survived')\n"
+                    "    os._exit(0)\n"
+                    "time.sleep(30)\n",
+                    encoding="ascii",
+                )
+            else:
+                exporter.write_text(
+                    "#!/bin/sh\n"
+                    "( sleep 1; printf survived > \"$1\" ) </dev/null >/dev/null 2>&1 &\n"
+                    "sleep 30\n",
+                    encoding="ascii",
+                )
             exporter.chmod(0o555)
             policy["executable_sha256"] = trace.sha256_file(exporter)
-            with isolated_test_install_trust(), self.assertRaises(subprocess.TimeoutExpired):
+            with isolated_test_install_trust(), self.assertRaises(
+                    trace.ExecutionIntegrityError) as raised:
                 trace.run_approved_executable(
                     [str(exporter), str(marker)],
                     path=exporter,
@@ -2351,46 +2374,101 @@ class TraceFormatTests(unittest.TestCase):
                     check=False,
                     capture_output=True,
                 )
+            self.assertIsInstance(raised.exception.__cause__, subprocess.TimeoutExpired)
             time.sleep(1.2)
             self.assertFalse(marker.exists())
 
-    def test_posix_process_tree_cleanup_escalates_and_reaps(self) -> None:
-        process = mock.Mock()
-        process.communicate.return_value = (b"", b"")
-        containment = trace._ProcessContainment(process=process, process_group_id=77)
+    def test_linux_subreaper_signals_stable_pidfds_not_numeric_ids(self) -> None:
+        process = mock.Mock(pid=77)
+        containment = trace._ProcessContainment(
+            process=process, linux_root_pidfd=90, linux_lock_held=True)
         with mock.patch.object(
-                trace, "_posix_process_group_exists", return_value=True), mock.patch.object(
-                trace,
-                "_wait_for_process_tree_quiescence",
-                side_effect=[trace.TraceError("term deadline"), None],
-        ), mock.patch.object(trace.os, "killpg") as killpg:
-            failures = trace._terminate_process_tree(containment)
+                trace, "_linux_direct_children", return_value={77, 78}), mock.patch.object(
+                trace, "_linux_open_pidfd", return_value=91) as open_pidfd, mock.patch.object(
+                trace, "_linux_signal_pidfd") as signal_pidfd, mock.patch.object(
+                trace.os, "close") as close, mock.patch.object(trace.os, "kill") as numeric_kill:
+            failures = trace._linux_signal_owned_children(containment, trace.signal.SIGKILL)
         self.assertEqual(failures, [])
+        open_pidfd.assert_called_once_with(78)
         self.assertEqual(
-            killpg.call_args_list,
-            [mock.call(77, trace.signal.SIGTERM), mock.call(77, trace.signal.SIGKILL)],
+            signal_pidfd.call_args_list,
+            [mock.call(90, trace.signal.SIGKILL), mock.call(91, trace.signal.SIGKILL)],
         )
-        process.communicate.assert_called_once()
+        close.assert_called_once_with(91)
+        numeric_kill.assert_not_called()
 
-    def test_posix_process_tree_cleanup_timeout_is_integrity_failure(self) -> None:
-        process = mock.Mock()
-        process.communicate.side_effect = subprocess.TimeoutExpired(["exporter"], 5)
-        containment = trace._ProcessContainment(process=process, process_group_id=78)
-        with mock.patch.object(
-                trace, "_posix_process_group_exists", return_value=True), mock.patch.object(
-                trace,
-                "_wait_for_process_tree_quiescence",
-                side_effect=trace.TraceError("cleanup deadline"),
-        ), mock.patch.object(trace.os, "killpg") as killpg:
-            failures = trace._terminate_process_tree(containment)
-        self.assertEqual(
-            [failure.component for failure in failures],
-            ["direct-child-reap", "process-tree-quiescence"],
-        )
-        self.assertEqual(
-            killpg.call_args_list,
-            [mock.call(78, trace.signal.SIGTERM), mock.call(78, trace.signal.SIGKILL)],
-        )
+    def test_linux_subreaper_rejects_unrelated_child_ownership(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_linux_enable_child_subreaper"), mock.patch.object(
+                trace, "_linux_require_pidfd_support"), mock.patch.object(
+                trace, "_linux_task_ids", return_value={1}), mock.patch.object(
+                trace, "_linux_direct_children", return_value={42}), mock.patch.object(
+                trace.subprocess, "Popen") as popen, self.assertRaisesRegex(
+                trace.TraceError, "owns unrelated children"):
+            trace._start_linux_subreaper_process(["approved"], {})
+        popen.assert_not_called()
+        lock.release.assert_called_once()
+
+    def test_linux_subreaper_boundary_precedes_target_execution(self) -> None:
+        source = inspect.getsource(trace._start_linux_subreaper_process)
+        self.assertLess(source.index("_linux_enable_child_subreaper"), source.index("subprocess.Popen"))
+        self.assertLess(source.index("_linux_task_ids"), source.index("subprocess.Popen"))
+        self.assertLess(source.index("_linux_direct_children"), source.index("subprocess.Popen"))
+        self.assertIn("_linux_open_pidfd", source)
+        self.assertNotIn("killpg", source)
+        self.assertNotIn("os.kill(", inspect.getsource(trace._linux_signal_owned_children))
+
+    def test_linux_subreaper_without_pidfd_support_fails_before_launch(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        with mock.patch.object(trace, "_LINUX_SUBREAPER_LOCK", lock), mock.patch.object(
+                trace, "_linux_enable_child_subreaper"), mock.patch.object(
+                trace, "_linux_require_pidfd_support", side_effect=trace.TraceError("pidfd unavailable")), mock.patch.object(
+                trace.subprocess, "Popen") as popen, self.assertRaisesRegex(
+                trace.TraceError, "pidfd unavailable"):
+            trace._start_linux_subreaper_process(["approved"], {})
+        popen.assert_not_called()
+        lock.release.assert_called_once()
+
+    def test_unproven_posix_containment_fails_closed_before_setsid_escape(self) -> None:
+        if sys.platform == "linux":
+            self.skipTest("Linux uses subreaper and pidfd containment")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            marker = root / "escaped"
+            exporter.chmod(0o755)
+            exporter.write_text(
+                "#!/bin/sh\n"
+                f"printf started > '{marker}'\n"
+                "sleep 30\n",
+                encoding="ascii",
+            )
+            exporter.chmod(0o555)
+            policy["executable_sha256"] = trace.sha256_file(exporter)
+            with isolated_test_install_trust(process_containment=False):
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                with self.assertRaisesRegex(
+                        run_ds4.TraceError, "proven process containment is unavailable"):
+                    run_ds4.run_exporter_command(
+                        [str(exporter), str(marker)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        timeout_seconds=1,
+                        check=False,
+                        capture_output=True,
+                    )
+            self.assertFalse(marker.exists())
 
     def test_windows_job_containment_is_suspended_before_assignment_and_resume(self) -> None:
         start_source = inspect.getsource(trace._start_windows_job_process)
@@ -2440,6 +2518,30 @@ class TraceFormatTests(unittest.TestCase):
             trace.WINDOWS_CREATE_SUSPENDED,
         )
         self.assertEqual(containment.job_handle, 93)
+        self.assertTrue(containment.windows_job_assigned)
+        self.assertTrue(containment.windows_process_resumed)
+
+    def test_windows_job_assignment_failure_kills_and_reaps_exact_child(self) -> None:
+        process = mock.Mock(pid=91)
+        process._handle = 92
+        kernel32 = mock.Mock()
+        kernel32.AssignProcessToJobObject.return_value = 0
+        kernel32.CloseHandle.return_value = 1
+        with mock.patch.object(
+                trace.subprocess, "Popen", return_value=process), mock.patch.object(
+                trace, "_create_windows_kill_job", return_value=93), mock.patch.object(
+                trace, "_windows_kernel32", return_value=kernel32), self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            trace._start_windows_job_process(["approved"], {})
+        self.assertFalse(raised.exception.quiescence_proven)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=trace.PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
+        kernel32.TerminateJobObject.assert_not_called()
+        self.assertEqual(
+            kernel32.CloseHandle.call_args_list,
+            [mock.call(92), mock.call(93)],
+        )
+        self.assertIsNone(process._handle)
 
     def test_ds4_writable_root_blocks_restore_before_postcheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3419,6 +3521,53 @@ class TraceFormatTests(unittest.TestCase):
                     )
             self.assertEqual(marker.read_text(encoding="ascii"), "build")
 
+    @unittest.skipUnless(os.name == "posix", "POSIX executable test")
+    def test_ds4_actual_invalid_utf8_and_post_build_failure_are_both_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            exporter.chmod(0o755)
+            exporter.write_text(
+                "#!/bin/sh\n"
+                "if test \"$1\" = --dsv41-attest-build; then\n"
+                "  printf 'post-build failed' >&2\n"
+                "  exit 9\n"
+                "fi\n"
+                "printf '\\377'\n",
+                encoding="ascii",
+            )
+            exporter.chmod(0o555)
+            policy["executable_sha256"] = trace.sha256_file(exporter)
+            expected_build = fixture_runtime_build(policy)
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                with self.assertRaisesRegex(
+                        preflight.PreflightError,
+                        "primary failure.*not valid UTF-8.*secondary post-invocation.*post-build failed",
+                ) as raised:
+                    run_ds4.query_accelerator_attestation(
+                        exporter,
+                        "Metal0",
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        expected_runtime_build=expected_build,
+                    )
+            primary = raised.exception.__cause__
+            self.assertIsInstance(primary, preflight.PreflightError)
+            self.assertIsInstance(primary.__cause__, UnicodeDecodeError)
+            self.assertIs(raised.exception.primary_error, primary)
+            self.assertEqual(
+                [failure.component for failure in raised.exception.secondary_errors],
+                ["post-invocation-runtime-build-attestation"],
+            )
+
     def test_ds4_invalid_utf8_build_attestation_is_nonrecursive(self) -> None:
         invalid_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"\xff", b"")
         with mock.patch.object(
@@ -3432,14 +3581,21 @@ class TraceFormatTests(unittest.TestCase):
         execute.assert_called_once()
 
     def test_ds4_main_unicode_error_still_post_attests(self) -> None:
+        runtime_trace = sys.modules["trace_format"]
         primary = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        contained_error = runtime_trace.ExecutionIntegrityError(
+            "decode failed after contained execution",
+            primary_error=primary,
+            secondary_errors=[],
+            quiescence_proven=True,
+        )
         build_result = run_ds4.subprocess.CompletedProcess(
             ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
         with mock.patch.object(
                 run_ds4,
                 "run_exporter_command",
-                side_effect=[primary, build_result],
-        ) as execute, self.assertRaises(UnicodeDecodeError) as raised:
+                side_effect=[contained_error, build_result],
+        ) as execute, self.assertRaises(runtime_trace.ExecutionIntegrityError) as raised:
             run_ds4.run_exporter_with_post_attestation(
                 ["/approved/exporter", "--model", "/model.gguf"],
                 operation="ds4 trace execution",
@@ -3450,7 +3606,7 @@ class TraceFormatTests(unittest.TestCase):
                 timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
                 check=False,
             )
-        self.assertIs(raised.exception, primary)
+        self.assertIs(raised.exception, contained_error)
         self.assertEqual(execute.call_count, 2)
 
     def test_ds4_postflight_invalid_utf8_still_post_attests(self) -> None:
@@ -3486,15 +3642,16 @@ class TraceFormatTests(unittest.TestCase):
         )
 
     def test_ds4_unicode_and_post_attestation_failures_are_both_retained(self) -> None:
-        primary = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
         secondary = OSError("post-build launch failed")
+        invalid_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, b"\xff", b"")
         with mock.patch.object(
                 run_ds4,
                 "run_exporter_command",
-                side_effect=[primary, secondary],
+                side_effect=[invalid_result, secondary],
         ) as execute, self.assertRaisesRegex(
                 preflight.PreflightError,
-                "primary failure \\[UnicodeDecodeError:.*secondary post-invocation.*"
+                "primary failure \\[PreflightError:.*not valid UTF-8.*secondary post-invocation.*"
                 "OSError: post-build launch failed") as raised:
             run_ds4.run_exporter_with_post_attestation(
                 ["/approved/exporter", "--model", "/model.gguf"],
@@ -3505,48 +3662,72 @@ class TraceFormatTests(unittest.TestCase):
                 expected_runtime_build=DS4_RUNTIME_BUILD,
                 timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
                 check=False,
+                capture_output=True,
+                decode_stdout_label="ds4 trace stdout",
+                decode_stderr_label="ds4 trace stderr",
             )
-        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIsInstance(raised.exception.__cause__, preflight.PreflightError)
+        self.assertIsInstance(raised.exception.__cause__.__cause__, UnicodeDecodeError)
+        self.assertIs(raised.exception.primary_error, raised.exception.__cause__)
+        self.assertEqual(
+            [failure.component for failure in raised.exception.secondary_errors],
+            ["post-invocation-runtime-build-attestation"],
+        )
         self.assertEqual(execute.call_count, 2)
 
-    def test_ds4_does_not_post_attest_without_process_tree_quiescence(self) -> None:
+    def test_ds4_explicit_quiescence_false_always_blocks_post_attestation(self) -> None:
         runtime_trace = sys.modules["trace_format"]
-        primary = subprocess.TimeoutExpired(["exporter"], 7)
-        failure = runtime_trace._IntegrityFailure(
-            "process-tree-quiescence", runtime_trace.TraceError("descendant survived"))
-        containment_error = runtime_trace.ExecutionIntegrityError(
-            "timeout and quiescence failure",
-            primary_error=primary,
-            secondary_errors=[failure],
-        )
-        with mock.patch.object(
-                run_ds4, "run_exporter_command", side_effect=containment_error) as execute, self.assertRaises(
-                runtime_trace.ExecutionIntegrityError) as raised:
-            run_ds4.run_exporter_with_post_attestation(
-                ["/approved/exporter", "--model", "/model.gguf"],
-                operation="ds4 trace execution",
-                exporter=Path("/approved/exporter"),
-                exporter_identity=object(),
-                exporter_policy=DS4_EXPORTER_POLICY,
-                expected_runtime_build=DS4_RUNTIME_BUILD,
-                timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        self.assertIs(raised.exception, containment_error)
-        execute.assert_called_once()
+        for component in (
+                "process-tree-quiescence",
+                "windows-process-reap",
+                "windows-process-termination",
+                "windows-job-assignment",
+                "linux-child-ownership"):
+            with self.subTest(component=component):
+                primary = subprocess.TimeoutExpired(["exporter"], 7)
+                failure = runtime_trace._IntegrityFailure(
+                    component, runtime_trace.TraceError("quiescence not proven"))
+                containment_error = runtime_trace.ExecutionIntegrityError(
+                    "execution did not prove quiescence",
+                    primary_error=primary,
+                    secondary_errors=[failure],
+                    quiescence_proven=False,
+                )
+                with mock.patch.object(
+                        run_ds4, "run_exporter_command", side_effect=containment_error) as execute, self.assertRaises(
+                        runtime_trace.ExecutionIntegrityError) as raised:
+                    run_ds4.run_exporter_with_post_attestation(
+                        ["/approved/exporter", "--model", "/model.gguf"],
+                        operation="ds4 trace execution",
+                        exporter=Path("/approved/exporter"),
+                        exporter_identity=object(),
+                        exporter_policy=DS4_EXPORTER_POLICY,
+                        expected_runtime_build=DS4_RUNTIME_BUILD,
+                        timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                self.assertIs(raised.exception, containment_error)
+                execute.assert_called_once()
 
     def test_ds4_accelerator_query_attests_after_launch_exceptions(self) -> None:
+        runtime_trace = sys.modules["trace_format"]
         build_result = run_ds4.subprocess.CompletedProcess(
             ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
-        for primary_error in (
+        for primary in (
                 OSError("device launch failed"),
                 subprocess.TimeoutExpired(["exporter"], 7),
         ):
-            with self.subTest(error=type(primary_error).__name__), mock.patch.object(
+            primary_error = runtime_trace.ExecutionIntegrityError(
+                "contained invocation failed",
+                primary_error=primary,
+                secondary_errors=[],
+                quiescence_proven=True,
+            )
+            with self.subTest(error=type(primary).__name__), mock.patch.object(
                     run_ds4,
                     "run_exporter_command",
                     side_effect=[primary_error, build_result],
-            ) as execute, self.assertRaisesRegex(type(primary_error), "device launch failed|timed out"):
+            ) as execute, self.assertRaises(runtime_trace.ExecutionIntegrityError):
                 run_ds4.query_accelerator_attestation(
                     Path("/approved/exporter"),
                     "Metal0",
@@ -3572,6 +3753,21 @@ class TraceFormatTests(unittest.TestCase):
                 run_ds4.EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
             )
 
+    def test_ds4_pre_spawn_failure_does_not_launch_post_attestation(self) -> None:
+        primary = OSError("process creation failed")
+        with mock.patch.object(
+                run_ds4, "run_exporter_command", side_effect=primary) as execute, self.assertRaises(
+                OSError) as raised:
+            run_ds4.query_accelerator_attestation(
+                Path("/approved/exporter"),
+                "Metal0",
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+            )
+        self.assertIs(raised.exception, primary)
+        execute.assert_called_once()
+
     def test_ds4_accelerator_query_attests_after_nonzero_exit(self) -> None:
         device_result = run_ds4.subprocess.CompletedProcess(
             ["exporter"], 9, b"", b"device failed")
@@ -3592,8 +3788,14 @@ class TraceFormatTests(unittest.TestCase):
         self.assertEqual(execute.call_count, 2)
 
     def test_ds4_invocation_reports_primary_and_post_attestation_failures(self) -> None:
+        runtime_trace = sys.modules["trace_format"]
         primary_failures = (
-            subprocess.TimeoutExpired(["exporter"], 7),
+            runtime_trace.ExecutionIntegrityError(
+                "contained invocation timed out",
+                primary_error=subprocess.TimeoutExpired(["exporter"], 7),
+                secondary_errors=[],
+                quiescence_proven=True,
+            ),
             run_ds4.subprocess.CompletedProcess(["exporter"], 9, b"", b"device failed"),
         )
         for primary_failure in primary_failures:
@@ -3604,7 +3806,7 @@ class TraceFormatTests(unittest.TestCase):
                     side_effect=[primary_failure, secondary_error],
             ) as execute, self.assertRaisesRegex(
                     preflight.PreflightError,
-                    "primary failure \\[(TimeoutExpired|PreflightError):.*secondary post-invocation.*"
+                    "primary failure \\[(ExecutionIntegrityError|PreflightError):.*secondary post-invocation.*"
                     "OSError: post-build launch failed"):
                 run_ds4.run_exporter_with_post_attestation(
                     ["/approved/exporter", "--dsv41-attest-device", "Metal0"],
