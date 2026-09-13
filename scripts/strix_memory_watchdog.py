@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
 import secrets
+import select
 import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -32,6 +37,8 @@ LEASE_FORMAT = "strix-memory-watchdog-lease"
 LEASE_VERSION = 1
 HEARTBEAT_FORMAT = "strix-memory-watchdog-heartbeat"
 HEARTBEAT_VERSION = 1
+PR_SET_PDEATHSIG = 1
+LEASE_GUARD_SIGNAL = signal.SIGUSR1
 
 EXIT_PROCFS_ERROR = 2
 EXIT_SWAP_ACTIVE = 3
@@ -80,6 +87,42 @@ class ProcessHandle(Protocol):
 
     def wait(self, timeout: float | None = None) -> int:
         ...
+
+
+@dataclass
+class GuardianProcess:
+    process: subprocess.Popen[bytes]
+    payload_pid: int
+    pulse_fd: int
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def poll(self) -> int | None:
+        return self.process.poll()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.process.wait(timeout=timeout)
+
+    def pulse(self) -> None:
+        try:
+            os.write(self.pulse_fd, b"\0")
+        except BlockingIOError as exc:
+            raise ProcessGroupError(
+                "guardian pulse pipe is blocked"
+            ) from exc
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            raise ProcessGroupError(
+                f"cannot pulse guardian: {detail}"
+            ) from exc
+
+    def close(self) -> None:
+        try:
+            os.close(self.pulse_fd)
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -139,6 +182,14 @@ class WatchdogConfig:
             or self.sample_interval_seconds <= 0
         ):
             raise ValueError("sample interval must be greater than zero")
+        if (
+            not math.isfinite(self.heartbeat_max_age_seconds)
+            or self.heartbeat_max_age_seconds
+            <= self.sample_interval_seconds
+        ):
+            raise ValueError(
+                "heartbeat max age must be greater than sample interval"
+            )
         lease_paths = (
             self.lease_path,
             self.heartbeat_path,
@@ -167,14 +218,6 @@ class WatchdogConfig:
             if len({paths.lease, paths.heartbeat, paths.audit}) != 3:
                 raise ValueError(
                     "lease, heartbeat, and audit paths must be distinct"
-                )
-            if (
-                not math.isfinite(self.heartbeat_max_age_seconds)
-                or self.heartbeat_max_age_seconds
-                <= self.sample_interval_seconds
-            ):
-                raise ValueError(
-                    "heartbeat max age must be greater than sample interval"
                 )
             return paths
         return None
@@ -278,6 +321,185 @@ def _command_sha256(command: Sequence[str]) -> str:
     return _sha256_bytes(encoded)
 
 
+def _set_parent_death_signal(
+    signal_number: int, expected_parent_pid: int
+) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal_number, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _kill_own_process_group(
+    _signal_number: int | None = None,
+    _frame: object | None = None,
+) -> None:
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        os._exit(EXIT_SIGNAL_ERROR)
+
+
+def _guardian_main(
+    control_fd: int,
+    status_fd: int,
+    pulse_timeout_seconds: float,
+    command: tuple[str, ...],
+) -> int:
+    if not sys.platform.startswith("linux"):
+        return EXIT_LAUNCH_ERROR
+    os.set_inheritable(control_fd, False)
+    os.set_inheritable(status_fd, False)
+    signal.signal(LEASE_GUARD_SIGNAL, _kill_own_process_group)
+    for signal_number in PARENT_SIGNALS:
+        signal.signal(signal_number, signal.SIG_IGN)
+    _set_parent_death_signal(LEASE_GUARD_SIGNAL, os.getppid())
+
+    def prepare_payload() -> None:
+        for signal_number in PARENT_SIGNALS:
+            signal.signal(signal_number, signal.SIG_DFL)
+
+    try:
+        payload = subprocess.Popen(command, preexec_fn=prepare_payload)
+    except (OSError, ValueError) as exc:
+        os.write(
+            status_fd,
+            json.dumps(
+                {"error": getattr(exc, "strerror", None) or str(exc)}
+            ).encode("utf-8")
+            + b"\n",
+        )
+        os.close(status_fd)
+        return EXIT_LAUNCH_ERROR
+
+    os.write(
+        status_fd,
+        json.dumps({"payload_pid": payload.pid}).encode("utf-8") + b"\n",
+    )
+    os.close(status_fd)
+    poller = select.poll()
+    poller.register(
+        control_fd,
+        select.POLLIN | select.POLLHUP | select.POLLERR,
+    )
+    deadline = time.monotonic() + pulse_timeout_seconds
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        events = poller.poll(max(1, min(50, int(remaining * 1000))))
+        for _, event_mask in events:
+            if event_mask & (select.POLLHUP | select.POLLERR):
+                _kill_own_process_group()
+            try:
+                pulse = os.read(control_fd, 65536)
+            except BlockingIOError:
+                pulse = b""
+            if not pulse:
+                _kill_own_process_group()
+            deadline = time.monotonic() + pulse_timeout_seconds
+        if time.monotonic() >= deadline:
+            _kill_own_process_group()
+        returncode = payload.poll()
+        if returncode is not None:
+            return (
+                128 - returncode
+                if returncode < 0
+                else returncode
+            )
+
+
+def _read_guardian_status(
+    descriptor: int, timeout_seconds: float
+) -> int:
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN | select.POLLHUP)
+    deadline = time.monotonic() + timeout_seconds
+    content = b""
+    while time.monotonic() < deadline:
+        events = poller.poll(
+            max(1, int((deadline - time.monotonic()) * 1000))
+        )
+        if not events:
+            continue
+        chunk = os.read(descriptor, 4096)
+        if not chunk:
+            break
+        content += chunk
+        if b"\n" in content:
+            break
+    if not content:
+        raise OSError("guardian did not report payload startup")
+    try:
+        status = json.loads(content.splitlines()[0])
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise OSError("guardian returned malformed startup status") from exc
+    if not isinstance(status, dict):
+        raise OSError("guardian returned malformed startup status")
+    if "error" in status:
+        raise OSError(str(status["error"]))
+    payload_pid = status.get("payload_pid")
+    if not isinstance(payload_pid, int):
+        raise OSError("guardian did not report a payload PID")
+    return payload_pid
+
+
+def _launch_guardian(
+    command: tuple[str, ...],
+    environment: dict[str, str],
+    pulse_timeout_seconds: float,
+    launch_mask: set[signal.Signals],
+) -> GuardianProcess:
+    control_read, control_write = os.pipe()
+    os.set_blocking(control_read, False)
+    os.set_blocking(control_write, False)
+    status_read, status_write = os.pipe()
+    parent_pid = os.getpid()
+
+    def prepare_guardian() -> None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, launch_mask)
+        _set_parent_death_signal(signal.SIGKILL, parent_pid)
+
+    guardian_command = (
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--internal-guardian",
+        str(control_read),
+        str(status_write),
+        str(pulse_timeout_seconds),
+        "--",
+        *command,
+    )
+    try:
+        process = subprocess.Popen(
+            guardian_command,
+            start_new_session=True,
+            pass_fds=(control_read, status_write),
+            preexec_fn=prepare_guardian,
+            env=environment,
+        )
+    finally:
+        os.close(control_read)
+        os.close(status_write)
+    try:
+        payload_pid = _read_guardian_status(status_read, 5.0)
+    except OSError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5.0)
+        os.close(control_write)
+        raise
+    finally:
+        os.close(status_read)
+    guardian = GuardianProcess(process, payload_pid, control_write)
+    guardian.pulse()
+    return guardian
+
+
 def _read_proc_bytes(root: Path, process_id: int, name: str) -> bytes:
     path = root / str(process_id) / name
     try:
@@ -321,15 +543,6 @@ def _write_json_atomic(
     temp_path = parent / (
         f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
-    payload = (
-        json.dumps(
-            value,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    ).encode("utf-8")
     try:
         descriptor = os.open(
             temp_path,
@@ -337,6 +550,23 @@ def _write_json_atomic(
             0o600,
         )
         with os.fdopen(descriptor, "wb") as stream:
+            file_status = os.fstat(stream.fileno())
+            record = {
+                **value,
+                "file_device": file_status.st_dev,
+                "file_inode": file_status.st_ino,
+                "file_uid": file_status.st_uid,
+                "file_mode": stat.S_IMODE(file_status.st_mode),
+            }
+            payload = (
+                json.dumps(
+                    record,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
@@ -394,6 +624,11 @@ class LeaseManager:
             _, _, proc_start_time_ticks = _read_proc_stat(
                 self.process_procfs_root, os.getpid()
             )
+            executable_path = (
+                self.process_procfs_root
+                / str(os.getpid())
+                / "exe"
+            ).resolve()
         except (OSError, LeaseValidationError):
             if sys.platform.startswith("linux"):
                 raise ArtifactError(
@@ -403,11 +638,13 @@ class LeaseManager:
             cmdline = b"\0".join(
                 os.fsencode(argument) for argument in sys.argv
             )
+            executable_path = Path(sys.executable).resolve()
         return {
             "pid": os.getpid(),
             "start_time_utc": _timestamp_utc(self.wall_clock),
             "proc_start_time_ticks": proc_start_time_ticks,
             "cmdline_sha256": _sha256_bytes(cmdline),
+            "executable_path": str(executable_path),
             "script_path": str(script_path),
             "script_sha256": _sha256_file(script_path),
         }
@@ -440,8 +677,16 @@ class LeaseManager:
             record["sample"] = sample
         return record
 
-    def start(self, child: ProcessHandle) -> None:
+    def start(
+        self, child: ProcessHandle, audit: AuditLogger
+    ) -> None:
         watchdog_identity = self._watchdog_identity()
+        audit_identity = audit.persistent_identity()
+        payload_pid = (
+            child.payload_pid
+            if isinstance(child, GuardianProcess)
+            else child.pid
+        )
         self.lease = {
             "format": LEASE_FORMAT,
             "version": LEASE_VERSION,
@@ -457,6 +702,9 @@ class LeaseManager:
             "watchdog_command_sha256": (
                 watchdog_identity["cmdline_sha256"]
             ),
+            "watchdog_executable_path": (
+                watchdog_identity["executable_path"]
+            ),
             "watchdog_script_path": watchdog_identity["script_path"],
             "watchdog_script_sha256": (
                 watchdog_identity["script_sha256"]
@@ -464,7 +712,8 @@ class LeaseManager:
             "soft_bytes": self.config.soft_bytes,
             "emergency_bytes": self.config.emergency_bytes,
             "strict_ceiling_bytes": STRICT_CEILING_BYTES,
-            "child_pid": child.pid,
+            "guardian_pid": child.pid,
+            "child_pid": payload_pid,
             "child_process_group_id": child.pid,
             "command": list(self.config.command),
             "child_command_sha256": _command_sha256(
@@ -475,11 +724,19 @@ class LeaseManager:
                 self.config.heartbeat_max_age_seconds
             ),
             "audit_path": str(self.audit_path),
+            "audit_device": audit_identity["device"],
+            "audit_inode": audit_identity["inode"],
+            "audit_uid": audit_identity["uid"],
+            "audit_mode": audit_identity["mode"],
+            "audit_fd": audit_identity["fd"],
             "procfs_root": str(
                 self.config.procfs_root.expanduser().resolve()
             ),
         }
-        heartbeat = self._heartbeat_record("active")
+        heartbeat = self._heartbeat_record(
+            "active",
+            {"audit_record_sha256": audit.last_record_sha256},
+        )
         _write_json_atomic(self.heartbeat_path, heartbeat, create=True)
         _write_json_atomic(self.lease_path, self.lease, create=True)
 
@@ -499,13 +756,34 @@ class LeaseManager:
 
 def _read_json_object(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            file_status = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(file_status.st_mode)
+                or file_status.st_uid != os.getuid()
+                or stat.S_IMODE(file_status.st_mode) != 0o600
+            ):
+                raise LeaseValidationError(
+                    f"{path} has unsafe type, owner, or mode"
+                )
+            value = json.load(stream)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise LeaseValidationError(
             f"cannot read valid JSON from {path}: {exc}"
         ) from exc
     if not isinstance(value, dict):
         raise LeaseValidationError(f"{path} must contain a JSON object")
+    if (
+        value.get("file_device") != file_status.st_dev
+        or value.get("file_inode") != file_status.st_ino
+        or value.get("file_uid") != file_status.st_uid
+        or value.get("file_mode") != stat.S_IMODE(file_status.st_mode)
+    ):
+        raise LeaseValidationError(f"{path} identity does not match")
     return value
 
 
@@ -525,16 +803,20 @@ def validate_active_lease(
     lease_path: Path,
     *,
     expected_script_path: Path,
+    expected_executable_path: Path | None = None,
     expected_soft_bytes: int = DEFAULT_SOFT_BYTES,
     expected_emergency_bytes: int = DEFAULT_EMERGENCY_BYTES,
     expected_procfs_root: Path = Path("/proc"),
-    expected_command_sha256: str | None = None,
+    expected_command: Sequence[str] | None = None,
     expected_heartbeat_path: Path | None = None,
     expected_audit_path: Path | None = None,
     expected_max_heartbeat_age_seconds: float | None = None,
     current_process_id: int | None = None,
     process_procfs_root: Path = Path("/proc"),
     monotonic_ns: Callable[[], int] | None = None,
+    pidfd_open: Callable[[int], int] | None = getattr(
+        os, "pidfd_open", None
+    ),
 ) -> dict[str, object]:
     lease_path = lease_path.expanduser().resolve()
     lease = _read_json_object(lease_path)
@@ -587,6 +869,14 @@ def validate_active_lease(
     watchdog_pid = _require_int(
         lease.get("watchdog_pid"), "watchdog_pid"
     )
+    pidfd: int | None = None
+    if pidfd_open is not None:
+        try:
+            pidfd = pidfd_open(watchdog_pid)
+        except OSError as exc:
+            raise LeaseValidationError(
+                "cannot open watchdog pidfd"
+            ) from exc
     watchdog_start_ticks = _require_int(
         lease.get("watchdog_start_time_ticks"),
         "watchdog_start_time_ticks",
@@ -596,6 +886,28 @@ def validate_active_lease(
     )
     if live_watchdog_start_ticks != watchdog_start_ticks:
         raise LeaseValidationError("watchdog process start time does not match")
+    expected_executable = (
+        expected_executable_path or Path(sys.executable)
+    ).expanduser().resolve()
+    try:
+        live_executable = (
+            process_procfs_root / str(watchdog_pid) / "exe"
+        ).resolve()
+    except OSError as exc:
+        raise LeaseValidationError(
+            "cannot resolve watchdog executable"
+        ) from exc
+    if (
+        live_executable != expected_executable
+        or Path(
+            _require_string(
+                lease.get("watchdog_executable_path"),
+                "watchdog_executable_path",
+            )
+        ).resolve()
+        != expected_executable
+    ):
+        raise LeaseValidationError("watchdog executable does not match")
     live_cmdline = _read_proc_bytes(
         process_procfs_root, watchdog_pid, "cmdline"
     )
@@ -604,48 +916,91 @@ def validate_active_lease(
         "watchdog_command_sha256",
     ):
         raise LeaseValidationError("watchdog command line does not match")
-    script_named = False
-    watchdog_cwd: Path | None = None
-    for raw_argument in live_cmdline.split(b"\0"):
-        if not raw_argument:
-            continue
-        argument_path = Path(os.fsdecode(raw_argument)).expanduser()
-        if not argument_path.is_absolute():
-            if watchdog_cwd is None:
-                try:
-                    watchdog_cwd = (
-                        process_procfs_root
-                        / str(watchdog_pid)
-                        / "cwd"
-                    ).resolve()
-                except OSError as exc:
-                    raise LeaseValidationError(
-                        "cannot resolve watchdog working directory"
-                    ) from exc
-            argument_path = watchdog_cwd / argument_path
-        if argument_path.resolve() == expected_script_path:
-            script_named = True
-            break
-    if not script_named:
+    argv = [
+        os.fsdecode(argument)
+        for argument in live_cmdline.split(b"\0")
+        if argument
+    ]
+    if len(argv) < 2 or argv[1] in ("-c", "-m"):
         raise LeaseValidationError(
-            "watchdog command line does not name the expected script"
+            "watchdog script is not in executable argv position"
         )
+    try:
+        watchdog_cwd = (
+            process_procfs_root / str(watchdog_pid) / "cwd"
+        ).resolve()
+    except OSError as exc:
+        raise LeaseValidationError(
+            "cannot resolve watchdog working directory"
+        ) from exc
+    argv_script = Path(argv[1]).expanduser()
+    if not argv_script.is_absolute():
+        argv_script = watchdog_cwd / argv_script
+    if argv_script.resolve() != expected_script_path:
+        raise LeaseValidationError(
+            "watchdog script is not in executable argv position"
+        )
+    try:
+        live_config = parse_args(argv[2:])
+        live_paths = live_config.validate()
+    except (SystemExit, ValueError) as exc:
+        raise LeaseValidationError(
+            "watchdog command line is invalid"
+        ) from exc
+    if (
+        live_config.soft_bytes != expected_soft_bytes
+        or live_config.emergency_bytes != expected_emergency_bytes
+        or live_config.procfs_root.expanduser().resolve()
+        != expected_procfs_root.expanduser().resolve()
+    ):
+        raise LeaseValidationError(
+            "watchdog command-line policy does not match"
+        )
+    if (
+        live_paths is None
+        or live_paths.lease != lease_path
+        or (
+            expected_heartbeat_path is not None
+            and live_paths.heartbeat
+            != expected_heartbeat_path.expanduser().resolve()
+        )
+        or (
+            expected_audit_path is not None
+            and live_paths.audit
+            != expected_audit_path.expanduser().resolve()
+        )
+    ):
+        raise LeaseValidationError(
+            "watchdog command-line artifact paths do not match"
+        )
+    if expected_command is not None and tuple(
+        expected_command
+    ) != live_config.command:
+        raise LeaseValidationError("monitored command does not match")
 
+    guardian_pid = _require_int(
+        lease.get("guardian_pid"), "guardian_pid"
+    )
     child_pid = _require_int(lease.get("child_pid"), "child_pid")
     process_group_id = _require_int(
         lease.get("child_process_group_id"),
         "child_process_group_id",
     )
+    guardian_parent_pid, guardian_group_id, _ = _read_proc_stat(
+        process_procfs_root, guardian_pid
+    )
     child_parent_pid, child_group_id, _ = _read_proc_stat(
         process_procfs_root, child_pid
     )
     if (
-        child_parent_pid != watchdog_pid
+        guardian_parent_pid != watchdog_pid
+        or guardian_group_id != process_group_id
+        or guardian_pid != process_group_id
+        or child_parent_pid != guardian_pid
         or child_group_id != process_group_id
-        or process_group_id != child_pid
     ):
         raise LeaseValidationError(
-            "monitored child parent or process group does not match"
+            "watchdog, guardian, child, or process group does not match"
         )
     command = lease.get("command")
     if (
@@ -660,9 +1015,8 @@ def validate_active_lease(
     )
     if command_sha256 != _command_sha256(command):
         raise LeaseValidationError("monitored command SHA is invalid")
-    if (
-        expected_command_sha256 is not None
-        and command_sha256 != expected_command_sha256
+    if expected_command is not None and command_sha256 != _command_sha256(
+        expected_command
     ):
         raise LeaseValidationError("monitored command SHA does not match")
 
@@ -725,6 +1079,13 @@ def validate_active_lease(
     )
     _require_int(heartbeat.get("sequence"), "heartbeat.sequence")
     _require_string(heartbeat.get("updated_at"), "heartbeat.updated_at")
+    heartbeat_sample = heartbeat.get("sample")
+    if not isinstance(heartbeat_sample, dict):
+        raise LeaseValidationError("heartbeat sample is invalid")
+    audit_record_sha256 = _require_string(
+        heartbeat_sample.get("audit_record_sha256"),
+        "heartbeat.sample.audit_record_sha256",
+    )
     now_monotonic_ns = (monotonic_ns or time.monotonic_ns)()
     age_ns = now_monotonic_ns - updated_monotonic_ns
     if age_ns < 0 or age_ns > int(heartbeat_max_age * 1_000_000_000):
@@ -738,14 +1099,64 @@ def validate_active_lease(
         and audit_path != expected_audit_path.expanduser().resolve()
     ):
         raise LeaseValidationError("persistent audit path does not match")
+    audit_fd = _require_int(lease.get("audit_fd"), "audit_fd")
+    audit_device = _require_int(
+        lease.get("audit_device"), "audit_device"
+    )
+    audit_inode = _require_int(
+        lease.get("audit_inode"), "audit_inode"
+    )
+    audit_uid = _require_int(lease.get("audit_uid"), "audit_uid")
+    audit_mode = _require_int(lease.get("audit_mode"), "audit_mode")
     try:
-        first_line = next(
+        audit_status = audit_path.stat(follow_symlinks=False)
+        live_audit_status = (
+            process_procfs_root
+            / str(watchdog_pid)
+            / "fd"
+            / str(audit_fd)
+        ).stat()
+        if (
+            not stat.S_ISREG(audit_status.st_mode)
+            or audit_status.st_dev != audit_device
+            or audit_status.st_ino != audit_inode
+            or live_audit_status.st_dev != audit_device
+            or live_audit_status.st_ino != audit_inode
+            or audit_status.st_uid != audit_uid
+            or audit_uid != os.getuid()
+            or stat.S_IMODE(audit_status.st_mode) != audit_mode
+            or audit_mode != 0o600
+        ):
+            raise LeaseValidationError(
+                "persistent audit identity does not match"
+            )
+        audit_descriptor = os.open(
+            audit_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            try:
+                fcntl.flock(
+                    audit_descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                pass
+            else:
+                fcntl.flock(audit_descriptor, fcntl.LOCK_UN)
+                raise LeaseValidationError(
+                    "watchdog does not hold the persistent audit lock"
+                )
+        finally:
+            os.close(audit_descriptor)
+        audit_lines = [
             line
             for line in audit_path.read_text(
                 encoding="utf-8"
             ).splitlines()
             if line
-        )
+        ]
+        first_line = next(iter(audit_lines))
         first_record = json.loads(first_line)
         if (
             not isinstance(first_record, dict)
@@ -754,6 +1165,14 @@ def validate_active_lease(
         ):
             raise LeaseValidationError(
                 "persistent audit does not contain watchdog records"
+            )
+        if not any(
+            _sha256_bytes((line + "\n").encode("utf-8"))
+            == audit_record_sha256
+            for line in audit_lines
+        ):
+            raise LeaseValidationError(
+                "heartbeat audit record does not match persistent audit"
             )
     except StopIteration as exc:
         raise LeaseValidationError("persistent audit is empty") from exc
@@ -767,7 +1186,102 @@ def validate_active_lease(
         raise LeaseValidationError(
             f"cannot inspect persistent audit {audit_path}: {exc}"
         ) from exc
+    _, _, final_watchdog_start_ticks = _read_proc_stat(
+        process_procfs_root, watchdog_pid
+    )
+    if final_watchdog_start_ticks != watchdog_start_ticks:
+        raise LeaseValidationError(
+            "watchdog process changed during validation"
+        )
+    if pidfd is not None:
+        os.close(pidfd)
     return lease
+
+
+def start_process_group_lease_guard(
+    expected_script_path: Path,
+    *,
+    startup_timeout_seconds: float = 5.0,
+    expected_procfs_root: Path = Path("/proc"),
+    process_procfs_root: Path = Path("/proc"),
+) -> threading.Thread:
+    try:
+        lease_path = Path(
+            os.environ["STRIX_MEMORY_WATCHDOG_LEASE_PATH"]
+        ).resolve()
+        heartbeat_path = Path(
+            os.environ["STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH"]
+        ).resolve()
+        audit_path = Path(
+            os.environ["STRIX_MEMORY_WATCHDOG_AUDIT_PATH"]
+        ).resolve()
+        max_age_seconds = float(
+            os.environ[
+                "STRIX_MEMORY_WATCHDOG_HEARTBEAT_MAX_AGE_SECONDS"
+            ]
+        )
+    except (KeyError, ValueError) as exc:
+        raise LeaseValidationError(
+            "watchdog artifact environment is missing or invalid"
+        ) from exc
+    current_cmdline = _read_proc_bytes(
+        process_procfs_root, os.getpid(), "cmdline"
+    )
+    expected_command = tuple(
+        os.fsdecode(argument)
+        for argument in current_cmdline.split(b"\0")
+        if argument
+    )
+    deadline = time.monotonic() + startup_timeout_seconds
+    while True:
+        try:
+            lease = validate_active_lease(
+                lease_path,
+                expected_script_path=expected_script_path,
+                expected_procfs_root=expected_procfs_root,
+                expected_command=expected_command,
+                expected_heartbeat_path=heartbeat_path,
+                expected_audit_path=audit_path,
+                expected_max_heartbeat_age_seconds=max_age_seconds,
+                process_procfs_root=process_procfs_root,
+            )
+            break
+        except LeaseValidationError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+    guardian_pid = _require_int(
+        lease.get("guardian_pid"), "guardian_pid"
+    )
+    signal.signal(LEASE_GUARD_SIGNAL, _kill_own_process_group)
+    _set_parent_death_signal(LEASE_GUARD_SIGNAL, guardian_pid)
+
+    def monitor() -> None:
+        interval = min(1.0, max_age_seconds / 3)
+        while True:
+            time.sleep(interval)
+            try:
+                validate_active_lease(
+                    lease_path,
+                    expected_script_path=expected_script_path,
+                    expected_procfs_root=expected_procfs_root,
+                    expected_command=expected_command,
+                    expected_heartbeat_path=heartbeat_path,
+                    expected_audit_path=audit_path,
+                    expected_max_heartbeat_age_seconds=max_age_seconds,
+                    process_procfs_root=process_procfs_root,
+                )
+            except LeaseValidationError:
+                _kill_own_process_group()
+
+    guard = threading.Thread(
+        target=monitor,
+        name="strix-watchdog-lease-guard",
+        daemon=True,
+    )
+    guard.start()
+    return guard
 
 
 class AuditLogger:
@@ -782,14 +1296,21 @@ class AuditLogger:
         self.lease_manager: LeaseManager | None = None
         self.finalized = False
         self.final_exit_code = EXIT_INTERNAL_ERROR
+        self.last_record_sha256: str | None = None
 
     def open_persistent(self, path: Path) -> None:
         resolved_path = path.expanduser().resolve()
         try:
             descriptor = os.open(
                 resolved_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+            )
+            fcntl.flock(
+                descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
             )
             self.persistent_stream = os.fdopen(
                 descriptor, "w", encoding="utf-8"
@@ -800,6 +1321,20 @@ class AuditLogger:
                 "audit",
                 f"cannot create persistent audit {resolved_path}: {detail}",
             ) from exc
+
+    def persistent_identity(self) -> dict[str, int]:
+        if self.persistent_stream is None:
+            raise ArtifactError(
+                "audit", "persistent audit is not open"
+            )
+        file_status = os.fstat(self.persistent_stream.fileno())
+        return {
+            "device": file_status.st_dev,
+            "inode": file_status.st_ino,
+            "uid": file_status.st_uid,
+            "mode": stat.S_IMODE(file_status.st_mode),
+            "fd": self.persistent_stream.fileno(),
+        }
 
     def close(self) -> None:
         if self.persistent_stream is not None:
@@ -824,6 +1359,7 @@ class AuditLogger:
         )
         self.stream.write(line)
         self.stream.flush()
+        self.last_record_sha256 = _sha256_bytes(line.encode("utf-8"))
         if self.persistent_stream is not None:
             try:
                 self.persistent_stream.write(line)
@@ -839,7 +1375,12 @@ class AuditLogger:
 
     def heartbeat(self, sample: dict[str, object]) -> None:
         if self.lease_manager is not None:
-            self.lease_manager.update_heartbeat(sample)
+            self.lease_manager.update_heartbeat(
+                {
+                    **sample,
+                    "audit_record_sha256": self.last_record_sha256,
+                }
+            )
 
     def finalize(self, record: dict[str, object]) -> None:
         if self.lease_manager is not None:
@@ -952,6 +1493,30 @@ def _signal_process_group(process_group_id: int, signal_number: int) -> str:
 
 
 def _process_group_alive(process_group_id: int) -> bool:
+    if sys.platform.startswith("linux"):
+        try:
+            process_paths = Path("/proc").iterdir()
+            for process_path in process_paths:
+                if not process_path.name.isdigit():
+                    continue
+                try:
+                    content = (
+                        process_path / "stat"
+                    ).read_text(encoding="utf-8")
+                    close_paren = content.rfind(")")
+                    fields = content[close_paren + 1:].split()
+                    if (
+                        close_paren >= 0
+                        and len(fields) >= 3
+                        and fields[0] != "Z"
+                        and int(fields[2]) == process_group_id
+                    ):
+                        return True
+                except (OSError, UnicodeError, ValueError):
+                    continue
+            return False
+        except OSError:
+            pass
     try:
         os.killpg(process_group_id, 0)
     except ProcessLookupError:
@@ -1012,18 +1577,23 @@ def _kill_and_finish(
             str(exc),
         )
 
-    audit.emit(
-        "process_group_signal",
-        **_state_fields(
-            snapshot,
-            peak_used_bytes,
-            child,
-            child.poll(),
-            group_status,
-            reason,
-        ),
-        signal="SIGKILL",
-    )
+    artifact_error: ArtifactError | None = None
+    try:
+        audit.emit(
+            "process_group_signal",
+            **_state_fields(
+                snapshot,
+                peak_used_bytes,
+                child,
+                child.poll(),
+                group_status,
+                reason,
+            ),
+            signal="SIGKILL",
+        )
+    except ArtifactError as exc:
+        artifact_error = exc
+        audit.disable_component(exc.component)
     try:
         child_returncode = child.wait(timeout=5.0)
     except subprocess.TimeoutExpired as exc:
@@ -1039,6 +1609,12 @@ def _kill_and_finish(
             "sigkill_timeout",
             str(exc),
         )
+    if artifact_error is not None:
+        classification = "lease_error"
+        exit_code = EXIT_LEASE_ERROR
+        error = f"{artifact_error.component}: {artifact_error}"
+    else:
+        error = None
     return _emit_final(
         audit,
         classification,
@@ -1049,6 +1625,7 @@ def _kill_and_finish(
         child,
         child_returncode,
         group_status,
+        error,
     )
 
 
@@ -1071,23 +1648,28 @@ def _graceful_cleanup(
     error: str | None = None,
 ) -> int:
     escalated = False
+    artifact_error: ArtifactError | None = None
     try:
         if graceful_signal is not None:
             process_group_status = signal_group(
                 child.pid, graceful_signal
             )
-            audit.emit(
-                "process_group_signal",
-                **_state_fields(
-                    snapshot,
-                    peak_used_bytes,
-                    child,
-                    child.poll(),
-                    process_group_status,
-                    reason,
-                ),
-                signal=signal.Signals(graceful_signal).name,
-            )
+            try:
+                audit.emit(
+                    "process_group_signal",
+                    **_state_fields(
+                        snapshot,
+                        peak_used_bytes,
+                        child,
+                        child.poll(),
+                        process_group_status,
+                        reason,
+                    ),
+                    signal=signal.Signals(graceful_signal).name,
+                )
+            except ArtifactError as exc:
+                artifact_error = exc
+                audit.disable_component(exc.component)
         deadline = monotonic() + grace_seconds
         while monotonic() < deadline:
             child.poll()
@@ -1105,18 +1687,23 @@ def _graceful_cleanup(
                 if escalation_result is not None
                 else reason
             )
-            audit.emit(
-                "process_group_signal",
-                **_state_fields(
-                    snapshot,
-                    peak_used_bytes,
-                    child,
-                    child.poll(),
-                    process_group_status,
-                    signal_reason,
-                ),
-                signal="SIGKILL",
-            )
+            try:
+                audit.emit(
+                    "process_group_signal",
+                    **_state_fields(
+                        snapshot,
+                        peak_used_bytes,
+                        child,
+                        child.poll(),
+                        process_group_status,
+                        signal_reason,
+                    ),
+                    signal="SIGKILL",
+                )
+            except ArtifactError as exc:
+                if artifact_error is None:
+                    artifact_error = exc
+                audit.disable_component(exc.component)
     except ProcessGroupError as exc:
         return _emit_final(
             audit,
@@ -1151,6 +1738,10 @@ def _graceful_cleanup(
 
     if escalated and escalation_result is not None:
         classification, exit_code, reason = escalation_result
+    if artifact_error is not None:
+        classification = "lease_error"
+        exit_code = EXIT_LEASE_ERROR
+        error = f"{artifact_error.component}: {artifact_error}"
     return _emit_final(
         audit,
         classification,
@@ -1173,6 +1764,7 @@ def _monitor_child(
     state: RuntimeState,
     signal_group: Callable[[int, int], str],
     group_alive: Callable[[int], bool],
+    pulse_guardian: Callable[[], None],
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None],
 ) -> int:
@@ -1273,19 +1865,6 @@ def _monitor_child(
         state.peak_used_bytes = max(
             state.peak_used_bytes, state.snapshot.used_bytes
         )
-        sample_record = audit.emit(
-            "sample",
-            **_state_fields(
-                state.snapshot,
-                state.peak_used_bytes,
-                child,
-                None,
-                "active",
-                "none",
-            ),
-        )
-        audit.heartbeat(sample_record)
-
         if state.snapshot.active_swaps:
             return _kill_and_finish(
                 audit,
@@ -1308,6 +1887,7 @@ def _monitor_child(
                 "used_bytes >= emergency_bytes",
                 signal_group,
             )
+        soft_signal_fields: dict[str, object] | None = None
         if (
             soft_deadline is None
             and state.snapshot.used_bytes >= config.soft_bytes
@@ -1328,8 +1908,7 @@ def _monitor_child(
                     str(exc),
                 )
             soft_deadline = now + config.grace_seconds
-            audit.emit(
-                "process_group_signal",
+            soft_signal_fields = {
                 **_state_fields(
                     state.snapshot,
                     state.peak_used_bytes,
@@ -1338,9 +1917,39 @@ def _monitor_child(
                     group_status,
                     "used_bytes >= soft_bytes",
                 ),
-                signal="SIGTERM",
-                grace_deadline_monotonic=soft_deadline,
+                "signal": "SIGTERM",
+                "grace_deadline_monotonic": soft_deadline,
+            }
+        try:
+            pulse_guardian()
+        except ProcessGroupError as exc:
+            return _kill_and_finish(
+                audit,
+                child,
+                state.snapshot,
+                state.peak_used_bytes,
+                "signal_error",
+                EXIT_SIGNAL_ERROR,
+                str(exc),
+                signal_group,
             )
+        if soft_signal_fields is not None:
+            audit.emit(
+                "process_group_signal",
+                **soft_signal_fields,
+            )
+        sample_record = audit.emit(
+            "sample",
+            **_state_fields(
+                state.snapshot,
+                state.peak_used_bytes,
+                child,
+                None,
+                "active",
+                "none",
+            )
+        )
+        audit.heartbeat(sample_record)
 
         sleep_seconds = config.sample_interval_seconds
         if soft_deadline is not None:
@@ -1363,6 +1972,9 @@ def run_watchdog(
     sleeper: Callable[[float], None] | None = None,
 ) -> int:
     artifact_paths = config.validate()
+    use_guardian = (
+        launcher is None and sys.platform.startswith("linux")
+    )
     reader = reader or ProcfsReader(config.procfs_root)
     audit = audit or AuditLogger(sys.stderr)
     launcher = launcher or subprocess.Popen
@@ -1472,8 +2084,8 @@ def run_watchdog(
             signal.pthread_sigmask(signal.SIG_SETMASK, launch_mask)
 
         try:
+            child_environment = os.environ.copy()
             if lease_manager is not None:
-                child_environment = os.environ.copy()
                 child_environment.update(
                     {
                         "STRIX_MEMORY_WATCHDOG_LEASE_PATH": str(
@@ -1490,6 +2102,14 @@ def run_watchdog(
                         ),
                     }
                 )
+            if use_guardian:
+                child = _launch_guardian(
+                    config.command,
+                    child_environment,
+                    config.heartbeat_max_age_seconds,
+                    launch_mask,
+                )
+            elif lease_manager is not None:
                 child = launcher(
                     config.command,
                     start_new_session=True,
@@ -1502,7 +2122,7 @@ def run_watchdog(
                     start_new_session=True,
                     preexec_fn=restore_child_signal_mask,
                 )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             detail = getattr(exc, "strerror", None) or str(exc)
             return _emit_final(
                 audit,
@@ -1518,7 +2138,7 @@ def run_watchdog(
             _raise_parent_signal
         )
         if lease_manager is not None:
-            lease_manager.start(child)
+            lease_manager.start(child, audit)
             audit.lease_manager = lease_manager
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         mask_restored = True
@@ -1542,6 +2162,7 @@ def run_watchdog(
             state,
             signal_group,
             group_alive,
+            child.pulse if isinstance(child, GuardianProcess) else lambda: None,
             monotonic,
             sleeper,
         )
@@ -1631,6 +2252,8 @@ def run_watchdog(
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         if previous_handlers:
             _restore_parent_signal_handlers(previous_handlers)
+        if isinstance(child, GuardianProcess):
+            child.close()
 
 
 def _positive_int(value: str) -> int:
@@ -1744,7 +2367,20 @@ def parse_args(argv: Sequence[str]) -> WatchdogConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    config = parse_args(argv if argv is not None else sys.argv[1:])
+    arguments = tuple(argv if argv is not None else sys.argv[1:])
+    if arguments and arguments[0] == "--internal-guardian":
+        if len(arguments) < 6 or arguments[4] != "--":
+            return EXIT_LAUNCH_ERROR
+        try:
+            return _guardian_main(
+                int(arguments[1]),
+                int(arguments[2]),
+                _positive_float(arguments[3]),
+                tuple(arguments[5:]),
+            )
+        except (OSError, ValueError):
+            return EXIT_LAUNCH_ERROR
+    config = parse_args(arguments)
     audit = AuditLogger(sys.stderr)
     try:
         return run_watchdog(config, audit=audit)
