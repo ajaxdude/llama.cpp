@@ -1,6 +1,7 @@
 set(TARGET llama-deepseek-v41-trace)
 add_executable(${TARGET} llama-trace.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-common llama vendor::hash ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 set(PROMPT_TARGET llama-deepseek-v41-prompt-builder)
