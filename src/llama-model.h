@@ -748,6 +748,8 @@ struct llama_model {
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
+    ggml_backend_buffer_type_t select_moe_buft(
+            int il, enum ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) const;
 
     bool has_tensor_overrides() const;
 

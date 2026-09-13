@@ -124,7 +124,7 @@ struct llama_dsv41_expert_runtime::impl {
                     checked_mul(tensor.nb[2], params.cache_slots, "DeepSeek V4.1 expert cache byte count overflow"),
                     "DeepSeek V4.1 expert cache byte count overflow");
 
-            ggml_backend_buffer_type_t buft = select_buft(tensor.layer);
+            ggml_backend_buffer_type_t buft = select_buft(tensor);
             if (buft == nullptr) {
                 throw std::runtime_error("DeepSeek V4.1 expert cache has no backend buffer type");
             }

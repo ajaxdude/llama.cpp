@@ -133,7 +133,7 @@ struct fixture {
         return llama_dsv41_expert_runtime(
                 tensors,
                 params,
-                [](int32_t) { return ggml_backend_cpu_buffer_type(); },
+                [](const llama_expert_store_tensor &) { return ggml_backend_cpu_buffer_type(); },
                 std::move(upload));
     }
 };
@@ -190,14 +190,14 @@ void test_configuration(const fixture & f) {
     params.direct_io = false;
     require_throws([&] {
         llama_dsv41_expert_runtime runtime(
-                f.tensors, params, [](int32_t) { return ggml_backend_cpu_buffer_type(); });
+                f.tensors, params, [](const llama_expert_store_tensor &) { return ggml_backend_cpu_buffer_type(); });
     });
 
     params.cache_slots = 1;
     params.cache_bytes = f.cache_bytes(1) - 1;
     require_throws([&] {
         llama_dsv41_expert_runtime runtime(
-                f.tensors, params, [](int32_t) { return ggml_backend_cpu_buffer_type(); });
+                f.tensors, params, [](const llama_expert_store_tensor &) { return ggml_backend_cpu_buffer_type(); });
     });
 
     auto runtime = f.make_runtime(1);
