@@ -180,12 +180,10 @@ class WatchdogConfig:
             raise ValueError("a command is required after --")
         if self.soft_bytes <= 0:
             raise ValueError("soft threshold must be greater than zero")
-        if self.soft_bytes > DEFAULT_SOFT_BYTES:
-            raise ValueError("soft threshold must not exceed 116 GiB")
         if self.emergency_bytes <= self.soft_bytes:
             raise ValueError("emergency threshold must be greater than soft threshold")
-        if self.emergency_bytes > DEFAULT_EMERGENCY_BYTES:
-            raise ValueError("emergency threshold must not exceed 118 GiB")
+        if self.emergency_bytes >= STRICT_CEILING_BYTES:
+            raise ValueError("emergency threshold must be below 120 GiB")
         if (
             not math.isfinite(self.grace_seconds)
             or self.grace_seconds <= 0
