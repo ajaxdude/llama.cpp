@@ -13,6 +13,16 @@ from typing import Any, BinaryIO, Iterable
 
 TRACE_FORMAT = "dsv41-trace"
 TRACE_VERSION = 1
+DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
+MODEL_SHA256 = "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
+REPOSITORY = "halo-box/strix-llama.cpp"
+SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
+CORPUS_SHA256 = {
+    "correctness-prose.txt": "2da590a37e3297767336c10b024a0de732d64bee4da5792596f8ddf49ea408d2",
+    "correctness-code.txt": "41b4246ef4e6b4e3f9f23a3d02aa8cdab48f495b3af0ebeaccea255679c771f0",
+    "correctness-structured.txt": "1278707adea5a953196c4cf5c04de301952813be3eac416a6aac4ff94f42f701",
+    "correctness-numeric.txt": "ebd444cf70662cc09289af45ef654af0953b98e967a449d031627d8ea92bc2e0",
+}
 MANIFEST_NAME = "manifest.json"
 EVENTS_NAME = "events.jsonl"
 BLOBS_DIR = "blobs"
@@ -28,6 +38,7 @@ DTYPE_SIZES = {
 }
 
 HARD_FAILURE_COMPONENTS = (
+    "prompt.bytes",
     "prompt.tokens",
     "engram.row_ids",
     "expert.ids",
@@ -65,6 +76,8 @@ class Mismatch:
     detail: str
     element_index: int | None = None
     byte_offset: int | None = None
+    token_index: int | None = None
+    component_element_index: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         result = {
@@ -80,6 +93,10 @@ class Mismatch:
             result["element_index"] = self.element_index
         if self.byte_offset is not None:
             result["byte_offset"] = self.byte_offset
+        if self.token_index is not None:
+            result["token_index"] = self.token_index
+        if self.component_element_index is not None:
+            result["component_element_index"] = self.component_element_index
         return result
 
 
@@ -198,10 +215,22 @@ def validate_event(event: dict[str, Any]) -> None:
         raise TraceError(f"unsupported event version: {event['trace_version']!r}")
     if event["byte_order"] != "little":
         raise TraceError("trace blobs must use little-endian byte order")
+    if event["phase"] not in ("input", "prefill", "decode"):
+        raise TraceError("event phase is invalid")
+    if not isinstance(event["step"], int) or event["step"] < 0:
+        raise TraceError("event step is invalid")
+    if not isinstance(event["token_start"], int) or event["token_start"] < 0:
+        raise TraceError("event token_start is invalid")
+    if not isinstance(event["token_count"], int) or event["token_count"] <= 0:
+        raise TraceError("event token_count is invalid")
+    if event["layer"] is not None and (not isinstance(event["layer"], int) or event["layer"] < 0):
+        raise TraceError("event layer is invalid")
+    if not isinstance(event["shape"], list) or not event["shape"] or any(dim <= 0 for dim in event["shape"]):
+        raise TraceError("event shape dimensions must be nonzero")
     if event["byte_count"] != expected_bytes(event):
         raise TraceError("event byte_count does not match dtype and shape")
     digest = event["sha256"]
-    if not isinstance(digest, str) or len(digest) != 64:
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise TraceError("event sha256 is invalid")
     if event["blob"] != f"{BLOBS_DIR}/{digest}.bin":
         raise TraceError("event blob path is not content addressed")
@@ -340,8 +369,12 @@ class TraceBundle:
                 raise TraceError(f"manifest is missing {key}")
         if not isinstance(self.manifest["runtime"], str) or not self.manifest["runtime"]:
             raise TraceError("manifest runtime is invalid")
+        if self.manifest["runtime"] not in ("ds4", "llama.cpp"):
+            raise TraceError("manifest runtime must be ds4 or llama.cpp")
         if not isinstance(self.manifest["revision"], str) or not self.manifest["revision"]:
             raise TraceError("manifest revision is invalid")
+        if self.manifest["runtime"] == "ds4" and self.manifest["revision"] != DS4_REVISION:
+            raise TraceError(f"ds4 revision must be {DS4_REVISION}")
         if not isinstance(self.manifest["build"], dict):
             raise TraceError("manifest build is invalid")
         if re.fullmatch(r"[0-9a-f]{64}", self.manifest["build"].get("sha256", "")) is None:
@@ -354,21 +387,108 @@ class TraceBundle:
                 raise TraceError(f"manifest {section} SHA-256 is invalid")
             if not isinstance(self.manifest[section].get("byte_count"), int):
                 raise TraceError(f"manifest {section} byte_count is invalid")
+        if self.manifest["model"]["sha256"] != MODEL_SHA256:
+            raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
+        if self.manifest["model"].get("architecture") != "deepseek41":
+            raise TraceError("model architecture must be deepseek41")
+        corpus_name = self.manifest["prompt"].get("corpus_name")
+        if corpus_name not in CORPUS_SHA256:
+            raise TraceError("prompt corpus is not in the fixed correctness corpus set")
+        if self.manifest["prompt"].get("corpus_sha256") != CORPUS_SHA256[corpus_name]:
+            raise TraceError(f"prompt corpus SHA-256 is invalid for {corpus_name}")
+        if self.manifest["runtime"] == "llama.cpp":
+            candidate = self.manifest.get("candidate")
+            if not isinstance(candidate, dict):
+                raise TraceError("llama.cpp candidate attestation is missing")
+            if candidate.get("repository") != REPOSITORY:
+                raise TraceError(f"candidate repository must be {REPOSITORY}")
+            for key in ("revision", "base_revision", "diff_sha256", "executable_sha256"):
+                if re.fullmatch(r"[0-9a-f]{40}" if "revision" in key else r"[0-9a-f]{64}",
+                        candidate.get(key, "")) is None:
+                    raise TraceError(f"candidate {key} is invalid")
+            if not candidate["revision"].startswith(self.manifest["revision"]):
+                raise TraceError("candidate revision does not match the exporter build revision")
+            if candidate["executable_sha256"] != self.manifest["build"]["sha256"]:
+                raise TraceError("candidate executable SHA-256 does not match the trace build")
         for section in ("config", "comparison", "environment", "audits"):
             if not isinstance(self.manifest[section], dict):
                 raise TraceError(f"manifest {section} is invalid")
+        expected_config = {
+            "layer_count": 40,
+            "vocab_size": 129280,
+            "engram_layers": [1, 14],
+            "engram_rows_per_token": 4,
+            "expert_count": 384,
+            "experts_used": 6,
+            "candidate_source_layer": 20,
+            "candidate_topk_blocks": 2048,
+            "candidate_block_size": 8,
+            "index_top_k": 512,
+            "candidate_propagation_layers": [24, 28, 32, 36],
+        }
+        if self.manifest["config"].get("deepseek41") != expected_config:
+            raise TraceError("DeepSeek V4.1 configuration is invalid")
         if self.manifest["comparison"].get("logits") != "byte-identical-f32":
             raise TraceError("logit comparison policy must be byte-identical-f32")
         for kind in ("memory", "swap", "watchdog"):
             audit = self.manifest["audits"].get(kind)
             if not isinstance(audit, dict):
                 raise TraceError(f"manifest {kind} audit reference is invalid")
-            if not isinstance(audit.get("path"), str) or not audit["path"]:
+            audit_path = audit.get("path")
+            if not isinstance(audit_path, str) or not audit_path:
                 raise TraceError(f"manifest {kind} audit path is invalid")
-            if re.fullmatch(r"[0-9a-f]{64}", audit.get("sha256", "")) is None:
+            digest = audit.get("sha256", "")
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise TraceError(f"manifest {kind} audit SHA-256 is invalid")
             if not isinstance(audit.get("created_unix"), int) or audit["created_unix"] <= 0:
                 raise TraceError(f"manifest {kind} audit timestamp is invalid")
+            expected_path = f"audits/{digest}.json"
+            if audit_path != expected_path:
+                raise TraceError(f"manifest {kind} audit path is not content addressed")
+            evidence_path = self.root / audit_path
+            try:
+                evidence = evidence_path.read_bytes()
+            except OSError as error:
+                raise TraceError(f"cannot read {kind} audit evidence: {error}") from error
+            if sha256_bytes(evidence) != digest:
+                raise TraceError(f"{kind} audit evidence SHA-256 mismatch")
+            try:
+                record = json.loads(evidence.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise TraceError(f"{kind} audit evidence is invalid: {error}") from error
+            if record.get("kind") != kind or record.get("created_unix") != audit["created_unix"]:
+                raise TraceError(f"{kind} audit evidence metadata mismatch")
+            if not isinstance(record.get("data"), dict):
+                raise TraceError(f"{kind} audit evidence data is invalid")
+            if kind == "memory":
+                used = record["data"].get("mem_used_bytes")
+                if not isinstance(used, int) or used < 0 or used >= SOFT_MEMORY_LIMIT:
+                    raise TraceError("memory audit evidence is invalid")
+            if kind == "swap":
+                if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
+                    raise TraceError("swap audit evidence does not report zero configured swap")
+            if kind == "watchdog":
+                required = ("pid", "start_time_ticks", "command_sha256", "heartbeat_path", "heartbeat_unix")
+                if any(key not in record["data"] for key in required):
+                    raise TraceError("watchdog audit evidence is incomplete")
+                data = record["data"]
+                if not isinstance(data["pid"], int) or data["pid"] <= 1:
+                    raise TraceError("watchdog audit PID is invalid")
+                if not isinstance(data["start_time_ticks"], int) or data["start_time_ticks"] <= 0:
+                    raise TraceError("watchdog audit start time is invalid")
+                if not isinstance(data["command_sha256"], str) or re.fullmatch(
+                        r"[0-9a-f]{64}", data["command_sha256"]) is None:
+                    raise TraceError("watchdog audit command SHA-256 is invalid")
+                if not isinstance(data["heartbeat_path"], str) or not data["heartbeat_path"]:
+                    raise TraceError("watchdog audit heartbeat path is invalid")
+                if not isinstance(data["heartbeat_unix"], int) or data["heartbeat_unix"] <= 0:
+                    raise TraceError("watchdog audit heartbeat timestamp is invalid")
+                max_age = data.get("max_heartbeat_age_seconds")
+                if not isinstance(max_age, int) or max_age <= 0 or max_age > 30:
+                    raise TraceError("watchdog audit heartbeat age is invalid")
+                if data["heartbeat_unix"] > record["created_unix"] or (
+                        record["created_unix"] - data["heartbeat_unix"] > max_age):
+                    raise TraceError("watchdog audit heartbeat was stale when captured")
 
     def read_blob(self, event: dict[str, Any]) -> bytes:
         try:
@@ -389,6 +509,8 @@ class TraceBundle:
             raise TraceError("expected decode_steps is invalid")
         if self.manifest.get("config", {}).get("decode_steps") != decode_steps:
             raise TraceError("expected decode_steps does not match config")
+        for event in self.events:
+            self._validate_component_schema(event)
         if not isinstance(components, dict):
             raise TraceError("expected components are invalid")
         if self.manifest.get("model", {}).get("architecture") == "deepseek41":
@@ -449,6 +571,66 @@ class TraceBundle:
                         if event["token_start"] != prompt_tokens + event["step"] or event["token_count"] != 1:
                             raise TraceError(f"{component} decode token coordinates are invalid")
 
+    def _validate_component_schema(self, event: dict[str, Any]) -> None:
+        component = event["component"]
+        phase = event["phase"]
+        layer = event["layer"]
+        dtype = event["dtype"]
+        shape = event["shape"]
+        token_count = event["token_count"]
+        config = self.manifest["config"].get("deepseek41")
+        if not isinstance(config, dict):
+            raise TraceError("DeepSeek V4.1 component schema configuration is missing")
+
+        if component == "prompt.bytes":
+            if phase != "input" or layer is not None or dtype != "bytes" or len(shape) != 1:
+                raise TraceError("prompt.bytes schema is invalid")
+            if shape[0] != self.manifest["prompt"]["byte_count"]:
+                raise TraceError("prompt.bytes length does not match the manifest")
+            if event["sha256"] != self.manifest["prompt"]["sha256"]:
+                raise TraceError("prompt.bytes SHA-256 does not match the manifest")
+            return
+        if component == "prompt.tokens":
+            if phase != "input" or layer is not None or dtype != "i32" or shape != [token_count]:
+                raise TraceError("prompt.tokens schema is invalid")
+            return
+        if component in ("logits.prefill", "logits.decode"):
+            if phase not in ("prefill", "decode") or layer is not None or dtype != "f32":
+                raise TraceError(f"{component} schema is invalid")
+            if token_count != 1 or shape != [config.get("vocab_size")]:
+                raise TraceError(f"{component} must contain one complete vocabulary-sized logit vector")
+            return
+        if component == "decode.greedy_token":
+            if phase != "decode" or layer is not None or dtype != "i32" or token_count != 1 or shape != [1]:
+                raise TraceError("decode.greedy_token schema is invalid")
+            return
+
+        if phase not in ("prefill", "decode") or layer is None:
+            raise TraceError(f"{component} phase or layer is invalid")
+        if len(shape) != 2 or shape[1] != token_count:
+            raise TraceError(f"{component} second dimension must equal token_count")
+        widths = {
+            "engram.row_ids": ("i32", config.get("engram_rows_per_token")),
+            "expert.ids": ("i32", config.get("experts_used")),
+            "expert.weights": ("f32", config.get("experts_used")),
+            "attn.source": ("i32", None),
+            "attn.candidate_blocks": ("i32", None),
+            "attn.candidates": ("i32", config.get("index_top_k")),
+        }
+        if component not in widths:
+            raise TraceError(f"unsupported trace component: {component}")
+        expected_dtype, width = widths[component]
+        if dtype != expected_dtype:
+            raise TraceError(f"{component} dtype must be {expected_dtype}")
+        if width is not None and shape[0] != width:
+            raise TraceError(f"{component} shape must be [{width},token_count]")
+        if component == "attn.candidate_blocks" and shape[0] > config.get("candidate_topk_blocks", 0):
+            raise TraceError("attn.candidate_blocks width exceeds candidate_topk_blocks")
+        if component == "expert.ids":
+            values = struct.iter_unpack("<i", self.read_blob(event))
+            if any(value < 0 or value >= config.get("expert_count", 0) for value, in values):
+                raise TraceError("expert.ids contains an out-of-range original expert ID")
+
 
 def first_byte_difference(left: bytes, right: bytes) -> int | None:
     for index, (a, b) in enumerate(zip(left, right)):
@@ -465,8 +647,10 @@ def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
         ("model.architecture", "model_identity"),
         ("prompt.sha256", "prompt_identity"),
         ("prompt.byte_count", "prompt_identity"),
+        ("expected.prompt_tokens", "tokenizer"),
         ("config.context", "configuration"),
         ("config.decode_steps", "configuration"),
+        ("config.deepseek41", "configuration"),
         ("comparison.logits", "comparison_policy"),
     )
     for dotted, classification in checks:
@@ -489,6 +673,26 @@ def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
 
 
 def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
+    if left.root.resolve() == right.root.resolve():
+        return Mismatch(
+            "artifact_identity",
+            "manifest",
+            "metadata",
+            -1,
+            -1,
+            None,
+            "cannot compare a trace bundle with itself",
+        )
+    if left.manifest["runtime"] != "ds4" or right.manifest["runtime"] != "llama.cpp":
+        return Mismatch(
+            "runtime_role",
+            "manifest",
+            "metadata",
+            -1,
+            -1,
+            None,
+            "left trace must be pinned ds4 and right trace must be llama.cpp candidate",
+        )
     mismatch = compare_manifests(left, right)
     if mismatch is not None:
         return mismatch
@@ -553,6 +757,15 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
         byte_offset = first_byte_difference(left_data, right_data)
         assert byte_offset is not None
         item_size = DTYPE_SIZES[left_event["dtype"]]
+        flat_element_index = byte_offset // item_size
+        token_index = None
+        component_element_index = None
+        token_count = left_event["token_count"]
+        elements = element_count(left_event["shape"])
+        if token_count > 0 and elements % token_count == 0:
+            elements_per_token = elements // token_count
+            token_index = left_event["token_start"] + flat_element_index // elements_per_token
+            component_element_index = flat_element_index % elements_per_token
         detail = f"first byte mismatch at {byte_offset}"
         item_offset = byte_offset - byte_offset % item_size
         if item_offset + item_size <= min(len(left_data), len(right_data)):
@@ -567,8 +780,10 @@ def compare_bundles(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
             template["token_start"],
             template["layer"],
             detail,
-            element_index=byte_offset // item_size,
+            element_index=flat_element_index,
             byte_offset=byte_offset,
+            token_index=token_index,
+            component_element_index=component_element_index,
         )
     return None
 

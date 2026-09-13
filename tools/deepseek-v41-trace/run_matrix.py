@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
-import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, require_nvme_path, resolved
-from trace_format import TraceBundle, report
+from preflight import PreflightError, require_nvme_path, resolved, run_preflight
+from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, report, sha256_file
 
 CORPORA = (
     "correctness-prose.txt",
@@ -26,12 +26,37 @@ def run(command: list[str]) -> None:
         raise RuntimeError(f"command failed with status {result.returncode}")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def prepare_prompt(
+    *,
+    builder: Path,
+    model: Path,
+    corpus: Path,
+    output: Path,
+    target_tokens: int,
+) -> dict[str, object]:
+    command = [
+        str(builder),
+        "--model", str(model),
+        "--corpus", str(corpus),
+        "--output", str(output),
+        "--tokens", str(target_tokens),
+    ]
+    print("exec:", " ".join(command), file=sys.stderr)
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"prompt builder failed: {result.stderr.strip()}")
+    try:
+        record = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"prompt builder returned invalid JSON: {error}") from error
+    if record.get("actual_tokens") != target_tokens:
+        raise RuntimeError("prompt builder did not produce the requested token count")
+    record.update({
+        "path": str(output),
+        "sha256": sha256_file(output),
+        "builder_sha256": sha256_file(builder),
+    })
+    return record
 
 
 def main() -> int:
@@ -42,6 +67,10 @@ def main() -> int:
     parser.add_argument("--watchdog-pid-file", type=Path, required=True)
     parser.add_argument("--llama-runner", type=Path, required=True)
     parser.add_argument("--llama-exporter", type=Path, required=True)
+    parser.add_argument("--llama-prompt-builder", type=Path, required=True)
+    parser.add_argument("--candidate-revision", required=True)
+    parser.add_argument("--base-revision", required=True)
+    parser.add_argument("--candidate-diff-sha256", required=True)
     parser.add_argument("--ds4-runner", type=Path, required=True)
     parser.add_argument("--ds4-exporter", type=Path, required=True)
     parser.add_argument("--ds4-exporter-sha256", required=True)
@@ -52,48 +81,94 @@ def main() -> int:
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--expert-cache-slots", type=int, required=True)
     parser.add_argument("--expert-cache-mib", type=int, required=True)
+    parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
     args = parser.parse_args()
 
     try:
         repo = resolved(args.repo)
         output = require_nvme_path(args.output, "matrix output")
         model = require_nvme_path(args.model, "model")
+        if not model.is_file():
+            raise PreflightError(f"model is not a file: {model}")
+        model_sha256 = sha256_file(model)
+        if model_sha256 != MODEL_SHA256:
+            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        prompt_builder = resolved(args.llama_prompt_builder)
+        if not prompt_builder.is_file() or not os.access(prompt_builder, os.X_OK):
+            raise PreflightError(f"prompt builder is not executable: {prompt_builder}")
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"matrix output directory is not empty: {output}")
         inputs = output / "inputs"
-        inputs.mkdir(parents=True, exist_ok=True)
+        sources = inputs / "sources"
+        prompts = inputs / "prompts"
+        sources.mkdir(parents=True, exist_ok=True)
+        prompts.mkdir(parents=True, exist_ok=True)
         corpus_records = []
         for name in CORPORA:
-            source = repo / "tests" / "corpus" / name
+            source = require_nvme_path(repo / "tests" / "corpus" / name, "repository corpus")
             if not source.is_file():
                 raise PreflightError(f"repository corpus is missing: {source}")
-            destination = inputs / name
+            destination = sources / name
             shutil.copyfile(source, destination)
+            source_sha256 = sha256_file(destination)
+            if source_sha256 != CORPUS_SHA256[name]:
+                raise PreflightError(
+                    f"repository corpus SHA-256 mismatch for {name}: expected {CORPUS_SHA256[name]}, found {source_sha256}")
             corpus_records.append({
                 "name": name,
                 "source": str(source),
                 "path": str(destination),
                 "byte_count": destination.stat().st_size,
-                "sha256": sha256_file(destination),
+                "sha256": source_sha256,
             })
 
         results = []
+        prompt_records = []
         for context in args.contexts:
             if context < 32768 or context > 131072:
                 raise PreflightError(f"context is outside the supported 32768..131072 matrix: {context}")
+            target_tokens = context - args.decode_steps
+            if target_tokens < 1:
+                raise PreflightError("decode steps leave no room for prompt tokens")
+            prepared_prompts = {}
+            for corpus in corpus_records:
+                stem = Path(corpus["name"]).stem
+                prompt = prompts / f"{stem}-c{context}.txt"
+                run_preflight(
+                    model=model,
+                    prompt=Path(corpus["path"]),
+                    output=prompt,
+                    watchdog_pid_file=args.watchdog_pid_file,
+                    busy_patterns=args.busy_pattern,
+                )
+                prepared = prepare_prompt(
+                    builder=resolved(args.llama_prompt_builder),
+                    model=model,
+                    corpus=Path(corpus["path"]),
+                    output=prompt,
+                    target_tokens=target_tokens,
+                )
+                prepared.update({"corpus": corpus["name"], "context": context})
+                prepared_prompts[corpus["name"]] = prepared
+                prompt_records.append(prepared)
             for ubatch in args.ubatches:
                 for corpus in corpus_records:
                     stem = Path(corpus["name"]).stem
                     case = f"{stem}-c{context}-ub{ubatch}"
                     llama_output = output / "llama" / case
                     ds4_output = output / "ds4" / case
+                    prompt = prepared_prompts[corpus["name"]]["path"]
                     common = [
                         "--model", str(model),
-                        "--prompt", corpus["path"],
+                        "--prompt", prompt,
+                        "--corpus-name", corpus["name"],
+                        "--corpus-sha256", corpus["sha256"],
                         "--watchdog-pid-file", str(resolved(args.watchdog_pid_file)),
                         "--context", str(context),
                         "--decode-steps", str(args.decode_steps),
                     ]
+                    for pattern in args.busy_pattern:
+                        common.extend(["--busy-pattern", pattern])
                     run([
                         sys.executable,
                         str(resolved(args.ds4_runner)),
@@ -108,6 +183,10 @@ def main() -> int:
                         sys.executable,
                         str(resolved(args.llama_runner)),
                         "--exporter", str(resolved(args.llama_exporter)),
+                        "--repo", str(repo),
+                        "--candidate-revision", args.candidate_revision,
+                        "--base-revision", args.base_revision,
+                        "--candidate-diff-sha256", args.candidate_diff_sha256,
                         "--output", str(llama_output),
                         "--batch", str(args.batch),
                         "--ubatch", str(ubatch),
@@ -129,10 +208,18 @@ def main() -> int:
         summary = {
             "status": "TARGET PASS",
             "model": str(model),
+            "model_sha256": model_sha256,
+            "candidate_revision": args.candidate_revision,
+            "base_revision": args.base_revision,
+            "candidate_diff_sha256": args.candidate_diff_sha256,
             "corpora": corpus_records,
+            "prompts": prompt_records,
             "contexts": args.contexts,
             "ubatches": args.ubatches,
             "decode_steps": args.decode_steps,
+            "target_prompt_tokens": {
+                str(context): context - args.decode_steps for context in args.contexts
+            },
             "cases": results,
         }
         (output / "summary.json").write_text(

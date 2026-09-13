@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
 import os
+import re
+import shutil
 import time
 from pathlib import Path
 
 FORBIDDEN_ROOT = Path("/mnt/bigspace")
 SOFT_MEMORY_LIMIT = 116 * 1024 * 1024 * 1024
+MAX_WATCHDOG_HEARTBEAT_AGE = 30
 
 
 class PreflightError(RuntimeError):
@@ -70,21 +74,70 @@ def memory_audit() -> dict[str, int]:
     return result
 
 
-def watchdog_audit(pid_file: Path) -> dict[str, object]:
-    pid_file = resolved(pid_file)
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def proc_start_time_ticks(stat: str) -> int:
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        raise PreflightError("watchdog process stat is invalid")
+    fields = stat[command_end + 2:].split()
+    if len(fields) < 20:
+        raise PreflightError("watchdog process stat is truncated")
+    return int(fields[19])
+
+
+def read_heartbeat(path: Path, max_age_seconds: int) -> int:
     try:
-        pid = int(pid_file.read_text(encoding="ascii").strip())
+        heartbeat = int(path.read_text(encoding="ascii").strip())
     except (OSError, ValueError) as error:
-        raise PreflightError(f"watchdog pid file is invalid: {error}") from error
+        raise PreflightError(f"watchdog heartbeat is invalid: {error}") from error
+    now = int(time.time())
+    if heartbeat <= 0 or heartbeat > now or now - heartbeat > max_age_seconds:
+        raise PreflightError("watchdog heartbeat is stale")
+    return heartbeat
+
+
+def watchdog_audit(pid_file: Path) -> dict[str, object]:
+    pid_file = require_nvme_path(pid_file, "watchdog lease")
+    try:
+        lease = json.loads(pid_file.read_text(encoding="ascii"))
+        pid = int(lease["pid"])
+        expected_start = int(lease["start_time_ticks"])
+        expected_command_sha256 = str(lease["command_sha256"])
+        heartbeat_path = require_nvme_path(Path(lease["heartbeat_path"]), "watchdog heartbeat")
+        max_age_seconds = int(lease.get("max_heartbeat_age_seconds", MAX_WATCHDOG_HEARTBEAT_AGE))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise PreflightError(f"watchdog lease is invalid: {error}") from error
+    if re.fullmatch(r"[0-9a-f]{64}", expected_command_sha256) is None:
+        raise PreflightError("watchdog lease command SHA-256 is invalid")
+    if max_age_seconds <= 0 or max_age_seconds > MAX_WATCHDOG_HEARTBEAT_AGE:
+        raise PreflightError(f"watchdog heartbeat age must be within 1..{MAX_WATCHDOG_HEARTBEAT_AGE} seconds")
     if pid <= 1 or not Path(f"/proc/{pid}").exists():
         raise PreflightError(f"watchdog process {pid} is not running")
     try:
-        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-    except OSError as error:
+        command_bytes = Path(f"/proc/{pid}/cmdline").read_bytes()
+        start_time_ticks = proc_start_time_ticks(Path(f"/proc/{pid}/stat").read_text(encoding="ascii"))
+    except (OSError, ValueError) as error:
         raise PreflightError(f"cannot inspect watchdog process {pid}: {error}") from error
+    command_sha256 = sha256_bytes(command_bytes)
+    if start_time_ticks != expected_start or command_sha256 != expected_command_sha256:
+        raise PreflightError("watchdog process identity does not match its lease")
+    heartbeat = read_heartbeat(heartbeat_path, max_age_seconds)
+    command = command_bytes.replace(b"\0", b" ").decode("utf-8", "replace").strip()
     if not command:
         raise PreflightError(f"watchdog process {pid} has no command line")
-    return {"pid": pid, "pid_file": str(pid_file), "command": command}
+    return {
+        "pid": pid,
+        "pid_file": str(pid_file),
+        "start_time_ticks": start_time_ticks,
+        "command": command,
+        "command_sha256": command_sha256,
+        "heartbeat_path": str(heartbeat_path),
+        "heartbeat_unix": heartbeat,
+        "max_heartbeat_age_seconds": max_age_seconds,
+    }
 
 
 def matching_workloads(patterns: list[str]) -> list[dict[str, object]]:
@@ -160,3 +213,60 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
     summary.write_text(json.dumps(audit, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     result["preflight"] = str(summary)
     return result
+
+
+def embed_audits(trace_root: Path, audits: dict[str, str]) -> dict[str, dict[str, object]]:
+    trace_root = resolved(trace_root)
+    embedded_root = trace_root / "audits"
+    embedded_root.mkdir(parents=True, exist_ok=True)
+    result = {}
+    for kind in ("memory", "swap", "watchdog"):
+        source = resolved(Path(audits[kind]))
+        data = source.read_bytes()
+        digest = sha256_bytes(data)
+        destination = embedded_root / f"{digest}.json"
+        if destination.exists() and destination.read_bytes() != data:
+            raise PreflightError(f"content-addressed audit collision: {destination}")
+        if not destination.exists():
+            shutil.copyfile(source, destination)
+        try:
+            record = json.loads(data.decode("ascii"))
+            created = int(record["created_unix"])
+        except (UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            raise PreflightError(f"cannot embed {kind} audit: {error}") from error
+        result[kind] = {
+            "path": f"audits/{digest}.json",
+            "sha256": digest,
+            "created_unix": created,
+        }
+    return result
+
+
+def bind_embedded_audits(trace_root: Path, audits: dict[str, str]) -> None:
+    trace_root = resolved(trace_root)
+    manifest_path = trace_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"cannot bind trace audits: {error}") from error
+    manifest["audits"] = embed_audits(trace_root, audits)
+    temp = manifest_path.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+    os.replace(temp, manifest_path)
+
+
+def bind_prompt_provenance(trace_root: Path, corpus_name: str, corpus_sha256: str) -> None:
+    trace_root = resolved(trace_root)
+    manifest_path = trace_root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"cannot bind prompt provenance: {error}") from error
+    prompt = manifest.get("prompt")
+    if not isinstance(prompt, dict):
+        raise PreflightError("trace manifest prompt is invalid")
+    prompt["corpus_name"] = corpus_name
+    prompt["corpus_sha256"] = corpus_sha256
+    temp = manifest_path.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+    os.replace(temp, manifest_path)

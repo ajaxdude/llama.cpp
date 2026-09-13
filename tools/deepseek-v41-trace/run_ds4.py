@@ -8,17 +8,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, resolved, run_preflight, write_audits
-from trace_format import TraceBundle, sha256_file
+from preflight import PreflightError, bind_embedded_audits, bind_prompt_provenance, resolved, run_preflight, write_audits
+from trace_format import CORPUS_SHA256, MODEL_SHA256, TraceBundle, TraceError, sha256_file
 
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 
 
 def read_revision(checkout: Path) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
-        text=True,
-    ).strip()
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise PreflightError(f"cannot read ds4 revision: {error}") from error
 
 
 def preflight(args: argparse.Namespace) -> dict[str, object]:
@@ -56,6 +60,8 @@ def main() -> int:
     parser.add_argument("--busy-pattern", action="append", default=["ds4-v41", "DeepSeek-V4.1"])
     parser.add_argument("--exporter", type=Path, required=True)
     parser.add_argument("--exporter-sha256", required=True)
+    parser.add_argument("--corpus-name", choices=sorted(CORPUS_SHA256), required=True)
+    parser.add_argument("--corpus-sha256", required=True)
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--prefill-chunk", type=int, default=512)
@@ -63,6 +69,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
+            raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         audit = preflight(args)
         if args.preflight_only:
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
@@ -75,6 +83,9 @@ def main() -> int:
         if exporter_sha256 != args.exporter_sha256:
             raise PreflightError(
                 f"trace exporter SHA-256 mismatch: expected {args.exporter_sha256}, found {exporter_sha256}")
+        model_sha256 = sha256_file(resolved(args.model))
+        if model_sha256 != MODEL_SHA256:
+            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
         audit["exporter"] = {"path": str(exporter), "sha256": exporter_sha256}
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
@@ -96,6 +107,9 @@ def main() -> int:
         result = subprocess.run(command, cwd=resolved(args.checkout), check=False)
         if result.returncode != 0:
             return result.returncode
+        preflight(args)
+        bind_embedded_audits(output, audits)
+        bind_prompt_provenance(output, args.corpus_name, args.corpus_sha256)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "ds4":
             raise PreflightError("ds4 exporter wrote a non-ds4 trace")
@@ -104,8 +118,10 @@ def main() -> int:
                 f"ds4 trace revision mismatch: expected {DS4_REVISION}, found {bundle.manifest.get('revision')}")
         if bundle.manifest.get("build", {}).get("sha256") != exporter_sha256:
             raise PreflightError("ds4 trace build SHA-256 does not match the executed exporter")
+        if bundle.manifest.get("model", {}).get("sha256") != MODEL_SHA256:
+            raise PreflightError("ds4 trace model SHA-256 does not match the published GGUF")
         return 0
-    except PreflightError as error:
+    except (PreflightError, TraceError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

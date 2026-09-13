@@ -3,24 +3,65 @@
 import importlib.util
 import json
 import struct
+import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
-MODULE_PATH = Path(__file__).parents[1] / "tools" / "deepseek-v41-trace" / "trace_format.py"
+TRACE_DIR = Path(__file__).parents[1] / "tools" / "deepseek-v41-trace"
+sys.path.insert(0, str(TRACE_DIR))
+MODULE_PATH = TRACE_DIR / "trace_format.py"
 SPEC = importlib.util.spec_from_file_location("dsv41_trace_format", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 trace = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(trace)
+import run_llama
+import preflight
 
 
-def manifest(runtime: str = "test") -> dict:
-    return {
+AUDIT_RECORDS = {
+    "memory": {
+        "created_unix": 1,
+        "kind": "memory",
+        "data": {"mem_total_bytes": 128, "mem_available_bytes": 64, "mem_used_bytes": 64},
+    },
+    "swap": {
+        "created_unix": 1,
+        "kind": "swap",
+        "data": {"enabled": False, "entries": []},
+    },
+    "watchdog": {
+        "created_unix": 1,
+        "kind": "watchdog",
+        "data": {
+            "pid": 123,
+            "start_time_ticks": 456,
+            "command_sha256": "7" * 64,
+            "heartbeat_path": "/run/user/123/watchdog.heartbeat",
+            "heartbeat_unix": 1,
+            "max_heartbeat_age_seconds": 30,
+        },
+    },
+}
+
+
+def audit_bytes(kind: str) -> bytes:
+    return (json.dumps(AUDIT_RECORDS[kind], sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def manifest(runtime: str = "llama.cpp") -> dict:
+    result = {
         "runtime": runtime,
-        "revision": "a" * 40,
+        "revision": trace.DS4_REVISION if runtime == "ds4" else "a" * 40,
         "build": {"sha256": "3" * 64},
-        "model": {"sha256": "1" * 64, "byte_count": 123},
-        "prompt": {"sha256": "2" * 64, "byte_count": 3},
+        "model": {"sha256": trace.MODEL_SHA256, "byte_count": 123, "architecture": "deepseek41"},
+        "prompt": {
+            "sha256": trace.sha256_bytes(b"abc"),
+            "byte_count": 3,
+            "corpus_name": "correctness-prose.txt",
+            "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
+        },
         "config": {
             "context": 32768,
             "decode_steps": 1,
@@ -31,19 +72,33 @@ def manifest(runtime: str = "test") -> dict:
             "flash_attention": True,
             "expert_cache_slots": 8,
             "expert_cache_bytes": 4096,
+            "deepseek41": {
+                "layer_count": 40,
+                "vocab_size": 129280,
+                "engram_layers": [1, 14],
+                "engram_rows_per_token": 4,
+                "expert_count": 384,
+                "experts_used": 6,
+                "candidate_source_layer": 20,
+                "candidate_topk_blocks": 2048,
+                "candidate_block_size": 8,
+                "index_top_k": 512,
+                "candidate_propagation_layers": [24, 28, 32, 36],
+            },
         },
         "comparison": {"logits": "byte-identical-f32"},
         "expected": {
             "prompt_tokens": 2,
             "decode_steps": 1,
             "components": {
+                "prompt.bytes": {"layers": None, "input": "tokens"},
                 "prompt.tokens": {"layers": None, "input": "tokens"},
-                "engram.row_ids": {"layers": [1], "prefill": "tokens", "decode": "steps"},
-                "expert.ids": {"layers": [0], "prefill": "tokens", "decode": "steps"},
-                "expert.weights": {"layers": [0], "prefill": "tokens", "decode": "steps"},
-                "attn.source": {"layers": [20], "prefill": "tokens", "decode": "steps"},
+                "engram.row_ids": {"layers": [1, 14], "prefill": "tokens", "decode": "steps"},
+                "expert.ids": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
+                "expert.weights": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
+                "attn.source": {"layers": list(range(40)), "prefill": "tokens", "decode": "steps"},
                 "attn.candidate_blocks": {"layers": [20], "prefill": "tokens", "decode": "steps"},
-                "attn.candidates": {"layers": [24], "prefill": "tokens", "decode": "steps"},
+                "attn.candidates": {"layers": [24, 28, 32, 36], "prefill": "tokens", "decode": "steps"},
                 "logits.prefill": {"layers": None, "prefill": "final"},
                 "logits.decode": {"layers": None, "decode": "steps"},
                 "decode.greedy_token": {"layers": None, "decode": "steps"},
@@ -51,14 +106,42 @@ def manifest(runtime: str = "test") -> dict:
         },
         "environment": {},
         "audits": {
-            "memory": {"path": "memory.json", "sha256": "4" * 64, "created_unix": 1},
-            "swap": {"path": "swap.json", "sha256": "5" * 64, "created_unix": 1},
-            "watchdog": {"path": "watchdog.json", "sha256": "6" * 64, "created_unix": 1},
+            kind: {
+                "path": f"audits/{trace.sha256_bytes(audit_bytes(kind))}.json",
+                "sha256": trace.sha256_bytes(audit_bytes(kind)),
+                "created_unix": 1,
+            }
+            for kind in ("memory", "swap", "watchdog")
         },
     }
+    if runtime == "llama.cpp":
+        result["candidate"] = {
+            "repository": trace.REPOSITORY,
+            "revision": "a" * 40,
+            "base_revision": "b" * 40,
+            "diff_sha256": "c" * 64,
+            "executable_sha256": "3" * 64,
+        }
+    return result
 
 
 def add_required_events(writer: object, logits: bytes | None = None) -> None:
+    audit_root = writer.root / "audits"
+    audit_root.mkdir(exist_ok=True)
+    for kind in ("memory", "swap", "watchdog"):
+        data = audit_bytes(kind)
+        (audit_root / f"{trace.sha256_bytes(data)}.json").write_bytes(data)
+    writer.add_event(
+        component="prompt.bytes",
+        phase="input",
+        step=0,
+        token_start=0,
+        token_count=2,
+        layer=None,
+        dtype="bytes",
+        shape=[3],
+        data=b"abc",
+    )
     writer.add_event(
         component="prompt.tokens",
         phase="input",
@@ -77,9 +160,9 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_start=0,
         token_count=2,
         layer=1,
-        dtype="u32",
-        shape=[2, 4],
-        data=struct.pack("<IIIIIIII", 1, 2, 3, 4, 5, 6, 7, 8),
+        dtype="i32",
+        shape=[4, 2],
+        data=struct.pack("<iiiiiiii", 1, 2, 3, 4, 5, 6, 7, 8),
     )
     writer.add_event(
         component="expert.ids",
@@ -89,7 +172,7 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=0,
         dtype="i32",
-        shape=[2, 6],
+        shape=[6, 2],
         data=struct.pack("<iiiiiiiiiiii", 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6),
         semantic_id_space="original",
     )
@@ -101,7 +184,7 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=0,
         dtype="f32",
-        shape=[2, 6],
+        shape=[6, 2],
         data=struct.pack("<ffffffffffff", 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6),
     )
     writer.add_event(
@@ -112,7 +195,7 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=20,
         dtype="i32",
-        shape=[2],
+        shape=[1, 2],
         data=struct.pack("<ii", 20, 20),
     )
     writer.add_event(
@@ -134,8 +217,8 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=2,
         layer=24,
         dtype="i32",
-        shape=[2, 2],
-        data=struct.pack("<iiii", 4, 7, 4, 7),
+        shape=[512, 2],
+        data=struct.pack("<" + "i" * 1024, *([4, 7] * 512)),
     )
     writer.add_event(
         component="logits.prefill",
@@ -145,8 +228,8 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=1,
         layer=None,
         dtype="f32",
-        shape=[4],
-        data=logits if logits is not None else struct.pack("<IIII", 0x3F800000, 0x80000000, 0x7FC12345, 0),
+        shape=[129280],
+        data=logits if logits is not None else struct.pack("<" + "I" * 129280, *([0x3F800000] * 129280)),
     )
     writer.add_event(
         component="decode.greedy_token",
@@ -161,23 +244,24 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
     )
     writer.add_event(
         component="engram.row_ids", phase="decode", step=0, token_start=2, token_count=1,
-        layer=1, dtype="u32", shape=[1, 4], data=struct.pack("<IIII", 9, 10, 11, 12))
+        layer=1, dtype="i32", shape=[4, 1], data=struct.pack("<iiii", 9, 10, 11, 12))
     writer.add_event(
         component="expert.ids", phase="decode", step=0, token_start=2, token_count=1,
-        layer=0, dtype="i32", shape=[1, 6], data=struct.pack("<iiiiii", 1, 2, 3, 4, 5, 6),
+        layer=0, dtype="i32", shape=[6, 1], data=struct.pack("<iiiiii", 1, 2, 3, 4, 5, 6),
         semantic_id_space="original")
     writer.add_event(
         component="expert.weights", phase="decode", step=0, token_start=2, token_count=1,
-        layer=0, dtype="f32", shape=[1, 6], data=struct.pack("<ffffff", 1, 2, 3, 4, 5, 6))
+        layer=0, dtype="f32", shape=[6, 1], data=struct.pack("<ffffff", 1, 2, 3, 4, 5, 6))
     writer.add_event(
         component="attn.source", phase="decode", step=0, token_start=2, token_count=1,
-        layer=20, dtype="i32", shape=[1], data=struct.pack("<i", 20))
+        layer=20, dtype="i32", shape=[1, 1], data=struct.pack("<i", 20))
     writer.add_event(
         component="attn.candidate_blocks", phase="decode", step=0, token_start=2, token_count=1,
-        layer=20, dtype="i32", shape=[2], data=struct.pack("<ii", 4, 7))
+        layer=20, dtype="i32", shape=[2, 1], data=struct.pack("<ii", 4, 7))
     writer.add_event(
         component="attn.candidates", phase="decode", step=0, token_start=2, token_count=1,
-        layer=24, dtype="i32", shape=[2], data=struct.pack("<ii", 4, 7))
+        layer=24, dtype="i32", shape=[512, 1],
+        data=struct.pack("<" + "i" * 512, *([4, 7] * 256)))
     writer.add_event(
         component="logits.decode",
         phase="decode",
@@ -186,9 +270,48 @@ def add_required_events(writer: object, logits: bytes | None = None) -> None:
         token_count=1,
         layer=None,
         dtype="f32",
-        shape=[4],
-        data=logits if logits is not None else struct.pack("<IIII", 0x3F800000, 0x80000000, 0x7FC12345, 0),
+        shape=[129280],
+        data=logits if logits is not None else struct.pack("<" + "I" * 129280, *([0x3F800000] * 129280)),
     )
+    writer.add_event(
+        component="engram.row_ids", phase="prefill", step=0, token_start=0, token_count=2,
+        layer=14, dtype="i32", shape=[4, 2], data=struct.pack("<iiiiiiii", 1, 2, 3, 4, 5, 6, 7, 8))
+    writer.add_event(
+        component="engram.row_ids", phase="decode", step=0, token_start=2, token_count=1,
+        layer=14, dtype="i32", shape=[4, 1], data=struct.pack("<iiii", 9, 10, 11, 12))
+    for layer in range(1, 40):
+        writer.add_event(
+            component="expert.ids", phase="prefill", step=0, token_start=0, token_count=2,
+            layer=layer, dtype="i32", shape=[6, 2],
+            data=struct.pack("<iiiiiiiiiiii", 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6),
+            semantic_id_space="original")
+        writer.add_event(
+            component="expert.ids", phase="decode", step=0, token_start=2, token_count=1,
+            layer=layer, dtype="i32", shape=[6, 1], data=struct.pack("<iiiiii", 1, 2, 3, 4, 5, 6),
+            semantic_id_space="original")
+        writer.add_event(
+            component="expert.weights", phase="prefill", step=0, token_start=0, token_count=2,
+            layer=layer, dtype="f32", shape=[6, 2],
+            data=struct.pack("<ffffffffffff", 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6))
+        writer.add_event(
+            component="expert.weights", phase="decode", step=0, token_start=2, token_count=1,
+            layer=layer, dtype="f32", shape=[6, 1], data=struct.pack("<ffffff", 1, 2, 3, 4, 5, 6))
+    for layer in list(range(20)) + list(range(21, 40)):
+        writer.add_event(
+            component="attn.source", phase="prefill", step=0, token_start=0, token_count=2,
+            layer=layer, dtype="i32", shape=[1, 2], data=struct.pack("<ii", 20, 20))
+        writer.add_event(
+            component="attn.source", phase="decode", step=0, token_start=2, token_count=1,
+            layer=layer, dtype="i32", shape=[1, 1], data=struct.pack("<i", 20))
+    for layer in (28, 32, 36):
+        writer.add_event(
+            component="attn.candidates", phase="prefill", step=0, token_start=0, token_count=2,
+            layer=layer, dtype="i32", shape=[512, 2],
+            data=struct.pack("<" + "i" * 1024, *([4, 7] * 512)))
+        writer.add_event(
+            component="attn.candidates", phase="decode", step=0, token_start=2, token_count=1,
+            layer=layer, dtype="i32", shape=[512, 1],
+            data=struct.pack("<" + "i" * 512, *([4, 7] * 256)))
 
 
 class TraceFormatTests(unittest.TestCase):
@@ -196,7 +319,7 @@ class TraceFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
             bits = (0x3F800000, 0x80000000, 0x7FC12345, 0)
-            data = struct.pack("<IIII", *bits)
+            data = struct.pack("<IIII", *bits) + bytes((129280 - len(bits)) * 4)
             with trace.TraceBundleWriter(root, manifest()) as writer:
                 add_required_events(writer, data)
             bundle = trace.TraceBundle(root)
@@ -208,19 +331,18 @@ class TraceFormatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             left = Path(temp) / "left"
             right = Path(temp) / "right"
-            with trace.TraceBundleWriter(left, manifest("llama.cpp")) as writer:
+            with trace.TraceBundleWriter(left, manifest("ds4")) as writer:
                 add_required_events(writer)
-            with trace.TraceBundleWriter(right, manifest("ds4")) as writer:
+            with trace.TraceBundleWriter(right, manifest("llama.cpp")) as writer:
                 add_required_events(writer)
             right_bundle = trace.TraceBundle(right)
             expert = next(item for item in right_bundle.events if item["component"] == "expert.ids")
-            expert_blob = right / expert["blob"]
-            expert_blob.write_bytes(struct.pack(
-                "<iiiiiiiiiiii", 1, 2, 9, 4, 5, 6, 1, 2, 3, 4, 5, 6))
-            expert["sha256"] = trace.sha256_file(expert_blob)
+            mutated = struct.pack(
+                "<iiiiiiiiiiii", 1, 2, 3, 4, 5, 6, 1, 2, 9, 4, 5, 6)
+            expert["sha256"] = trace.sha256_bytes(mutated)
             expert["blob"] = f"blobs/{expert['sha256']}.bin"
             new_blob = right / expert["blob"]
-            expert_blob.rename(new_blob)
+            new_blob.write_bytes(mutated)
             events = [
                 expert if trace.event_key(item) == trace.event_key(expert) else item
                 for item in right_bundle.events
@@ -234,7 +356,33 @@ class TraceFormatTests(unittest.TestCase):
             divergence = result["first_divergence"]
             self.assertEqual(divergence["classification"], "routing_original_expert")
             self.assertEqual(divergence["layer"], 0)
-            self.assertEqual(divergence["element_index"], 2)
+            self.assertEqual(divergence["element_index"], 8)
+            self.assertEqual(divergence["token_index"], 1)
+            self.assertEqual(divergence["component_element_index"], 2)
+
+    def test_llama_runner_preserves_binary_prompt_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = root / "model.gguf"
+            prompt = root / "prompt.txt"
+            exporter = root / "exporter"
+            output = root / "trace"
+            model.write_bytes(b"model")
+            prompt.write_bytes(b"line with trailing newline\n")
+            args = Namespace(
+                model=model,
+                prompt=prompt,
+                context=32768,
+                decode_steps=8,
+                batch=2048,
+                ubatch=512,
+                gpu_layers=99,
+                expert_cache_slots=8,
+                expert_cache_mib=4096,
+            )
+            command = run_llama.build_command(args, exporter, output)
+            self.assertEqual(command[command.index("-bf") + 1], str(prompt.resolve()))
+            self.assertNotIn("-f", command)
 
     def test_rejects_cache_slot_id_space(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -276,30 +424,109 @@ class TraceFormatTests(unittest.TestCase):
             with self.assertRaisesRegex(trace.TraceError, "watchdog audit reference"):
                 trace.TraceBundle(root)
 
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest()
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            (root / trace_manifest["audits"]["memory"]["path"]).unlink()
+            with self.assertRaisesRegex(trace.TraceError, "memory audit evidence"):
+                trace.TraceBundle(root)
+
+    def test_rejects_unpinned_ds4_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            trace_manifest = manifest("ds4")
+            trace_manifest["revision"] = "a" * 40
+            with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                add_required_events(writer)
+            with self.assertRaisesRegex(trace.TraceError, "ds4 revision"):
+                trace.TraceBundle(root)
+
+    def test_rejects_wrong_component_schema_and_same_bundle_compare(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
+                add_required_events(writer)
+            events_path = root / trace.EVENTS_NAME
+            events = [
+                json.loads(line)
+                for line in events_path.read_text(encoding="ascii").splitlines()
+            ]
+            expert = next(event for event in events if event["component"] == "expert.ids")
+            expert["dtype"] = "f32"
+            events_path.write_text(
+                "".join(trace.canonical_json(event) + "\n" for event in events),
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(trace.TraceError, "expert.ids dtype"):
+                trace.TraceBundle(root)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "trace"
+            with trace.TraceBundleWriter(root, manifest("ds4")) as writer:
+                add_required_events(writer)
+            bundle = trace.TraceBundle(root)
+            result = trace.report(bundle, bundle)
+            self.assertEqual(result["first_divergence"]["classification"], "artifact_identity")
+
+    def test_rejects_empty_variable_width_components(self) -> None:
+        for component in ("attn.source", "attn.candidate_blocks"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temp:
+                writer = trace.TraceBundleWriter(Path(temp) / "trace", manifest())
+                with self.assertRaisesRegex(trace.TraceError, "nonzero"):
+                    writer.add_event(
+                        component=component,
+                        phase="prefill",
+                        step=0,
+                        token_start=0,
+                        token_count=2,
+                        layer=20,
+                        dtype="i32",
+                        shape=[0, 2],
+                        data=b"",
+                    )
+                writer.events.close()
+
+    def test_watchdog_stat_parser_handles_parentheses(self) -> None:
+        fields = ["S", *[str(value) for value in range(4, 23)]]
+        self.assertEqual(preflight.proc_start_time_ticks(f"123 (watch) dog) {' '.join(fields)}"), 22)
+
     def test_report_generation_passes_identical_bundles(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             left = Path(temp) / "left"
             right = Path(temp) / "right"
-            with trace.TraceBundleWriter(left, manifest("llama.cpp")) as writer:
+            with trace.TraceBundleWriter(left, manifest("ds4")) as writer:
                 add_required_events(writer)
-            with trace.TraceBundleWriter(right, manifest("ds4")) as writer:
+            with trace.TraceBundleWriter(right, manifest("llama.cpp")) as writer:
                 add_required_events(writer)
             result = trace.report(trace.TraceBundle(left), trace.TraceBundle(right))
             self.assertEqual(result["status"], "TARGET PASS")
-            self.assertEqual(result["events_compared"], 16)
+            self.assertEqual(result["events_compared"], 259)
             self.assertIsNone(result["first_divergence"])
 
     def test_manifest_mismatch_is_classified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             left = Path(temp) / "left"
             right = Path(temp) / "right"
-            left_manifest = manifest("llama.cpp")
-            right_manifest = manifest("ds4")
-            right_manifest["prompt"]["sha256"] = "3" * 64
+            left_manifest = manifest("ds4")
+            right_manifest = manifest("llama.cpp")
+            right_prompt = b"abd"
+            right_manifest["prompt"]["sha256"] = trace.sha256_bytes(right_prompt)
             with trace.TraceBundleWriter(left, left_manifest) as writer:
                 add_required_events(writer)
             with trace.TraceBundleWriter(right, right_manifest) as writer:
                 add_required_events(writer)
+            events_path = right / trace.EVENTS_NAME
+            events = [json.loads(line) for line in events_path.read_text(encoding="ascii").splitlines()]
+            prompt_event = next(event for event in events if event["component"] == "prompt.bytes")
+            prompt_event["sha256"] = trace.sha256_bytes(right_prompt)
+            prompt_event["blob"] = f"blobs/{prompt_event['sha256']}.bin"
+            (right / prompt_event["blob"]).write_bytes(right_prompt)
+            events_path.write_text(
+                "".join(trace.canonical_json(event) + "\n" for event in events),
+                encoding="ascii",
+            )
             result = trace.report(trace.TraceBundle(left), trace.TraceBundle(right))
             self.assertEqual(result["first_divergence"]["classification"], "prompt_identity")
 

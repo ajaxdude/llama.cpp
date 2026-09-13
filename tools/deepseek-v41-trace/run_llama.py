@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -8,13 +9,102 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import PreflightError, resolved, run_preflight, write_audits
-from trace_format import TraceBundle, sha256_file
+from preflight import PreflightError, bind_embedded_audits, bind_prompt_provenance, resolved, run_preflight, write_audits
+from trace_format import CORPUS_SHA256, MODEL_SHA256, REPOSITORY, TraceBundle, TraceError, sha256_file
+
+
+def git_output(repo: Path, *args: str) -> bytes:
+    try:
+        return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise PreflightError(f"git {' '.join(args)} failed: {error}") from error
+
+
+def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dict[str, str]:
+    repo = resolved(args.repo)
+    revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
+    base_revision = git_output(repo, "rev-parse", args.base_revision).decode("ascii").strip()
+    if revision != args.candidate_revision:
+        raise PreflightError(
+            f"candidate revision mismatch: expected {args.candidate_revision}, found {revision}")
+    if base_revision != args.base_revision:
+        raise PreflightError(
+            f"base revision mismatch: expected {args.base_revision}, found {base_revision}")
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_revision, revision],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "diff", "--quiet"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "--quiet"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise PreflightError(f"candidate repository is not cleanly based on {base_revision}: {error}") from error
+    diff = git_output(repo, "diff", "--binary", "--no-ext-diff", base_revision, revision, "--")
+    diff_sha256 = hashlib.sha256(diff).hexdigest()
+    if diff_sha256 != args.candidate_diff_sha256:
+        raise PreflightError(
+            f"candidate diff SHA-256 mismatch: expected {args.candidate_diff_sha256}, found {diff_sha256}")
+    return {
+        "repository": REPOSITORY,
+        "revision": revision,
+        "base_revision": base_revision,
+        "diff_sha256": diff_sha256,
+        "executable_sha256": exporter_sha256,
+    }
+
+
+def bind_candidate_attestation(output: Path, attestation: dict[str, str]) -> None:
+    manifest_path = output / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"cannot bind candidate attestation: {error}") from error
+    manifest["candidate"] = attestation
+    temp = manifest_path.with_suffix(".tmp")
+    temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+    os.replace(temp, manifest_path)
+
+
+def build_command(args: argparse.Namespace, exporter: Path, output: Path) -> list[str]:
+    return [
+        str(exporter),
+        "-m", str(resolved(args.model)),
+        "-bf", str(resolved(args.prompt)),
+        "-o", str(output),
+        "-c", str(args.context),
+        "-n", str(args.decode_steps),
+        "-b", str(args.batch),
+        "-ub", str(args.ubatch),
+        "-ngl", str(args.gpu_layers),
+        "-fa", "on",
+        "-ctk", "f16",
+        "-ctv", "f16",
+        "--expert-cache-slots", str(args.expert_cache_slots),
+        "--expert-cache-mib", str(args.expert_cache_mib),
+    ]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fail-closed launcher for llama.cpp DeepSeek V4.1 traces")
     parser.add_argument("--exporter", type=Path, required=True)
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--candidate-revision", required=True)
+    parser.add_argument("--base-revision", required=True)
+    parser.add_argument("--candidate-diff-sha256", required=True)
+    parser.add_argument("--corpus-name", choices=sorted(CORPUS_SHA256), required=True)
+    parser.add_argument("--corpus-sha256", required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -31,6 +121,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
+            raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
         audit = run_preflight(
             model=args.model,
             prompt=args.prompt,
@@ -56,6 +148,10 @@ def main() -> int:
         if not exporter.is_file() or not os.access(exporter, os.X_OK):
             raise PreflightError(f"trace exporter is not executable: {exporter}")
         exporter_sha256 = sha256_file(exporter)
+        model_sha256 = sha256_file(resolved(args.model))
+        if model_sha256 != MODEL_SHA256:
+            raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
+        attestation = candidate_attestation(args, exporter_sha256)
         output = resolved(args.output)
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"trace output directory is not empty: {output}")
@@ -64,33 +160,30 @@ def main() -> int:
         environment["DSV41_TRACE_MEMORY_AUDIT"] = audits["memory"]
         environment["DSV41_TRACE_SWAP_AUDIT"] = audits["swap"]
         environment["DSV41_TRACE_WATCHDOG_AUDIT"] = audits["watchdog"]
-        command = [
-            str(exporter),
-            "-m", str(resolved(args.model)),
-            "-f", str(resolved(args.prompt)),
-            "-o", str(output),
-            "-c", str(args.context),
-            "-n", str(args.decode_steps),
-            "-b", str(args.batch),
-            "-ub", str(args.ubatch),
-            "-ngl", str(args.gpu_layers),
-            "-fa", "on",
-            "-ctk", "f16",
-            "-ctv", "f16",
-            "--expert-cache-slots", str(args.expert_cache_slots),
-            "--expert-cache-mib", str(args.expert_cache_mib),
-        ]
+        command = build_command(args, exporter, output)
         print("exec:", shlex.join(command), file=sys.stderr)
         result = subprocess.run(command, env=environment, check=False)
         if result.returncode != 0:
             return result.returncode
+        run_preflight(
+            model=args.model,
+            prompt=args.prompt,
+            output=args.output,
+            watchdog_pid_file=args.watchdog_pid_file,
+            busy_patterns=args.busy_pattern,
+        )
+        bind_embedded_audits(output, audits)
+        bind_prompt_provenance(output, args.corpus_name, args.corpus_sha256)
+        bind_candidate_attestation(output, attestation)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "llama.cpp":
             raise PreflightError("llama exporter wrote a non-llama.cpp trace")
         if bundle.manifest.get("build", {}).get("sha256") != exporter_sha256:
             raise PreflightError("llama trace build SHA-256 does not match the executed exporter")
+        if bundle.manifest.get("model", {}).get("sha256") != MODEL_SHA256:
+            raise PreflightError("llama trace model SHA-256 does not match the published GGUF")
         return 0
-    except PreflightError as error:
+    except (PreflightError, TraceError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

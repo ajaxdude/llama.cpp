@@ -12,6 +12,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <clocale>
 #include <cstdint>
 #include <cstdio>
@@ -106,6 +107,58 @@ static std::string required_environment(const char * name) {
     return value;
 }
 
+#if defined(__linux__)
+static uint64_t proc_start_time_ticks(int64_t pid) {
+    const std::vector<uint8_t> bytes = read_file("/proc/" + std::to_string(pid) + "/stat");
+    const std::string stat(bytes.begin(), bytes.end());
+    const size_t command_end = stat.rfind(')');
+    if (command_end == std::string::npos) {
+        throw std::runtime_error("watchdog process stat is invalid");
+    }
+    std::istringstream fields(stat.substr(command_end + 2));
+    std::string value;
+    for (int field = 3; field <= 22; ++field) {
+        if (!(fields >> value)) {
+            throw std::runtime_error("watchdog process stat is truncated");
+        }
+    }
+    return std::stoull(value);
+}
+
+static void validate_watchdog(const json & data) {
+    const int64_t pid = data.value("pid", INT64_C(0));
+    if (pid <= 1 || !fs::exists("/proc/" + std::to_string(pid))) {
+        throw std::runtime_error("watchdog process is not running");
+    }
+    if (proc_start_time_ticks(pid) != data.value("start_time_ticks", UINT64_C(0))) {
+        throw std::runtime_error("watchdog process start time changed");
+    }
+    const std::vector<uint8_t> command = read_file("/proc/" + std::to_string(pid) + "/cmdline");
+    if (sha256_data(command.data(), command.size()) != data.value("command_sha256", "")) {
+        throw std::runtime_error("watchdog process command changed");
+    }
+    const fs::path heartbeat_path = data.value("heartbeat_path", "");
+    const int64_t max_age = data.value("max_heartbeat_age_seconds", INT64_C(0));
+    if (heartbeat_path.empty() || max_age <= 0 || max_age > 30) {
+        throw std::runtime_error("watchdog heartbeat configuration is invalid");
+    }
+    const std::vector<uint8_t> heartbeat_bytes = read_file(heartbeat_path);
+    const std::string heartbeat_text(heartbeat_bytes.begin(), heartbeat_bytes.end());
+    size_t parsed = 0;
+    const int64_t heartbeat = std::stoll(heartbeat_text, &parsed);
+    while (parsed < heartbeat_text.size() && std::isspace(static_cast<unsigned char>(heartbeat_text[parsed]))) {
+        ++parsed;
+    }
+    if (parsed != heartbeat_text.size()) {
+        throw std::runtime_error("watchdog heartbeat is invalid");
+    }
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (heartbeat <= 0 || heartbeat > now || now - heartbeat > max_age) {
+        throw std::runtime_error("watchdog heartbeat is stale");
+    }
+}
+#endif
+
 static json audit_reference(const char * environment_name, const char * expected_kind) {
     const fs::path path = required_environment(environment_name);
     require_nvme_path(path, "audit");
@@ -129,10 +182,7 @@ static json audit_reference(const char * environment_name, const char * expected
     }
 #if defined(__linux__)
     if (std::string(expected_kind) == "watchdog") {
-        const int64_t pid = audit["data"].value("pid", INT64_C(0));
-        if (pid <= 1 || !fs::exists("/proc/" + std::to_string(pid))) {
-            throw std::runtime_error("watchdog audit process is not running");
-        }
+        validate_watchdog(audit["data"]);
     }
 #endif
     json result = {
@@ -141,7 +191,7 @@ static json audit_reference(const char * environment_name, const char * expected
         {"created_unix", created},
     };
     if (std::string(expected_kind) == "watchdog") {
-        result["pid"] = audit["data"].value("pid", INT64_C(0));
+        result["data"] = audit["data"];
     }
     return result;
 }
@@ -164,7 +214,7 @@ static std::vector<int64_t> tensor_shape(const ggml_tensor * tensor) {
     }
     std::vector<int64_t> result;
     result.reserve(rank);
-    for (int i = rank - 1; i >= 0; --i) {
+    for (int i = 0; i < rank; ++i) {
         result.push_back(tensor->ne[i]);
     }
     return result;
@@ -362,10 +412,10 @@ static void decode_tokens(
         llama_context * ctx,
         trace_writer & writer,
         const std::vector<llama_token> & tokens,
-        int32_t n_batch) {
+        int32_t n_ubatch) {
     int64_t offset = 0;
     while (offset < static_cast<int64_t>(tokens.size())) {
-        const int32_t count = static_cast<int32_t>(std::min<int64_t>(n_batch, tokens.size() - offset));
+        const int32_t count = static_cast<int32_t>(std::min<int64_t>(n_ubatch, tokens.size() - offset));
         llama_batch batch = llama_batch_init(count, 0, 1);
         for (int32_t i = 0; i < count; ++i) {
             const bool logits = offset + i + 1 == static_cast<int64_t>(tokens.size());
@@ -420,7 +470,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (params.model.path.empty() || params.prompt_file.empty() || params.out_file.empty()) {
-            throw std::runtime_error("-m, -f, and -o are required");
+            throw std::runtime_error("-m, -bf, and -o are required");
         }
         if (params.n_predict < 1) {
             throw std::runtime_error("-n must request at least one deterministic decode step");
@@ -456,6 +506,7 @@ int main(int argc, char ** argv) {
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const bool add_bos = llama_vocab_get_add_bos(vocab);
         const std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         if (tokens.empty()) {
             throw std::runtime_error("prompt tokenization produced no tokens");
         }
@@ -507,6 +558,19 @@ int main(int argc, char ** argv) {
                 {"expert_cache_bytes", static_cast<uint64_t>(params.expert_cache_mib) << 20},
                 {"tokenizer_add_bos", add_bos},
                 {"tokenizer_parse_special", true},
+                {"deepseek41", {
+                    {"layer_count", 40},
+                    {"vocab_size", n_vocab},
+                    {"engram_layers", {1, 14}},
+                    {"engram_rows_per_token", 4},
+                    {"expert_count", 384},
+                    {"experts_used", 6},
+                    {"candidate_source_layer", 20},
+                    {"candidate_topk_blocks", 2048},
+                    {"candidate_block_size", 8},
+                    {"index_top_k", 512},
+                    {"candidate_propagation_layers", {24, 28, 32, 36}},
+                }},
             }},
             {"comparison", {
                 {"tokens", "exact"},
@@ -529,6 +593,7 @@ int main(int argc, char ** argv) {
                 {"prompt_tokens", tokens.size()},
                 {"decode_steps", params.n_predict},
                 {"components", {
+                    {"prompt.bytes", {{"layers", nullptr}, {"input", "tokens"}}},
                     {"prompt.tokens", {{"layers", nullptr}, {"input", "tokens"}}},
                     {"engram.row_ids", {{"layers", {1, 14}}, {"prefill", "tokens"}, {"decode", "steps"}}},
                     {"expert.ids", {{"layers", all_layers}, {"prefill", "tokens"}, {"decode", "steps"}}},
@@ -552,8 +617,7 @@ int main(int argc, char ** argv) {
         writer.add("prompt.tokens", -1, "i32", {static_cast<int64_t>(tokens.size())},
                 tokens.data(), tokens.size()*sizeof(tokens[0]));
 
-        decode_tokens(ctx, writer, tokens, params.n_batch);
-        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        decode_tokens(ctx, writer, tokens, params.n_ubatch);
         std::vector<float> logits = copy_logits(ctx, n_vocab);
         writer.set_execution("prefill", 0, tokens.size() - 1, 1);
         writer.add("logits.prefill", -1, "f32", {n_vocab}, logits.data(), logits.size()*sizeof(float));
@@ -580,10 +644,7 @@ int main(int argc, char ** argv) {
         }
 
 #if defined(__linux__)
-        const int64_t watchdog_pid = watchdog_audit.value("pid", INT64_C(0));
-        if (watchdog_pid <= 1 || !fs::exists("/proc/" + std::to_string(watchdog_pid))) {
-            throw std::runtime_error("watchdog stopped before trace completion");
-        }
+        validate_watchdog(watchdog_audit["data"]);
 #endif
         writer.finish();
         llama_backend_free();
