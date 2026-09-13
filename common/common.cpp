@@ -1704,8 +1704,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.dsv41_memory_hard_bytes = (uint64_t) params.dsv41_memory_hard_mib << 20;
     mparams.dsv41_memory_safety_margin_bytes = (uint64_t) params.dsv41_memory_safety_margin_mib << 20;
     mparams.dsv41_admission_context = params.n_ctx == 0 ? 32768 : params.n_ctx;
+    mparams.dsv41_admission_batch = std::max(params.n_batch, 1);
     mparams.dsv41_admission_sequences = params.n_parallel;
-    mparams.dsv41_admission_ubatch = params.n_ubatch;
+    mparams.dsv41_admission_ubatch = std::min(
+            mparams.dsv41_admission_batch,
+            static_cast<uint32_t>(std::max(params.n_ubatch, 1)));
+    mparams.dsv41_admission_outputs = params.n_outputs_max <= 0 ?
+            mparams.dsv41_admission_batch :
+            std::min<uint32_t>(params.n_outputs_max, mparams.dsv41_admission_batch);
+    mparams.dsv41_admission_outputs = std::max<uint32_t>(
+            mparams.dsv41_admission_outputs, std::max(params.n_parallel, 1));
+    mparams.dsv41_admission_outputs_per_seq = params.n_outputs_max_per_seq == 0 ?
+            mparams.dsv41_admission_outputs :
+            std::min<uint32_t>(std::max(params.n_outputs_max_per_seq, 1), mparams.dsv41_admission_outputs);
     mparams.dsv41_procfs_root = params.dsv41_procfs_root.c_str();
 
     if (params.kv_overrides.empty()) {

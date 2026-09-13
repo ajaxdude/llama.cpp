@@ -192,20 +192,40 @@ uint64_t llama_dsv41_engram_staging_bytes(uint32_t n_ubatch) {
             "Engram staging");
 }
 
-uint64_t llama_dsv41_output_bytes(uint32_t n_vocab, uint32_t n_ubatch) {
-    if (n_vocab == 0 || n_ubatch == 0) {
+uint64_t llama_dsv41_output_bytes(
+        uint32_t n_vocab,
+        uint32_t n_batch,
+        uint32_t n_outputs_max) {
+    if (n_vocab == 0 || n_batch == 0 || n_outputs_max == 0 || n_outputs_max > n_batch) {
         throw std::runtime_error("DeepSeek V4.1 output accounting dimensions must be non-zero");
     }
     const uint64_t floats = checked_mul(
-            checked_mul(n_vocab, n_ubatch, "output floats"),
-            2*sizeof(float),
+            checked_mul(checked_mul(n_vocab, 3, "output floats"), n_outputs_max, "output floats"),
+            sizeof(float),
             "output floats");
     const uint64_t token_rows = checked_add(n_vocab, 1, "output tokens");
     const uint64_t tokens = checked_mul(
-            checked_mul(token_rows, n_ubatch, "output tokens"),
+            checked_mul(token_rows, n_outputs_max, "output tokens"),
             sizeof(int32_t),
             "output tokens");
-    return checked_add(floats, tokens, "outputs");
+    const uint64_t output_ids = checked_mul(n_batch, sizeof(int32_t), "output IDs");
+    const uint64_t sampling_counts = checked_mul(
+            checked_mul(n_outputs_max, 3, "sampling counts"),
+            sizeof(size_t),
+            "sampling counts");
+    return checked_add(
+            checked_add(floats, tokens, "outputs"),
+            checked_add(output_ids, sampling_counts, "outputs"),
+            "outputs");
+}
+
+bool llama_dsv41_has_unified_topology(const std::vector<enum ggml_backend_dev_type> & device_types) {
+    return !device_types.empty() && std::all_of(
+            device_types.begin(),
+            device_types.end(),
+            [](enum ggml_backend_dev_type type) {
+                return type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            });
 }
 
 llama_dsv41_admission_result llama_dsv41_admit(
@@ -224,8 +244,11 @@ llama_dsv41_admission_result llama_dsv41_admit(
     result.safety_margin_bytes = params.safety_margin_bytes;
     result.device_reported_bytes_ignored = params.device_reported_bytes;
     result.n_ctx = params.n_ctx;
+    result.n_batch = params.n_batch;
     result.n_seq = params.n_seq;
     result.n_ubatch = params.n_ubatch;
+    result.n_outputs_max = params.n_outputs_max;
+    result.n_outputs_max_per_seq = params.n_outputs_max_per_seq;
 
     if (host.total == 0 || host.available > host.total || host.used != host.total - host.available) {
         reject("host", result, "host memory snapshot is invalid");
@@ -255,6 +278,12 @@ llama_dsv41_admission_result llama_dsv41_admit(
     validate_context(params.n_ctx);
     if (params.n_seq != 1) {
         reject("context", result, "bounded DeepSeek V4.1 admission currently requires one sequence");
+    }
+    if (params.n_batch == 0 || params.n_ubatch == 0 || params.n_ubatch > params.n_batch ||
+            params.n_outputs_max == 0 || params.n_outputs_max > params.n_batch ||
+            params.n_outputs_max_per_seq == 0 ||
+            params.n_outputs_max_per_seq > params.n_outputs_max) {
+        reject("context", result, "batch, ubatch, and output limits are invalid");
     }
     if (params.n_expert_used == 0 || params.n_expert_used > LLAMA_DSV41_N_EXPERT) {
         reject("cache", result, "expert top-k is invalid");
@@ -288,6 +317,9 @@ llama_dsv41_admission_result llama_dsv41_admit(
             params.configured_cache_bytes > max_cache_bytes) {
         reject("cache", result, "configured cache exceeds the published expert count");
     }
+    result.required_expert_slots = static_cast<uint32_t>(std::min<uint64_t>(
+            LLAMA_DSV41_N_EXPERT,
+            checked_mul(params.n_expert_used, params.n_ubatch, "required expert slots")));
     const uint64_t bytes_slots = params.configured_cache_bytes == 0 ?
             LLAMA_DSV41_N_EXPERT : params.configured_cache_bytes/result.expert_slot_bytes;
     if (params.configured_cache_slots != 0 && params.configured_cache_bytes != 0 &&
@@ -301,10 +333,6 @@ llama_dsv41_admission_result llama_dsv41_admit(
     if (params.configured_cache_bytes != 0) {
         slot_cap = std::min(slot_cap, bytes_slots);
     }
-    if (slot_cap < params.n_expert_used) {
-        reject("cache", result, "configured cache is smaller than expert top-k");
-    }
-
     const auto state = llama_dsv41_account_memory(
             params.n_ctx,
             params.n_seq,
@@ -315,7 +343,10 @@ llama_dsv41_admission_result llama_dsv41_admit(
     result.state_bytes = state.total();
     result.graph_workspace_bytes = llama_dsv41_estimate_graph_workspace(params.n_ctx, params.n_ubatch);
     result.engram_staging_bytes = llama_dsv41_engram_staging_bytes(params.n_ubatch);
-    result.output_bytes = llama_dsv41_output_bytes(params.n_vocab, params.n_ubatch);
+    result.output_bytes = llama_dsv41_output_bytes(
+            params.n_vocab,
+            params.n_batch,
+            params.n_outputs_max);
 
     result.fixed_bytes = result.host_used;
     result.fixed_bytes = checked_add(result.fixed_bytes, result.dense_tensor_bytes, "fixed bytes");
@@ -341,18 +372,17 @@ llama_dsv41_admission_result llama_dsv41_admit(
             result.expert_slot_bytes, result.expert_staging_slot_bytes, "expert slot and staging");
     const uint64_t fit_slots = (result.soft_bytes - result.fixed_bytes)/bytes_per_slot;
     const uint64_t selected = std::min(slot_cap, fit_slots);
-    if (selected < params.n_expert_used) {
-        result.projected_bytes = result.fixed_bytes;
-        reject("cache", result, "remaining budget cannot hold the minimum expert top-k");
-    }
-
     result.expert_slots = static_cast<uint32_t>(selected);
+    result.expert_ubatch_capacity = result.expert_slots/params.n_expert_used;
     result.expert_cache_bytes = checked_mul(result.expert_slot_bytes, selected, "expert cache");
     result.expert_staging_bytes = checked_mul(result.expert_staging_slot_bytes, selected, "expert staging");
     result.projected_bytes = checked_add(
             checked_add(result.fixed_bytes, result.expert_cache_bytes, "projected bytes"),
             result.expert_staging_bytes,
             "projected bytes");
+    if (selected < result.required_expert_slots) {
+        reject("cache", result, "selected cache cannot hold the requested ubatch worst-case routed expert union");
+    }
     if (result.projected_bytes > result.soft_bytes) {
         reject("soft", result, "projected startup exceeds the soft limit");
     }
@@ -368,15 +398,20 @@ llama_dsv41_admission_result llama_dsv41_admit(
 
 std::string llama_dsv41_admission_result::describe() const {
     return format(
-            "DeepSeek V4.1 memory admission: category=%s, context=%u, sequences=%u, ubatch=%u, "
+            "DeepSeek V4.1 memory admission: category=%s, context=%u, batch=%u, sequences=%u, ubatch=%u, "
+            "outputs=%u, outputs_per_seq=%u, "
             "host_total=%llu, host_available=%llu, current=%llu, fixed=%llu, "
             "dense=%llu, state=%llu, workspace=%llu, engram_staging=%llu, expert_slots=%u, "
-            "expert_cache=%llu, expert_staging=%llu, outputs=%llu, safety_margin=%llu, projected=%llu, "
+            "required_expert_slots=%u, expert_ubatch_capacity=%u, expert_cache=%llu, expert_staging=%llu, output_bytes=%llu, "
+            "safety_margin=%llu, projected=%llu, "
             "soft=%llu, watchdog=%llu, hard=%llu, device_reported_ignored=%llu",
             category.c_str(),
             n_ctx,
+            n_batch,
             n_seq,
             n_ubatch,
+            n_outputs_max,
+            n_outputs_max_per_seq,
             (unsigned long long) host_total,
             (unsigned long long) host_available,
             (unsigned long long) host_used,
@@ -386,6 +421,8 @@ std::string llama_dsv41_admission_result::describe() const {
             (unsigned long long) graph_workspace_bytes,
             (unsigned long long) engram_staging_bytes,
             expert_slots,
+            required_expert_slots,
+            expert_ubatch_capacity,
             (unsigned long long) expert_cache_bytes,
             (unsigned long long) expert_staging_bytes,
             (unsigned long long) output_bytes,

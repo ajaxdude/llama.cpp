@@ -358,8 +358,11 @@ extern "C" {
         uint64_t dsv41_memory_hard_bytes;
         uint64_t dsv41_memory_safety_margin_bytes;
         uint32_t dsv41_admission_context;
+        uint32_t dsv41_admission_batch;
         uint32_t dsv41_admission_sequences;
         uint32_t dsv41_admission_ubatch;
+        uint32_t dsv41_admission_outputs;
+        uint32_t dsv41_admission_outputs_per_seq;
         const char * dsv41_procfs_root;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()

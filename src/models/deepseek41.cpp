@@ -284,12 +284,30 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     admission_params.configured_cache_slots = std::max(params.expert_cache_slots, 0);
     admission_params.n_ctx = params.dsv41_admission_context == 0 ?
             LLAMA_DSV41_ADMISSION_CONTEXT : params.dsv41_admission_context;
+    admission_params.n_batch = params.dsv41_admission_batch == 0 ? 2048 : params.dsv41_admission_batch;
     admission_params.n_seq = params.dsv41_admission_sequences == 0 ? 1 : params.dsv41_admission_sequences;
-    admission_params.n_ubatch = params.dsv41_admission_ubatch == 0 ? 2048 : params.dsv41_admission_ubatch;
+    admission_params.n_ubatch = std::min(
+            admission_params.n_batch,
+            params.dsv41_admission_ubatch == 0 ?
+                    admission_params.n_batch : params.dsv41_admission_ubatch);
+    admission_params.n_outputs_max = std::min(
+            admission_params.n_batch,
+            params.dsv41_admission_outputs == 0 ?
+                    admission_params.n_batch : params.dsv41_admission_outputs);
+    admission_params.n_outputs_max = std::max(admission_params.n_outputs_max, admission_params.n_seq);
+    admission_params.n_outputs_max_per_seq = std::min(
+            admission_params.n_outputs_max,
+            params.dsv41_admission_outputs_per_seq == 0 ?
+                    admission_params.n_outputs_max : params.dsv41_admission_outputs_per_seq);
     admission_params.n_vocab = n_vocab;
     admission_params.n_expert_used = n_expert_used;
     admission_params.direct_io = true;
-    admission_params.unified_memory = true;
+    std::vector<enum ggml_backend_dev_type> device_types;
+    device_types.reserve(devices.size());
+    for (const auto & device : devices) {
+        device_types.push_back(ggml_backend_dev_type(device.dev));
+    }
+    admission_params.unified_memory = llama_dsv41_has_unified_topology(device_types);
 
     const std::string procfs_root = params.dsv41_procfs_root == nullptr ? "/proc" : params.dsv41_procfs_root;
     admission = std::make_shared<admission_model>();
@@ -362,17 +380,38 @@ void llama_model_deepseek41::validate_context_params(const llama_cparams & cpara
     if (!admission) {
         throw std::runtime_error("DeepSeek V4.1 context has no host-memory admission result");
     }
+    const uint32_t n_outputs_max = std::min(cparams.n_outputs_max, cparams.n_batch);
+    const uint32_t output_rows = std::max(n_outputs_max, cparams.n_seq_max);
+    const uint32_t n_outputs_max_per_seq = std::min(cparams.n_outputs_max_per_seq, output_rows);
+    const bool has_layer_embeddings = std::any_of(
+            cparams.embeddings_layer_inp.begin(),
+            cparams.embeddings_layer_inp.end(),
+            [](bool enabled) { return enabled; });
     if (cparams.n_ctx > admission->result.n_ctx ||
+            cparams.n_batch > admission->result.n_batch ||
             cparams.n_seq_max > admission->result.n_seq ||
-            cparams.n_ubatch > admission->result.n_ubatch) {
+            cparams.n_ubatch > admission->result.n_ubatch ||
+            output_rows > admission->result.n_outputs_max ||
+            n_outputs_max_per_seq > admission->result.n_outputs_max_per_seq ||
+            cparams.embeddings ||
+            cparams.embeddings_nextn ||
+            has_layer_embeddings) {
         llama_dsv41_admission_result failure = admission->result;
         failure.category = "context";
         throw std::runtime_error(format(
-                "%s, requested_context=%u, requested_sequences=%u, requested_ubatch=%u",
+                "%s, requested_context=%u, requested_batch=%u, requested_sequences=%u, requested_ubatch=%u, "
+                "requested_outputs=%u, requested_outputs_per_seq=%u, embeddings=%s, embeddings_nextn=%s, "
+                "layer_embeddings=%s",
                 failure.describe().c_str(),
                 cparams.n_ctx,
+                cparams.n_batch,
                 cparams.n_seq_max,
-                cparams.n_ubatch));
+                cparams.n_ubatch,
+                output_rows,
+                n_outputs_max_per_seq,
+                cparams.embeddings ? "true" : "false",
+                cparams.embeddings_nextn ? "true" : "false",
+                has_layer_embeddings ? "true" : "false"));
     }
 }
 

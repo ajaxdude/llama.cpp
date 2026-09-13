@@ -6,12 +6,14 @@
 ./scripts/strix_memory_watchdog.py -- \
     ./build/bin/llama-server \
     -m /mnt/models/deepseek-v41/DeepSeek-V4.1-Flash-Q2.gguf \
-    -c 32768 -b 2048 -ub 2048 -ngl 99
+    -c 32768 -b 2048 -ub 32 -ngl 99
 ```
 
-DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
+DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
 
 Use `--dsv41-procfs-root`, `--dsv41-memory-soft-mib`, `--dsv41-memory-watchdog-mib`, `--dsv41-memory-hard-mib`, and `--dsv41-memory-safety-margin-mib` only when reproducing admission tests or applying a more conservative host policy. `--expert-cache-slots` and `--expert-cache-mib` are optional caps; zero auto-fits. If both cache options are set, their capacity must describe the same number of complete published tensor slots.
+
+The current expert runtime remaps the unique routed-expert union for one ubatch. Admission therefore requires `min(384, 6 * ubatch)` resident slots instead of only six top-k slots. For example, a 224-slot cache admits at most ubatch 37. Admission reports both the required slot count and the admitted ubatch capacity; it fails rather than lowering an explicit ubatch. DeepSeek V4.1 embedding extraction is rejected because those optional output buffers are not part of the bounded generation profile.
 
 Admission accepts context checkpoints 32768, 65536, 98304, and 131072. It never lowers an explicit context request. A request that does not fit reports current use, fixed tensor bytes, state bytes, graph workspace, Engram and expert staging, output bytes, selected cache slots and bytes, safety margin, all thresholds, and the rejecting category.
 

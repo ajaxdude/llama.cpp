@@ -2,6 +2,8 @@
 
 #include "llama-expert-store.h"
 
+#include "ggml-backend.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -30,8 +32,11 @@ struct llama_dsv41_admission_params {
     uint64_t device_reported_bytes = 0;
     uint32_t configured_cache_slots = 0;
     uint32_t n_ctx = LLAMA_DSV41_ADMISSION_CONTEXT;
+    uint32_t n_batch = 2048;
     uint32_t n_seq = 1;
     uint32_t n_ubatch = 2048;
+    uint32_t n_outputs_max = 2048;
+    uint32_t n_outputs_max_per_seq = 2048;
     uint32_t n_vocab = 0;
     uint32_t n_expert_used = 0;
     uint32_t kv_element_size = 2;
@@ -61,9 +66,14 @@ struct llama_dsv41_admission_result {
     uint64_t expert_slot_bytes = 0;
     uint64_t expert_staging_slot_bytes = 0;
     uint32_t expert_slots = 0;
+    uint32_t required_expert_slots = 0;
+    uint32_t expert_ubatch_capacity = 0;
     uint32_t n_ctx = 0;
+    uint32_t n_batch = 0;
     uint32_t n_seq = 0;
     uint32_t n_ubatch = 0;
+    uint32_t n_outputs_max = 0;
+    uint32_t n_outputs_max_per_seq = 0;
     std::string category;
 
     std::string describe() const;
@@ -73,7 +83,11 @@ llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_
 
 uint64_t llama_dsv41_estimate_graph_workspace(uint32_t n_ctx, uint32_t n_ubatch);
 uint64_t llama_dsv41_engram_staging_bytes(uint32_t n_ubatch);
-uint64_t llama_dsv41_output_bytes(uint32_t n_vocab, uint32_t n_ubatch);
+uint64_t llama_dsv41_output_bytes(
+        uint32_t n_vocab,
+        uint32_t n_batch,
+        uint32_t n_outputs_max);
+bool llama_dsv41_has_unified_topology(const std::vector<enum ggml_backend_dev_type> & device_types);
 
 llama_dsv41_admission_result llama_dsv41_admit(
         const llama_dsv41_host_memory & host,

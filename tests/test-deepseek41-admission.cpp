@@ -89,6 +89,7 @@ llama_dsv41_host_memory host_with_used(uint64_t used) {
 
 llama_dsv41_admission_params base_params() {
     llama_dsv41_admission_params params;
+    params.n_ubatch = 32;
     params.n_vocab = LLAMA_DSV41_N_VOCAB;
     params.n_expert_used = LLAMA_DSV41_N_EXPERT_USED;
     return params;
@@ -160,6 +161,7 @@ void test_published_slot_fit() {
 void test_configured_cache() {
     const auto tensors = published_tensors();
     auto params = base_params();
+    params.n_ubatch = 2;
     params.configured_cache_slots = 12;
     params.configured_cache_bytes = 12*398131200ULL + 1024;
     const auto result = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
@@ -175,7 +177,7 @@ void test_configured_cache() {
     params.configured_cache_bytes = 0;
     REQUIRE(thrown([&]() {
         llama_dsv41_admit(host_with_used(0), 0, tensors, params);
-    }).find("top-k") != std::string::npos);
+    }).find("routed expert union") != std::string::npos);
 
     params.configured_cache_slots = LLAMA_DSV41_N_EXPERT + 1;
     REQUIRE(thrown([&]() {
@@ -186,6 +188,7 @@ void test_configured_cache() {
 void test_threshold_boundaries() {
     const auto tensors = published_tensors();
     auto params = base_params();
+    params.n_ubatch = 1;
     params.configured_cache_slots = LLAMA_DSV41_N_EXPERT_USED;
     params.configured_cache_bytes = params.configured_cache_slots*398131200ULL;
     params.safety_margin_bytes = 1;
@@ -260,8 +263,10 @@ void test_diagnostics_and_guards() {
     const std::string diagnostic = result.describe();
     for (const char * field : {
                 "category=", "current=", "fixed=", "dense=", "state=", "workspace=",
-                "host_total=", "host_available=", "expert_slots=", "expert_cache=", "expert_staging=",
-                "soft=", "watchdog=", "hard=" }) {
+                "host_total=", "host_available=", "batch=", "outputs=", "outputs_per_seq=",
+                "expert_slots=", "required_expert_slots=", "expert_ubatch_capacity=",
+                "expert_cache=", "expert_staging=",
+                "output_bytes=", "soft=", "watchdog=", "hard=" }) {
         REQUIRE(diagnostic.find(field) != std::string::npos);
     }
 
@@ -277,6 +282,55 @@ void test_diagnostics_and_guards() {
     }).find("physical host memory") != std::string::npos);
 }
 
+void test_expert_union_and_outputs() {
+    const auto tensors = published_tensors();
+    auto params = base_params();
+    params.n_ubatch = 2;
+    params.configured_cache_slots = 11;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("worst-case routed expert union") != std::string::npos);
+
+    params.configured_cache_slots = 12;
+    const auto result = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    REQUIRE(result.required_expert_slots == 12);
+    REQUIRE(result.expert_slots == 12);
+
+    params = base_params();
+    params.n_ubatch = 37;
+    params.configured_cache_slots = 224;
+    const auto bounded = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    REQUIRE(bounded.required_expert_slots == 222);
+    REQUIRE(bounded.expert_slots == 224);
+    REQUIRE(bounded.expert_ubatch_capacity == 37);
+
+    params.n_ubatch = 38;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), 0, tensors, params);
+    }).find("worst-case routed expert union") != std::string::npos);
+
+    const uint64_t expected =
+            3*100ULL*10*sizeof(float) +
+            (100ULL + 1)*10*sizeof(int32_t) +
+            16*sizeof(int32_t) +
+            3*10*sizeof(size_t);
+    REQUIRE(llama_dsv41_output_bytes(100, 16, 10) == expected);
+}
+
+void test_unified_topology() {
+    REQUIRE(!llama_dsv41_has_unified_topology({}));
+    REQUIRE(!llama_dsv41_has_unified_topology({ GGML_BACKEND_DEVICE_TYPE_CPU }));
+    REQUIRE(!llama_dsv41_has_unified_topology({ GGML_BACKEND_DEVICE_TYPE_GPU }));
+    REQUIRE(!llama_dsv41_has_unified_topology({ GGML_BACKEND_DEVICE_TYPE_META }));
+    REQUIRE(llama_dsv41_has_unified_topology({ GGML_BACKEND_DEVICE_TYPE_IGPU }));
+    REQUIRE(llama_dsv41_has_unified_topology({
+            GGML_BACKEND_DEVICE_TYPE_IGPU,
+            GGML_BACKEND_DEVICE_TYPE_IGPU }));
+    REQUIRE(!llama_dsv41_has_unified_topology({
+            GGML_BACKEND_DEVICE_TYPE_IGPU,
+            GGML_BACKEND_DEVICE_TYPE_GPU }));
+}
+
 }
 
 int main() {
@@ -287,5 +341,7 @@ int main() {
     test_threshold_boundaries();
     test_context_progression();
     test_diagnostics_and_guards();
+    test_expert_union_and_outputs();
+    test_unified_topology();
     return 0;
 }
