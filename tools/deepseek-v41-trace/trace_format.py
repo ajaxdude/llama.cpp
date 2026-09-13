@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
 import os
 import re
+import signal
 import stat
 import struct
 import subprocess
@@ -132,6 +134,45 @@ DEEPSEEK41_EXPECTED_COMPONENTS = {
 
 class TraceError(RuntimeError):
     pass
+
+
+PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS = 5
+PROCESS_TREE_TERM_GRACE_SECONDS = 1
+WINDOWS_CREATE_SUSPENDED = 0x00000004
+WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+@dataclass(frozen=True)
+class _IntegrityFailure:
+    component: str
+    error: BaseException
+
+
+class ExecutionIntegrityError(TraceError):
+    def __init__(
+            self,
+            message: str,
+            *,
+            primary_error: BaseException | None,
+            secondary_errors: list[_IntegrityFailure]):
+        super().__init__(message)
+        self.primary_error = primary_error
+        self.secondary_errors = tuple(secondary_errors)
+
+
+@dataclass
+class _ProcessContainment:
+    process: subprocess.Popen[bytes]
+    process_group_id: int | None = None
+    job_handle: int | None = None
+
+
+@dataclass
+class _ContainedRun:
+    result: subprocess.CompletedProcess[bytes] | None
+    primary_error: BaseException | None
+    integrity_failures: list[_IntegrityFailure]
+    containment: _ProcessContainment | None
 
 
 @dataclass(frozen=True)
@@ -595,6 +636,407 @@ def verify_approved_runtime_file_identities(
             raise TraceError(f"{label} runtime component identity changed after approval")
 
 
+def _windows_error(message: str) -> TraceError:
+    return TraceError(f"{message}: Windows error {ctypes.get_last_error()}")
+
+
+def _windows_kernel32() -> Any:
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _create_windows_kill_job() -> int:
+    from ctypes import wintypes
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = _windows_kernel32()
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise _windows_error("cannot create process containment job")
+    limits = ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        primary_error = _windows_error("cannot configure process containment job")
+        if not kernel32.CloseHandle(job):
+            close_error = _windows_error("cannot close unconfigured process containment job")
+            raise ExecutionIntegrityError(
+                f"Windows job configuration primary failure "
+                f"[{type(primary_error).__name__}: {primary_error}]; "
+                f"secondary integrity failures: windows-job-handle-close "
+                f"[{type(close_error).__name__}: {close_error}]",
+                primary_error=primary_error,
+                secondary_errors=[_IntegrityFailure("windows-job-handle-close", close_error)],
+            ) from primary_error
+        raise primary_error
+    return int(job)
+
+
+def _open_windows_process_thread(process_id: int) -> int:
+    from ctypes import wintypes
+
+    class ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32 = _windows_kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+    if not snapshot or int(snapshot) == ctypes.c_void_p(-1).value:
+        raise _windows_error("cannot enumerate suspended process threads")
+    entry = ThreadEntry32()
+    entry.dwSize = ctypes.sizeof(entry)
+    thread = None
+    try:
+        found = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.th32OwnerProcessID == process_id:
+                thread = kernel32.OpenThread(0x0002 | 0x00100000, False, entry.th32ThreadID)
+                if not thread:
+                    raise _windows_error("cannot open suspended process thread")
+                break
+            found = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    except BaseException as primary_error:
+        if not kernel32.CloseHandle(snapshot):
+            close_error = _windows_error("cannot close process thread snapshot")
+            raise ExecutionIntegrityError(
+                f"Windows thread enumeration primary failure "
+                f"[{type(primary_error).__name__}: {primary_error}]; "
+                f"secondary integrity failures: windows-snapshot-handle-close "
+                f"[{type(close_error).__name__}: {close_error}]",
+                primary_error=primary_error,
+                secondary_errors=[_IntegrityFailure("windows-snapshot-handle-close", close_error)],
+            ) from primary_error
+        raise
+    if not kernel32.CloseHandle(snapshot):
+        close_error = _windows_error("cannot close process thread snapshot")
+        failures = [_IntegrityFailure("windows-snapshot-handle-close", close_error)]
+        if thread:
+            if not kernel32.CloseHandle(thread):
+                failures.append(_IntegrityFailure(
+                    "windows-thread-handle-close",
+                    _windows_error("cannot close suspended process thread")))
+        if len(failures) > 1:
+            raise ExecutionIntegrityError(
+                f"Windows thread enumeration integrity failures: "
+                f"{_format_integrity_failures(failures)}",
+                primary_error=None,
+                secondary_errors=failures,
+            ) from close_error
+        raise close_error
+    if not thread:
+        raise TraceError("cannot find suspended process thread")
+    return int(thread)
+
+
+def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
+    creationflags = int(launch.pop("creationflags", 0)) | WINDOWS_CREATE_SUSPENDED
+    process = subprocess.Popen(command, creationflags=creationflags, **launch)
+    job = None
+    thread = None
+    try:
+        job = _create_windows_kill_job()
+        kernel32 = _windows_kernel32()
+        process_handle = int(process._handle)
+        if not kernel32.AssignProcessToJobObject(job, process_handle):
+            raise _windows_error("cannot assign suspended process to containment job")
+        thread = _open_windows_process_thread(process.pid)
+        if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+            raise _windows_error("cannot resume contained process")
+        thread_closed = kernel32.CloseHandle(thread)
+        thread = None
+        if not thread_closed:
+            raise _windows_error("cannot close resumed process thread")
+        return _ProcessContainment(process=process, job_handle=job)
+    except BaseException as primary_error:
+        kernel32 = _windows_kernel32()
+        failures = []
+        if thread is not None:
+            if not kernel32.CloseHandle(thread):
+                failures.append(_IntegrityFailure(
+                    "windows-thread-handle-close",
+                    _windows_error("cannot close suspended process thread")))
+        if job is not None:
+            if not kernel32.TerminateJobObject(job, 1):
+                failures.append(_IntegrityFailure(
+                    "windows-job-termination",
+                    _windows_error("cannot terminate failed process containment job")))
+            if not kernel32.CloseHandle(job):
+                failures.append(_IntegrityFailure(
+                    "windows-job-handle-close",
+                    _windows_error("cannot close failed process containment job")))
+        else:
+            try:
+                process.kill()
+            except BaseException as error:
+                failures.append(_IntegrityFailure("windows-process-termination", error))
+        try:
+            process.wait(timeout=PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("windows-process-reap", error))
+        if failures:
+            raise ExecutionIntegrityError(
+                f"Windows containment startup primary failure "
+                f"[{type(primary_error).__name__}: {primary_error}]; "
+                f"secondary integrity failures: {_format_integrity_failures(failures)}",
+                primary_error=primary_error,
+                secondary_errors=failures,
+            ) from primary_error
+        raise
+
+
+def _start_contained_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
+    if sys.platform == "win32":
+        return _start_windows_job_process(command, launch)
+    launch["start_new_session"] = True
+    process = subprocess.Popen(command, **launch)
+    return _ProcessContainment(process=process, process_group_id=process.pid)
+
+
+def _posix_process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _windows_job_active_processes(job_handle: int) -> int:
+    from ctypes import wintypes
+
+    class BasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+    accounting = BasicAccountingInformation()
+    kernel32 = _windows_kernel32()
+    if not kernel32.QueryInformationJobObject(
+            job_handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+        raise _windows_error("cannot query process containment job")
+    return int(accounting.ActiveProcesses)
+
+
+def _process_tree_is_quiescent(containment: _ProcessContainment) -> bool:
+    if containment.job_handle is not None:
+        return _windows_job_active_processes(containment.job_handle) == 0
+    if containment.process_group_id is None:
+        raise TraceError("process containment identity is missing")
+    return not _posix_process_group_exists(containment.process_group_id)
+
+
+def _wait_for_process_tree_quiescence(containment: _ProcessContainment, deadline: float) -> None:
+    while not _process_tree_is_quiescent(containment):
+        if time.monotonic() >= deadline:
+            raise TraceError("process tree did not become quiescent before the cleanup deadline")
+        time.sleep(0.01)
+
+
+def _terminate_process_tree(containment: _ProcessContainment) -> list[_IntegrityFailure]:
+    failures = []
+    deadline = time.monotonic() + PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS
+    process = containment.process
+    try:
+        if containment.job_handle is not None:
+            if not _windows_kernel32().TerminateJobObject(containment.job_handle, 1):
+                raise _windows_error("cannot terminate process containment job")
+        elif containment.process_group_id is not None and _posix_process_group_exists(containment.process_group_id):
+            try:
+                os.killpg(containment.process_group_id, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            term_deadline = min(deadline, time.monotonic() + PROCESS_TREE_TERM_GRACE_SECONDS)
+            try:
+                _wait_for_process_tree_quiescence(containment, term_deadline)
+            except TraceError:
+                if _posix_process_group_exists(containment.process_group_id):
+                    try:
+                        os.killpg(containment.process_group_id, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+        else:
+            raise TraceError("process containment identity is missing")
+    except BaseException as error:
+        failures.append(_IntegrityFailure("process-tree-termination", error))
+    try:
+        remaining = max(0.01, deadline - time.monotonic())
+        process.communicate(timeout=remaining)
+    except BaseException as error:
+        failures.append(_IntegrityFailure("direct-child-reap", error))
+    try:
+        _wait_for_process_tree_quiescence(containment, deadline)
+    except BaseException as error:
+        failures.append(_IntegrityFailure("process-tree-quiescence", error))
+    return failures
+
+
+def _run_contained_process(
+        command: list[str],
+        *,
+        label: str,
+        timeout: float | None,
+        input_data: bytes | None,
+        launch: dict[str, Any],
+) -> _ContainedRun:
+    containment = None
+    try:
+        containment = _start_contained_process(command, launch)
+    except ExecutionIntegrityError as error:
+        return _ContainedRun(
+            None,
+            error.primary_error or error,
+            list(error.secondary_errors),
+            None,
+        )
+    except BaseException as error:
+        return _ContainedRun(None, error, [], None)
+    try:
+        stdout, stderr = containment.process.communicate(input=input_data, timeout=timeout)
+        result = subprocess.CompletedProcess(
+            command, containment.process.returncode, stdout, stderr)
+    except BaseException as error:
+        failures = _terminate_process_tree(containment)
+        return _ContainedRun(None, error, failures, containment)
+    try:
+        if _process_tree_is_quiescent(containment):
+            return _ContainedRun(result, None, [], containment)
+    except BaseException as error:
+        failures = [_IntegrityFailure("process-tree-quiescence", error)]
+    else:
+        error = TraceError(f"{label} process tree remained active after direct child exit")
+        failures = []
+    failures.extend(_terminate_process_tree(containment))
+    return _ContainedRun(None, error, failures, containment)
+
+
+def _close_process_containment(containment: _ProcessContainment | None) -> list[_IntegrityFailure]:
+    if containment is None or containment.job_handle is None:
+        return []
+    try:
+        if not _windows_kernel32().CloseHandle(containment.job_handle):
+            raise _windows_error("cannot close process containment job")
+        containment.job_handle = None
+        return []
+    except BaseException as error:
+        return [_IntegrityFailure("containment-handle-close", error)]
+
+
+def _format_integrity_failures(failures: list[_IntegrityFailure]) -> str:
+    return "; ".join(
+        f"{failure.component} [{type(failure.error).__name__}: {failure.error}]"
+        for failure in failures)
+
+
+def _raise_execution_integrity_failures(
+        *,
+        label: str,
+        primary_error: BaseException | None,
+        integrity_failures: list[_IntegrityFailure],
+) -> None:
+    if primary_error is not None and integrity_failures:
+        raise ExecutionIntegrityError(
+            f"{label} primary failure [{type(primary_error).__name__}: {primary_error}]; "
+            f"secondary integrity failures: {_format_integrity_failures(integrity_failures)}",
+            primary_error=primary_error,
+            secondary_errors=integrity_failures,
+        ) from primary_error
+    if primary_error is not None:
+        raise primary_error
+    if len(integrity_failures) == 1:
+        raise integrity_failures[0].error
+    if integrity_failures:
+        raise ExecutionIntegrityError(
+            f"{label} integrity failures: {_format_integrity_failures(integrity_failures)}",
+            primary_error=None,
+            secondary_errors=integrity_failures,
+        ) from integrity_failures[0].error
+
+
+def _decode_subprocess_stream(
+        stream: bytes | None,
+        *,
+        text: bool,
+        encoding: str | None,
+        errors: str | None,
+) -> bytes | str | None:
+    if stream is None or not text:
+        return stream
+    return stream.decode(encoding or "utf-8", errors or "strict")
+
+
 def run_approved_executable(
         command: list[str],
         *,
@@ -605,12 +1047,38 @@ def run_approved_executable(
         label: str,
         **kwargs: Any,
 ) -> tuple[subprocess.CompletedProcess[Any], ExecutableFileReceipt]:
-    if sys.platform not in {"linux", "darwin"}:
+    if sys.platform not in {"linux", "darwin", "win32"}:
         raise TraceError(f"{label} immutable execution is unsupported on this platform")
     if not command or command[0] != str(path):
         raise TraceError(f"{label} command path differs from external approval")
-    if "executable" in kwargs or "pass_fds" in kwargs:
+    protected_controls = {
+        "creationflags", "executable", "pass_fds", "preexec_fn", "process_group", "start_new_session"}
+    if protected_controls & kwargs.keys():
         raise TraceError(f"{label} execution parameters may not override immutable launch controls")
+    timeout = kwargs.pop("timeout", None)
+    check = bool(kwargs.pop("check", False))
+    capture_output = bool(kwargs.pop("capture_output", False))
+    text = bool(kwargs.pop("text", kwargs.pop("universal_newlines", False)))
+    encoding = kwargs.pop("encoding", None)
+    errors = kwargs.pop("errors", None)
+    input_value = kwargs.pop("input", None)
+    if encoding is not None or errors is not None:
+        text = True
+    if input_value is not None and "stdin" in kwargs:
+        raise TraceError(f"{label} execution input conflicts with stdin")
+    if capture_output and ("stdout" in kwargs or "stderr" in kwargs):
+        raise TraceError(f"{label} capture_output conflicts with stdout or stderr")
+    if capture_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if input_value is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if isinstance(input_value, str):
+        input_data = input_value.encode(encoding or "utf-8", errors or "strict")
+    elif input_value is None or isinstance(input_value, bytes):
+        input_data = input_value
+    else:
+        raise TraceError(f"{label} execution input is invalid")
     identity, descriptor = _approved_file_identity(
         path,
         install_root=Path(runtime_policy["install_root"]),
@@ -621,6 +1089,10 @@ def run_approved_executable(
         executable=True,
     )
     runtime_files: list[tuple[ExecutableFileReceipt, int]] = []
+    containment = None
+    result = None
+    primary_error = None
+    integrity_failures: list[_IntegrityFailure] = []
     try:
         for component in runtime_policy["runtime_receipt"]["components"]:
             runtime_path = Path(runtime_policy["install_root"]) / "lib" / component["filename"]
@@ -641,70 +1113,115 @@ def run_approved_executable(
                 label=f"{label} runtime component",
             )
         retained_descriptors = (descriptor, *(item[1] for item in runtime_files))
-        launch = {
-            "pass_fds": retained_descriptors,
-            **kwargs,
-        }
+        launch = dict(kwargs)
+        if sys.platform != "win32":
+            launch["pass_fds"] = retained_descriptors
         if sys.platform == "linux":
             launch["executable"] = f"/proc/self/fd/{descriptor}"
-        execution_error: OSError | subprocess.SubprocessError | None = None
-        result = None
-        try:
-            result = subprocess.run(command, **launch)
-        except (OSError, subprocess.SubprocessError) as error:
-            execution_error = error
-        descriptor_after = os.fstat(descriptor)
-        if (
-                descriptor_after.st_dev,
-                descriptor_after.st_ino,
-                descriptor_after.st_size,
-                descriptor_after.st_mtime_ns,
-                descriptor_after.st_ctime_ns,
-        ) != (
-                identity.device,
-                identity.inode,
-                identity.byte_count,
-                identity.modified_ns,
-                identity.changed_ns,
-        ):
-            raise TraceError(f"{label} descriptor identity changed during execution")
-        verify_approved_executable_identity(path, identity, label=label)
-        for runtime_identity, runtime_descriptor in runtime_files:
-            runtime_after = os.fstat(runtime_descriptor)
-            if (
-                    runtime_after.st_dev,
-                    runtime_after.st_ino,
-                    runtime_after.st_uid,
-                    stat.S_IMODE(runtime_after.st_mode),
-                    runtime_after.st_nlink,
-                    runtime_after.st_size,
-                    runtime_after.st_mtime_ns,
-                    runtime_after.st_ctime_ns,
-            ) != (
-                    runtime_identity.device,
-                    runtime_identity.inode,
-                    runtime_identity.owner_uid,
-                    runtime_identity.mode,
-                    runtime_identity.link_count,
-                    runtime_identity.byte_count,
-                    runtime_identity.modified_ns,
-                    runtime_identity.changed_ns,
-            ):
-                raise TraceError(f"{label} runtime component descriptor changed during execution")
-            verify_approved_executable_identity(
-                Path(runtime_identity.path),
-                runtime_identity,
-                label=f"{label} runtime component",
+        contained = _run_contained_process(
+            command,
+            label=label,
+            timeout=timeout,
+            input_data=input_data,
+            launch=launch,
+        )
+        containment = contained.containment
+        result = contained.result
+        primary_error = contained.primary_error
+        integrity_failures.extend(contained.integrity_failures)
+        if result is not None and check and result.returncode != 0 and primary_error is None:
+            primary_error = subprocess.CalledProcessError(
+                result.returncode,
+                result.args,
+                output=result.stdout,
+                stderr=result.stderr,
             )
-        if execution_error is not None:
-            raise execution_error
-        if result is None:
-            raise TraceError(f"{label} execution did not return a result")
-        return result, identity
+        try:
+            descriptor_after = os.fstat(descriptor)
+            if (
+                    descriptor_after.st_dev,
+                    descriptor_after.st_ino,
+                    descriptor_after.st_size,
+                    descriptor_after.st_mtime_ns,
+                    descriptor_after.st_ctime_ns,
+            ) != (
+                    identity.device,
+                    identity.inode,
+                    identity.byte_count,
+                    identity.modified_ns,
+                    identity.changed_ns,
+            ):
+                raise TraceError(f"{label} descriptor identity changed during execution")
+        except BaseException as error:
+            integrity_failures.append(_IntegrityFailure("executable-descriptor", error))
+        try:
+            verify_approved_executable_identity(path, identity, label=label)
+        except BaseException as error:
+            integrity_failures.append(_IntegrityFailure("executable-path-root", error))
+        for runtime_identity, runtime_descriptor in runtime_files:
+            try:
+                runtime_after = os.fstat(runtime_descriptor)
+                if (
+                        runtime_after.st_dev,
+                        runtime_after.st_ino,
+                        runtime_after.st_uid,
+                        stat.S_IMODE(runtime_after.st_mode),
+                        runtime_after.st_nlink,
+                        runtime_after.st_size,
+                        runtime_after.st_mtime_ns,
+                        runtime_after.st_ctime_ns,
+                ) != (
+                        runtime_identity.device,
+                        runtime_identity.inode,
+                        runtime_identity.owner_uid,
+                        runtime_identity.mode,
+                        runtime_identity.link_count,
+                        runtime_identity.byte_count,
+                        runtime_identity.modified_ns,
+                        runtime_identity.changed_ns,
+                ):
+                    raise TraceError(f"{label} runtime component descriptor changed during execution")
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure(
+                    f"runtime-descriptor:{runtime_identity.path}", error))
+            try:
+                verify_approved_executable_identity(
+                    Path(runtime_identity.path),
+                    runtime_identity,
+                    label=f"{label} runtime component",
+                )
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure(
+                    f"runtime-path-root:{runtime_identity.path}", error))
+    except BaseException as error:
+        if primary_error is None:
+            primary_error = error
+        else:
+            integrity_failures.append(_IntegrityFailure("launcher-orchestration", error))
     finally:
         for _runtime_identity, runtime_descriptor in runtime_files:
-            os.close(runtime_descriptor)
-        os.close(descriptor)
+            try:
+                os.close(runtime_descriptor)
+            except BaseException as error:
+                integrity_failures.append(_IntegrityFailure("runtime-descriptor-close", error))
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            integrity_failures.append(_IntegrityFailure("executable-descriptor-close", error))
+        integrity_failures.extend(_close_process_containment(containment))
+    _raise_execution_integrity_failures(
+        label=label,
+        primary_error=primary_error,
+        integrity_failures=integrity_failures,
+    )
+    if result is None:
+        raise TraceError(f"{label} execution did not return a result")
+    stdout = _decode_subprocess_stream(
+        result.stdout, text=text, encoding=encoding, errors=errors)
+    stderr = _decode_subprocess_stream(
+        result.stderr, text=text, encoding=encoding, errors=errors)
+    decoded_result = subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
+    return decoded_result, identity
 
 
 def install_trust_evidence(

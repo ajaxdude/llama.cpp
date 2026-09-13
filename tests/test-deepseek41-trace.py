@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -1991,10 +1992,11 @@ class TraceFormatTests(unittest.TestCase):
                     }],
                 },
             }
-            completed = subprocess.CompletedProcess([str(executable)], 0, "", "")
+            completed = subprocess.CompletedProcess([str(executable)], 0, b"", b"")
+            contained = trace._ContainedRun(completed, None, [], None)
             with isolated_test_install_trust(), mock.patch.object(
                     trace.sys, "platform", "linux"), mock.patch.object(
-                    trace.subprocess, "run", return_value=completed) as execute:
+                    trace, "_run_contained_process", return_value=contained) as execute:
                 result, identity = trace.run_approved_executable(
                     [str(executable), "--version"],
                     path=executable,
@@ -2006,12 +2008,56 @@ class TraceFormatTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
-            self.assertIs(result, completed)
+            self.assertEqual(result.stdout, "")
             self.assertEqual(identity.path, str(executable))
-            kwargs = execute.call_args.kwargs
-            self.assertRegex(kwargs["executable"], r"^/proc/self/fd/[0-9]+$")
+            launch = execute.call_args.kwargs["launch"]
+            self.assertRegex(launch["executable"], r"^/proc/self/fd/[0-9]+$")
             self.assertEqual(execute.call_args.args[0][0], str(executable))
-            self.assertEqual(len(kwargs["pass_fds"]), 2)
+            self.assertEqual(len(launch["pass_fds"]), 2)
+
+    def test_approved_executable_postchecks_before_strict_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            install = Path(temp).resolve() / "install"
+            executable = install / "bin" / "approved"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"approved")
+            executable.chmod(0o555)
+            policy = {
+                "install_root": str(install),
+                "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "runtime_receipt": {"components": []},
+            }
+            events = []
+            completed = subprocess.CompletedProcess([str(executable)], 0, b"\xff", b"")
+            contained = trace._ContainedRun(completed, None, [], None)
+            original_verify = trace.verify_approved_executable_identity
+            original_decode = trace._decode_subprocess_stream
+
+            def verify(*args: object, **kwargs: object) -> None:
+                events.append("verify")
+                original_verify(*args, **kwargs)
+
+            def decode(*args: object, **kwargs: object) -> bytes | str | None:
+                events.append("decode")
+                return original_decode(*args, **kwargs)
+
+            with isolated_test_install_trust(), mock.patch.object(
+                    trace, "_run_contained_process", return_value=contained), mock.patch.object(
+                    trace, "verify_approved_executable_identity", side_effect=verify), mock.patch.object(
+                    trace, "_decode_subprocess_stream", side_effect=decode), self.assertRaises(UnicodeDecodeError):
+                trace.run_approved_executable(
+                    [str(executable)],
+                    path=executable,
+                    runtime_policy=policy,
+                    expected_path=str(executable),
+                    expected_sha256=trace.sha256_file(executable),
+                    label="approved executable",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            self.assertGreater(events.count("verify"), 1)
+            self.assertLess(max(index for index, event in enumerate(events) if event == "verify"), events.index("decode"))
 
     def test_approved_install_rejects_mutable_alias_and_hardlink_paths(self) -> None:
         for mutation, message in (
@@ -2088,7 +2134,7 @@ class TraceFormatTests(unittest.TestCase):
             }
             with isolated_test_install_trust(), mock.patch.object(
                     trace.sys, "platform", "linux"), mock.patch.object(
-                    trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                    trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                     trace.TraceError, "path is mutable"):
                 trace.run_approved_executable(
                     [str(executable)],
@@ -2120,15 +2166,14 @@ class TraceFormatTests(unittest.TestCase):
                     timeout_seconds=30,
                     check=True,
                     capture_output=True,
-                    text=True,
                 )
-                self.assertEqual(first.stdout, "approved\n")
+                self.assertEqual(first.stdout, b"approved\n")
                 exporter.parent.chmod(0o755)
                 exporter.chmod(0o755)
                 exporter.write_text("#!/bin/sh\nprintf 'replacement\\n'\n", encoding="ascii")
                 exporter.chmod(0o555)
                 exporter.parent.chmod(0o555)
-                with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                with mock.patch.object(trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                         run_ds4.TraceError, "SHA-256 differs|identity changed"):
                     run_ds4.run_exporter_command(
                         [str(exporter)],
@@ -2138,7 +2183,6 @@ class TraceFormatTests(unittest.TestCase):
                         timeout_seconds=30,
                         check=True,
                         capture_output=True,
-                        text=True,
                     )
                 execute.assert_not_called()
 
@@ -2160,15 +2204,19 @@ class TraceFormatTests(unittest.TestCase):
                     label="ds4 exporter",
                 )
 
-                def swap_after_precheck(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                def swap_after_precheck(*_args: object, **_kwargs: object) -> trace._ContainedRun:
                     exporter.parent.chmod(0o755)
                     exporter.rename(backup)
                     replacement.rename(exporter)
                     exporter.parent.chmod(0o555)
-                    return subprocess.CompletedProcess([str(exporter)], 0, "replacement\n", "")
+                    result = subprocess.CompletedProcess([str(exporter)], 0, b"replacement\n", b"")
+                    return trace._ContainedRun(result, None, [], None)
 
                 with mock.patch.object(
-                        trace.subprocess, "run", side_effect=swap_after_precheck), self.assertRaisesRegex(
+                        sys.modules["trace_format"],
+                        "_run_contained_process",
+                        side_effect=swap_after_precheck,
+                ), self.assertRaisesRegex(
                         run_ds4.TraceError, "descriptor identity changed|SHA-256 differs|identity changed"):
                     run_ds4.run_exporter_command(
                         [str(exporter)],
@@ -2178,7 +2226,6 @@ class TraceFormatTests(unittest.TestCase):
                         timeout_seconds=30,
                         check=True,
                         capture_output=True,
-                        text=True,
                     )
 
     def test_ds4_exporter_postchecks_failed_invocation(self) -> None:
@@ -2199,16 +2246,22 @@ class TraceFormatTests(unittest.TestCase):
                     label="ds4 exporter",
                 )
 
-                def fail_after_swap(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                def fail_after_swap(*_args: object, **_kwargs: object) -> trace._ContainedRun:
                     exporter.parent.chmod(0o755)
                     exporter.rename(backup)
                     replacement.rename(exporter)
                     exporter.parent.chmod(0o555)
-                    raise subprocess.CalledProcessError(7, [str(exporter)])
+                    error = subprocess.TimeoutExpired([str(exporter)], 7)
+                    return trace._ContainedRun(None, error, [], None)
 
                 with mock.patch.object(
-                        trace.subprocess, "run", side_effect=fail_after_swap), self.assertRaisesRegex(
-                        run_ds4.TraceError, "descriptor identity changed|SHA-256 differs|identity changed"):
+                        sys.modules["trace_format"],
+                        "_run_contained_process",
+                        side_effect=fail_after_swap,
+                ), self.assertRaisesRegex(
+                        run_ds4.TraceError,
+                        "primary failure \\[TimeoutExpired:.*secondary integrity failures:.*"
+                        "executable-path-root.*(SHA-256 differs|identity changed)"):
                     run_ds4.run_exporter_command(
                         [str(exporter)],
                         exporter=exporter,
@@ -2217,8 +2270,176 @@ class TraceFormatTests(unittest.TestCase):
                         timeout_seconds=30,
                         check=True,
                         capture_output=True,
-                        text=True,
                     )
+
+    def test_ds4_exporter_aggregates_all_postcheck_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            runtime_path = (
+                Path(policy["install_root"]) / "lib" /
+                policy["runtime_receipt"]["components"][0]["filename"])
+            primary = subprocess.TimeoutExpired([str(exporter)], 7)
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+
+                def fail_and_mutate(*_args: object, **_kwargs: object) -> trace._ContainedRun:
+                    exporter.chmod(0o755)
+                    exporter.write_text("#!/bin/sh\nexit 9\n", encoding="ascii")
+                    runtime_path.chmod(0o755)
+                    runtime_path.write_bytes(b"mutated runtime")
+                    Path(policy["install_root"]).chmod(0o777)
+                    cleanup = trace._IntegrityFailure(
+                        "process-tree-quiescence", trace.TraceError("cleanup deadline expired"))
+                    return trace._ContainedRun(None, primary, [cleanup], None)
+
+                with mock.patch.object(
+                        sys.modules["trace_format"],
+                        "_run_contained_process",
+                        side_effect=fail_and_mutate,
+                ), self.assertRaises(sys.modules["trace_format"].ExecutionIntegrityError) as raised:
+                    run_ds4.run_exporter_command(
+                        [str(exporter)],
+                        exporter=exporter,
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        timeout_seconds=30,
+                        check=False,
+                        capture_output=True,
+                    )
+            error = raised.exception
+            self.assertIs(error.__cause__, primary)
+            self.assertIs(error.primary_error, primary)
+            components = {failure.component for failure in error.secondary_errors}
+            self.assertIn("process-tree-quiescence", components)
+            self.assertIn("executable-descriptor", components)
+            self.assertIn("executable-path-root", components)
+            self.assertTrue(any(item.startswith("runtime-descriptor:") for item in components))
+            self.assertTrue(any(item.startswith("runtime-path-root:") for item in components))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group test")
+    def test_approved_executable_timeout_kills_descendant_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            marker = root / "descendant-survived"
+            exporter.chmod(0o755)
+            exporter.write_text(
+                "#!/bin/sh\n"
+                "( sleep 1; printf survived > \"$1\" ) </dev/null >/dev/null 2>&1 &\n"
+                "sleep 30\n",
+                encoding="ascii",
+            )
+            exporter.chmod(0o555)
+            policy["executable_sha256"] = trace.sha256_file(exporter)
+            with isolated_test_install_trust(), self.assertRaises(subprocess.TimeoutExpired):
+                trace.run_approved_executable(
+                    [str(exporter), str(marker)],
+                    path=exporter,
+                    runtime_policy=policy,
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="approved executable",
+                    timeout=0.1,
+                    check=False,
+                    capture_output=True,
+                )
+            time.sleep(1.2)
+            self.assertFalse(marker.exists())
+
+    def test_posix_process_tree_cleanup_escalates_and_reaps(self) -> None:
+        process = mock.Mock()
+        process.communicate.return_value = (b"", b"")
+        containment = trace._ProcessContainment(process=process, process_group_id=77)
+        with mock.patch.object(
+                trace, "_posix_process_group_exists", return_value=True), mock.patch.object(
+                trace,
+                "_wait_for_process_tree_quiescence",
+                side_effect=[trace.TraceError("term deadline"), None],
+        ), mock.patch.object(trace.os, "killpg") as killpg:
+            failures = trace._terminate_process_tree(containment)
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(77, trace.signal.SIGTERM), mock.call(77, trace.signal.SIGKILL)],
+        )
+        process.communicate.assert_called_once()
+
+    def test_posix_process_tree_cleanup_timeout_is_integrity_failure(self) -> None:
+        process = mock.Mock()
+        process.communicate.side_effect = subprocess.TimeoutExpired(["exporter"], 5)
+        containment = trace._ProcessContainment(process=process, process_group_id=78)
+        with mock.patch.object(
+                trace, "_posix_process_group_exists", return_value=True), mock.patch.object(
+                trace,
+                "_wait_for_process_tree_quiescence",
+                side_effect=trace.TraceError("cleanup deadline"),
+        ), mock.patch.object(trace.os, "killpg") as killpg:
+            failures = trace._terminate_process_tree(containment)
+        self.assertEqual(
+            [failure.component for failure in failures],
+            ["direct-child-reap", "process-tree-quiescence"],
+        )
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(78, trace.signal.SIGTERM), mock.call(78, trace.signal.SIGKILL)],
+        )
+
+    def test_windows_job_containment_is_suspended_before_assignment_and_resume(self) -> None:
+        start_source = inspect.getsource(trace._start_windows_job_process)
+        create_source = inspect.getsource(trace._create_windows_kill_job)
+        cleanup_source = inspect.getsource(trace._terminate_process_tree)
+        self.assertLess(start_source.index("subprocess.Popen"), start_source.index("AssignProcessToJobObject"))
+        self.assertLess(start_source.index("AssignProcessToJobObject"), start_source.index("ResumeThread"))
+        self.assertIn("WINDOWS_CREATE_SUSPENDED", start_source)
+        self.assertIn("WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", create_source)
+        self.assertIn("SetInformationJobObject", create_source)
+        self.assertIn("TerminateJobObject", cleanup_source)
+        self.assertIn("QueryInformationJobObject", inspect.getsource(trace._windows_job_active_processes))
+        self.assertIn("CloseHandle", inspect.getsource(trace._close_process_containment))
+        sentinel = mock.Mock()
+        launch = {}
+        with mock.patch.object(trace.sys, "platform", "win32"), mock.patch.object(
+                trace, "_start_windows_job_process", return_value=sentinel) as start:
+            self.assertIs(trace._start_contained_process(["approved"], launch), sentinel)
+        start.assert_called_once_with(["approved"], launch)
+
+    def test_windows_job_assignment_happens_before_resume(self) -> None:
+        events = []
+        process = mock.Mock(pid=91)
+        process._handle = 92
+        kernel32 = mock.Mock()
+        kernel32.AssignProcessToJobObject.side_effect = lambda *_args: events.append("assign") or 1
+        kernel32.ResumeThread.side_effect = lambda *_args: events.append("resume") or 0
+        kernel32.CloseHandle.side_effect = lambda *_args: events.append("close") or 1
+        with mock.patch.object(
+                trace.subprocess,
+                "Popen",
+                side_effect=lambda *_args, **_kwargs: events.append("popen") or process,
+        ) as popen, mock.patch.object(
+                trace,
+                "_create_windows_kill_job",
+                side_effect=lambda: events.append("job") or 93,
+        ), mock.patch.object(
+                trace, "_windows_kernel32", return_value=kernel32), mock.patch.object(
+                trace,
+                "_open_windows_process_thread",
+                side_effect=lambda _pid: events.append("thread") or 94,
+        ):
+            containment = trace._start_windows_job_process(["approved"], {})
+        self.assertEqual(events, ["popen", "job", "assign", "thread", "resume", "close"])
+        self.assertEqual(
+            popen.call_args.kwargs["creationflags"] & trace.WINDOWS_CREATE_SUSPENDED,
+            trace.WINDOWS_CREATE_SUSPENDED,
+        )
+        self.assertEqual(containment.job_handle, 93)
 
     def test_ds4_writable_root_blocks_restore_before_postcheck(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2234,7 +2455,7 @@ class TraceFormatTests(unittest.TestCase):
                 )
             Path(policy["install_root"]).chmod(0o777)
             try:
-                with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                with mock.patch.object(trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                         run_ds4.TraceError, "path is mutable|distinct"):
                     run_ds4.run_exporter_command(
                         [str(exporter)],
@@ -2271,7 +2492,7 @@ class TraceFormatTests(unittest.TestCase):
                     alias.symlink_to(exporter)
                     exporter = alias
                 with isolated_test_install_trust(), mock.patch.object(
-                        trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                        trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                         trace.TraceError, message):
                     trace.run_approved_executable(
                         [str(exporter)],
@@ -2290,7 +2511,7 @@ class TraceFormatTests(unittest.TestCase):
             replacement.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
             replacement.chmod(0o555)
             with isolated_test_install_trust(), mock.patch.object(
-                    trace.subprocess, "run") as execute, self.assertRaisesRegex(
+                    trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                     trace.TraceError, "command path differs"):
                 trace.run_approved_executable(
                     [str(replacement)],
@@ -2305,7 +2526,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_ds4_exporter_rejects_execution_owned_install(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
-            with mock.patch.object(trace.subprocess, "run") as execute, self.assertRaisesRegex(
+            with mock.patch.object(trace, "_run_contained_process") as execute, self.assertRaisesRegex(
                     trace.TraceError, "owner must be distinct"):
                 trace.run_approved_executable(
                     [str(exporter)],
@@ -3117,9 +3338,9 @@ class TraceFormatTests(unittest.TestCase):
             '"backend": "Metal"',
             '"backend": "Metal", "backend": "Metal"',
         )
-        device_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, duplicate, "")
+        device_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, duplicate.encode("utf-8"), b"")
         build_result = run_ds4.subprocess.CompletedProcess(
-            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
         with mock.patch.object(
                 run_ds4, "run_exporter_command",
                 side_effect=[device_result, build_result]) as execute:
@@ -3133,9 +3354,190 @@ class TraceFormatTests(unittest.TestCase):
                 )
         self.assertEqual(execute.call_count, 2)
 
+    def test_ds4_invalid_utf8_device_output_still_post_attests(self) -> None:
+        device_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"\xff", b"")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[device_result, build_result],
+        ) as execute, self.assertRaisesRegex(preflight.PreflightError, "not valid UTF-8"):
+            run_ds4.query_accelerator_attestation(
+                Path("/approved/exporter"),
+                "Metal0",
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+            )
+        self.assertEqual(
+            [call.args[0] for call in execute.call_args_list],
+            [
+                ["/approved/exporter", "--dsv41-attest-device", "Metal0"],
+                ["/approved/exporter", "--dsv41-attest-build"],
+            ],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX executable test")
+    def test_ds4_invalid_utf8_actual_process_still_runs_build_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            policy, exporter = materialize_ds4_exporter_policy(root)
+            marker = root / "build-attested"
+            exporter.chmod(0o755)
+            exporter.write_text(
+                "#!/bin/sh\n"
+                "if test \"$1\" = --dsv41-attest-build; then\n"
+                f"  printf build > '{marker}'\n"
+                "  printf '{}'\n"
+                "else\n"
+                "  printf '\\377'\n"
+                "fi\n",
+                encoding="ascii",
+            )
+            exporter.chmod(0o555)
+            policy["executable_sha256"] = trace.sha256_file(exporter)
+            expected_build = fixture_runtime_build(policy)
+            with isolated_test_install_trust():
+                identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                with mock.patch.object(
+                        run_ds4, "validate_runtime_build_evidence", return_value=expected_build), self.assertRaisesRegex(
+                        preflight.PreflightError, "not valid UTF-8"):
+                    run_ds4.query_accelerator_attestation(
+                        exporter,
+                        "Metal0",
+                        exporter_identity=identity,
+                        exporter_policy=policy,
+                        expected_runtime_build=expected_build,
+                    )
+            self.assertEqual(marker.read_text(encoding="ascii"), "build")
+
+    def test_ds4_invalid_utf8_build_attestation_is_nonrecursive(self) -> None:
+        invalid_result = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"\xff", b"")
+        with mock.patch.object(
+                run_ds4, "run_exporter_command", return_value=invalid_result) as execute, self.assertRaisesRegex(
+                preflight.PreflightError, "not valid UTF-8"):
+            run_ds4.query_runtime_build_attestation(
+                Path("/approved/exporter"),
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+            )
+        execute.assert_called_once()
+
+    def test_ds4_main_unicode_error_still_post_attests(self) -> None:
+        primary = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[primary, build_result],
+        ) as execute, self.assertRaises(UnicodeDecodeError) as raised:
+            run_ds4.run_exporter_with_post_attestation(
+                ["/approved/exporter", "--model", "/model.gguf"],
+                operation="ds4 trace execution",
+                exporter=Path("/approved/exporter"),
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+                timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(execute.call_count, 2)
+
+    def test_ds4_postflight_invalid_utf8_still_post_attests(self) -> None:
+        valid_device = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, json.dumps(METAL_ACCELERATOR_ATTESTATION).encode("utf-8"), b"")
+        invalid_device = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"\xff", b"")
+        build_result = run_ds4.subprocess.CompletedProcess(
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[valid_device, build_result, invalid_device, build_result],
+        ) as execute:
+            run_ds4.query_accelerator_attestation(
+                Path("/approved/exporter"),
+                "Metal0",
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+            )
+            with self.assertRaisesRegex(preflight.PreflightError, "not valid UTF-8"):
+                run_ds4.query_accelerator_attestation(
+                    Path("/approved/exporter"),
+                    "Metal0",
+                    exporter_identity=object(),
+                    exporter_policy=DS4_EXPORTER_POLICY,
+                    expected_runtime_build=DS4_RUNTIME_BUILD,
+                )
+        self.assertEqual(execute.call_count, 4)
+        self.assertEqual(
+            execute.call_args_list[-1].args[0],
+            ["/approved/exporter", "--dsv41-attest-build"],
+        )
+
+    def test_ds4_unicode_and_post_attestation_failures_are_both_retained(self) -> None:
+        primary = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        secondary = OSError("post-build launch failed")
+        with mock.patch.object(
+                run_ds4,
+                "run_exporter_command",
+                side_effect=[primary, secondary],
+        ) as execute, self.assertRaisesRegex(
+                preflight.PreflightError,
+                "primary failure \\[UnicodeDecodeError:.*secondary post-invocation.*"
+                "OSError: post-build launch failed") as raised:
+            run_ds4.run_exporter_with_post_attestation(
+                ["/approved/exporter", "--model", "/model.gguf"],
+                operation="ds4 trace execution",
+                exporter=Path("/approved/exporter"),
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+                timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertEqual(execute.call_count, 2)
+
+    def test_ds4_does_not_post_attest_without_process_tree_quiescence(self) -> None:
+        runtime_trace = sys.modules["trace_format"]
+        primary = subprocess.TimeoutExpired(["exporter"], 7)
+        failure = runtime_trace._IntegrityFailure(
+            "process-tree-quiescence", runtime_trace.TraceError("descendant survived"))
+        containment_error = runtime_trace.ExecutionIntegrityError(
+            "timeout and quiescence failure",
+            primary_error=primary,
+            secondary_errors=[failure],
+        )
+        with mock.patch.object(
+                run_ds4, "run_exporter_command", side_effect=containment_error) as execute, self.assertRaises(
+                runtime_trace.ExecutionIntegrityError) as raised:
+            run_ds4.run_exporter_with_post_attestation(
+                ["/approved/exporter", "--model", "/model.gguf"],
+                operation="ds4 trace execution",
+                exporter=Path("/approved/exporter"),
+                exporter_identity=object(),
+                exporter_policy=DS4_EXPORTER_POLICY,
+                expected_runtime_build=DS4_RUNTIME_BUILD,
+                timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        self.assertIs(raised.exception, containment_error)
+        execute.assert_called_once()
+
     def test_ds4_accelerator_query_attests_after_launch_exceptions(self) -> None:
         build_result = run_ds4.subprocess.CompletedProcess(
-            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
         for primary_error in (
                 OSError("device launch failed"),
                 subprocess.TimeoutExpired(["exporter"], 7),
@@ -3172,9 +3574,9 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_ds4_accelerator_query_attests_after_nonzero_exit(self) -> None:
         device_result = run_ds4.subprocess.CompletedProcess(
-            ["exporter"], 9, "", "device failed")
+            ["exporter"], 9, b"", b"device failed")
         build_result = run_ds4.subprocess.CompletedProcess(
-            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
         with mock.patch.object(
                 run_ds4,
                 "run_exporter_command",
@@ -3192,7 +3594,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_ds4_invocation_reports_primary_and_post_attestation_failures(self) -> None:
         primary_failures = (
             subprocess.TimeoutExpired(["exporter"], 7),
-            run_ds4.subprocess.CompletedProcess(["exporter"], 9, "", "device failed"),
+            run_ds4.subprocess.CompletedProcess(["exporter"], 9, b"", b"device failed"),
         )
         for primary_failure in primary_failures:
             secondary_error = OSError("post-build launch failed")
@@ -3221,9 +3623,9 @@ class TraceFormatTests(unittest.TestCase):
             )
 
     def test_ds4_main_trace_result_waits_for_post_attestation(self) -> None:
-        trace_result = run_ds4.subprocess.CompletedProcess(["exporter"], 11, "", "trace failed")
+        trace_result = run_ds4.subprocess.CompletedProcess(["exporter"], 11, b"", b"trace failed")
         build_result = run_ds4.subprocess.CompletedProcess(
-            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD), "")
+            ["exporter"], 0, trace.canonical_json(DS4_RUNTIME_BUILD).encode("utf-8"), b"")
         with mock.patch.object(
                 run_ds4,
                 "run_exporter_command",
@@ -3251,7 +3653,7 @@ class TraceFormatTests(unittest.TestCase):
         )
 
     def test_ds4_exporter_command_requires_bounded_timeout(self) -> None:
-        completed = run_ds4.subprocess.CompletedProcess(["exporter"], 0, "", "")
+        completed = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"", b"")
         identity = object()
         with mock.patch.object(
                 run_ds4, "run_approved_executable", return_value=(completed, identity)) as execute:

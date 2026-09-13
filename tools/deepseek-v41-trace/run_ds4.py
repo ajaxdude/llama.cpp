@@ -28,6 +28,7 @@ from trace_format import (
     CORPUS_SHA256,
     DS4_REPOSITORY,
     DS4_REVISION,
+    ExecutionIntegrityError,
     ExecutableFileReceipt,
     MODEL_SHA256,
     NO_EXTERNAL_STATE_STORAGE,
@@ -139,7 +140,8 @@ def run_exporter_command(
         exporter_policy: dict[str, Any],
         timeout_seconds: int | None = None,
         **kwargs: Any) -> subprocess.CompletedProcess[Any]:
-    if type(timeout_seconds) is not int or timeout_seconds <= 0 or "timeout" in kwargs:
+    if type(timeout_seconds) is not int or timeout_seconds <= 0 or (
+            {"timeout", "text", "encoding", "errors", "universal_newlines"} & kwargs.keys()):
         raise PreflightError("ds4 exporter timeout is invalid")
     result, executed_identity = run_approved_executable(
         command,
@@ -156,6 +158,15 @@ def run_exporter_command(
     return result
 
 
+def decode_exporter_output(value: bytes | None, *, label: str) -> str:
+    if not isinstance(value, bytes):
+        raise PreflightError(f"{label} bytes are missing")
+    try:
+        return value.decode("utf-8", "strict")
+    except UnicodeError as error:
+        raise PreflightError(f"{label} is not valid UTF-8: {error}") from error
+
+
 def query_runtime_build_attestation(
         exporter: Path,
         *,
@@ -169,12 +180,14 @@ def query_runtime_build_attestation(
         timeout_seconds=EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
         check=False,
         capture_output=True,
-        text=True,
     )
     if result.returncode != 0:
-        raise PreflightError(f"ds4 exporter build attestation failed: {result.stderr.strip()}")
+        detail = decode_exporter_output(
+            result.stderr, label="ds4 exporter build attestation stderr").strip()
+        raise PreflightError(f"ds4 exporter build attestation failed: {detail}")
     try:
-        record = strict_json_loads(result.stdout)
+        record = strict_json_loads(decode_exporter_output(
+            result.stdout, label="ds4 exporter build attestation stdout"))
         return validate_runtime_build_evidence(record, exporter_policy, label="ds4 exporter")
     except TraceError as error:
         raise PreflightError(f"ds4 exporter build attestation is invalid: {error}") from error
@@ -201,13 +214,15 @@ def run_exporter_with_post_attestation(
             timeout_seconds=timeout_seconds,
             **kwargs,
         )
-    except (OSError, subprocess.SubprocessError, TraceError, PreflightError) as error:
+    except BaseException as error:
         primary_error = error
+    if isinstance(primary_error, ExecutionIntegrityError) and any(
+            failure.component.startswith(("process-tree-", "direct-child-", "containment-"))
+            for failure in primary_error.secondary_errors):
+        raise primary_error
     nonzero_error = None
     if result is not None and result.returncode != 0:
-        detail = result.stderr.strip() if isinstance(result.stderr, str) else ""
-        nonzero_error = PreflightError(
-            f"{operation} failed: {detail or f'exit {result.returncode}'}")
+        nonzero_error = PreflightError(f"{operation} failed: exit {result.returncode}")
     secondary_error = None
     try:
         post_runtime_build = query_runtime_build_attestation(
@@ -217,7 +232,7 @@ def run_exporter_with_post_attestation(
         )
         if post_runtime_build != expected_runtime_build:
             raise PreflightError(f"ds4 exporter build identity changed during {operation}")
-    except (OSError, subprocess.SubprocessError, TraceError, PreflightError) as error:
+    except BaseException as error:
         secondary_error = error
     reported_primary = primary_error or nonzero_error
     if reported_primary is not None:
@@ -252,16 +267,17 @@ def query_accelerator_attestation(
         timeout_seconds=EXPORTER_ATTESTATION_TIMEOUT_SECONDS,
         check=False,
         capture_output=True,
-        text=True,
     )
     validation_error = None
     attestation = None
     if result.returncode != 0:
-        detail = result.stderr.strip() or f"exit {result.returncode}"
+        detail = decode_exporter_output(
+            result.stderr, label="selected accelerator query stderr").strip() or f"exit {result.returncode}"
         validation_error = PreflightError(f"selected accelerator query failed: {detail}")
     else:
         try:
-            record = strict_json_loads(result.stdout)
+            record = strict_json_loads(decode_exporter_output(
+                result.stdout, label="selected accelerator query stdout"))
             attestation = validate_accelerator_attestation(record, expected_device=device)
         except (TraceError, PreflightError) as error:
             validation_error = PreflightError(
