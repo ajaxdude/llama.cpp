@@ -357,9 +357,11 @@ void llama_model_deepseek41::validate_context_params(const llama_cparams & cpara
     if (cparams.n_ctx > admission->result.n_ctx ||
             cparams.n_seq_max > admission->result.n_seq ||
             cparams.n_ubatch > admission->result.n_ubatch) {
+        llama_dsv41_admission_result failure = admission->result;
+        failure.category = "context";
         throw std::runtime_error(format(
-                "%s, category=context, requested_context=%u, requested_sequences=%u, requested_ubatch=%u",
-                admission->result.describe().c_str(),
+                "%s, requested_context=%u, requested_sequences=%u, requested_ubatch=%u",
+                failure.describe().c_str(),
                 cparams.n_ctx,
                 cparams.n_seq_max,
                 cparams.n_ubatch));

@@ -2891,7 +2891,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--dsv41-memory-safety-margin-mib"}, "MiB",
         string_format("DeepSeek V4.1 explicit startup safety margin (default: %d)", params.dsv41_memory_safety_margin_mib),
         [](common_params & params, int value) {
-            if (value < 0) {
+            if (value <= 0) {
                 throw std::invalid_argument("invalid value");
             }
             params.dsv41_memory_safety_margin_mib = value;

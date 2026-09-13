@@ -183,7 +183,7 @@ void test_threshold_boundaries() {
     auto params = base_params();
     params.configured_cache_slots = LLAMA_DSV41_N_EXPERT_USED;
     params.configured_cache_bytes = params.configured_cache_slots*398131200ULL;
-    params.safety_margin_bytes = 0;
+    params.safety_margin_bytes = 1;
 
     const auto zero = llama_dsv41_admit(host_with_used(0), 0, tensors, params);
     const uint64_t planned_without_host = zero.projected_bytes;
@@ -247,6 +247,17 @@ void test_diagnostics_and_guards() {
                 "expert_slots=", "expert_cache=", "expert_staging=", "soft=", "watchdog=", "hard=" }) {
         REQUIRE(diagnostic.find(field) != std::string::npos);
     }
+
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(host_with_used(0), UINT64_MAX, tensors, params);
+    }).find("overflow") != std::string::npos);
+
+    auto small_host = host_with_used(0);
+    small_host.total = 8ULL << 30;
+    small_host.available = small_host.total;
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(small_host, 0, tensors, params);
+    }).find("physical host memory") != std::string::npos);
 }
 
 }

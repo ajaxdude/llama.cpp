@@ -182,6 +182,8 @@ uint64_t llama_dsv41_estimate_graph_workspace(uint32_t n_ctx, uint32_t n_ubatch)
     if (n_ubatch == 0 || n_ubatch > 2048) {
         throw std::runtime_error("DeepSeek V4.1 bounded admission requires n_ubatch in 1..2048");
     }
+    // Conservative ds4 graph bound: 7.884 GiB total state at 32K and 8.951 GiB at 131K.
+    // Replace this estimate when the full graph can report exact no-alloc reserve bytes before model allocation.
     const uint64_t base = 7688ULL << 20;
     return checked_add(base, checked_mul(n_ctx, 7424, "graph workspace"), "graph workspace");
 }
@@ -206,8 +208,9 @@ uint64_t llama_dsv41_output_bytes(uint32_t n_vocab, uint32_t n_ubatch) {
             checked_mul(n_vocab, n_ubatch, "output floats"),
             2*sizeof(float),
             "output floats");
+    const uint64_t token_rows = checked_add(n_vocab, 1, "output tokens");
     const uint64_t tokens = checked_mul(
-            checked_mul(n_vocab, n_ubatch, "output tokens"),
+            checked_mul(token_rows, n_ubatch, "output tokens"),
             sizeof(int32_t),
             "output tokens");
     return checked_add(floats, tokens, "outputs");
@@ -251,6 +254,9 @@ llama_dsv41_admission_result llama_dsv41_admit(
             params.watchdog_bytes >= params.hard_bytes ||
             params.hard_bytes > LLAMA_DSV41_ADMISSION_HARD_BYTES) {
         reject("thresholds", result, "require soft < watchdog < hard <= 120 GiB");
+    }
+    if (params.safety_margin_bytes == 0) {
+        reject("thresholds", result, "safety margin must be non-zero");
     }
     validate_context(params.n_ctx);
     if (params.n_seq != 1) {
@@ -326,6 +332,10 @@ llama_dsv41_admission_result llama_dsv41_admit(
         result.projected_bytes = result.fixed_bytes;
         reject("fixed", result, "fixed startup categories exceed the soft limit");
     }
+    if (result.fixed_bytes > result.host_total) {
+        result.projected_bytes = result.fixed_bytes;
+        reject("host", result, "fixed startup categories exceed physical host memory");
+    }
 
     const uint64_t bytes_per_slot = checked_add(
             result.expert_slot_bytes, result.expert_staging_slot_bytes, "expert slot and staging");
@@ -345,6 +355,9 @@ llama_dsv41_admission_result llama_dsv41_admit(
             "projected bytes");
     if (result.projected_bytes > result.soft_bytes) {
         reject("soft", result, "projected startup exceeds the soft limit");
+    }
+    if (result.projected_bytes > result.host_total) {
+        reject("host", result, "projected startup exceeds physical host memory");
     }
     if (result.projected_bytes >= result.hard_bytes) {
         reject("hard", result, "projected startup is not strictly below the hard limit");
