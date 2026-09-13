@@ -1,6 +1,6 @@
 # DeepSeek V4.1 correctness traces
 
-This directory defines the versioned cross-runtime trace format used by issue #48. It compares the unchanged published GGUF between llama.cpp and ds4 revision `bd66c402070042bf0a79ad6ece8242de4c93680c`.
+This directory defines version 2 of the cross-runtime trace format used by issue #48. It compares the unchanged published GGUF between llama.cpp and ds4 revision `bd66c402070042bf0a79ad6ece8242de4c93680c`.
 
 Each trace is a directory:
 
@@ -10,7 +10,7 @@ Each trace is a directory:
 - `audits/pre/<sha256>.json` and `audits/post/<sha256>.json` store immutable safety evidence from both sides of execution.
 - `provenance/<sha256>.json` binds the exact prompt to its fixed corpus, published model, target token count, and prompt-builder executable.
 
-The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected. Any graph tensor in the reserved `dsv41.trace.*` namespace with an unknown component, malformed suffix, or unexpected layer fails the exporter.
+The required hard-failure event components are `prompt.bytes`, `prompt.tokens`, `engram.row_ids`, `expert.ids`, `expert.weights`, `attn.source`, `attn.candidate_blocks`, `attn.candidates`, `logits.prefill`, `logits.decode`, and `decode.greedy_token`. `expert.ids` must declare `semantic_id_space: "original"`; cache slot IDs are rejected. Any graph tensor in the reserved `dsv41.trace.*` namespace with an unknown component, malformed suffix, or unexpected layer fails the exporter. Every bundle also carries an exact accelerator attestation. The selected backend device must map through its PCI identity and Linux KFD topology to `gfx_target_version=110501` (`gfx1151`); device labels or environment strings are not accepted as architecture evidence.
 
 Internal tensors use raw ggml dimension order, and every dimension must be positive. The validator requires Engram rows as i32 `[24, token_count]`, original expert IDs as i32 `[6, token_count]`, router weights as f32 `[6, token_count]`, layer-0/1 raw attention-source rows as i32 `[128, token_count]`, compressed attention-source IDs as nonempty rank-2 i32 with width at most 512, layer-20 candidate blocks as nonempty rank-2 i32 with width at most 2048, propagated candidates as nonempty rank-2 i32 with width at most 512, and complete f32 logits as `[129280]`. Raw attention rows use physical ring IDs `0..127`, visible current-ubatch IDs `128..128+token_index`, and unavailable sentinel `128+token_count`; layers 0 and 1 must be byte-identical for each execution step. Original expert IDs must be within `0..383`.
 
@@ -59,7 +59,8 @@ cmake --build build-dsv41-trace-rocm --config Release -j "$(nproc)" --target \
   test-deepseek41-engram \
   test-deepseek41-expert \
   test-deepseek41-memory \
-  test-deepseek41-runtime
+  test-deepseek41-runtime \
+  test-deepseek41-trace-host
 
 build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o MUL_MAT_ID
 build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o MUL_MAT
@@ -68,7 +69,7 @@ build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o SET_ROWS
 build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o CPY
 ```
 
-Do not change host ROCm packages for this run. Vulkan can provide secondary coverage, but it cannot replace the required ROCm low-level and oracle evidence. The llama runner selects `ROCm0` explicitly by default.
+Do not change host ROCm packages for this run. Vulkan can provide secondary coverage, but it cannot replace the required ROCm low-level and oracle evidence. The llama runner selects `ROCm0` explicitly, invokes the exact exporter for a pre-allocation device attestation, and rejects the run unless the backend PCI identity maps to exactly one KFD node reporting `gfx1151`. The native exporter repeats the query before model allocation and verifies that the loaded model still uses the same device.
 
 Set `HIP_LAUNCH_BLOCKING=1` on the canonical watchdog command that owns the complete matrix process group. The wrappers fail closed if this variable is absent or different, and every embedded memory, swap, and watchdog audit records it. Keep the same inherited value for ds4 and llama.cpp.
 
@@ -80,7 +81,7 @@ The approved watchdog revision is exactly `778db6f50eae04e6c232c69b9575bdbd07479
 
 The approved watchdog must own the complete matrix process group and expose its canonical validation and process-group lease-guard APIs. The wrappers verify its pinned script identity, Python executable and argv position, PID and Linux start time, exact command bytes, 116/118/120 GiB thresholds, `/proc` source, watchdog/guardian/matrix topology, current process group, child command hash, atomic lease/heartbeat identities, heartbeat freshness and persistent-audit record hash, and the watchdog-held audit lock. The direct matrix payload starts the canonical process-group lease guard before inference. The wrappers repeat validation before and after each runtime.
 
-Use one empty directory on verified non-rotational NVMe for every input and output. These metadata commands do not execute the model:
+Use one empty directory on verified non-rotational NVMe for every input and output. The Python launchers and both native tools resolve symlinks and the nearest existing output parent through `/proc/self/mountinfo`, `/sys/dev/block`, and `/sys/class/block`. They require a resolvable local NVMe block device with `queue/rotational=0`; tmpfs, network filesystems, rotational disks, unknown devices, and `/mnt/bigspace` fail closed. Btrfs subvolume sources such as `/dev/nvme0n1p3[/home]` are resolved through the parent block device. `TMPDIR` is mandatory and has no `/tmp` fallback. These metadata commands do not execute the model:
 
 ```sh
 MODEL=/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf
@@ -110,13 +111,13 @@ The expected model digest is `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9
 
 The exporter is intentionally external to the canonical ds4 checkout. It must be built from the pinned revision and emit this trace format without changing the canonical checkout. The launcher requires its trusted SHA-256 and rejects a bundle unless the exporter reports the pinned revision and its build SHA-256 matches the executed file.
 
-The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the normal model, context, batch, ubatch, KV, Flash Attention, offload, and expert-cache arguments. `-bf` supplies the exact prompt bytes, `-n` is the number of greedy decode steps, and `-o` is the trace directory. It also requires `DSV41_TRACE_MEMORY_AUDIT`, `DSV41_TRACE_SWAP_AUDIT`, and `DSV41_TRACE_WATCHDOG_AUDIT` so every run points to its safety evidence.
+The llama.cpp exporter is built as `llama-deepseek-v41-trace`. It accepts the normal model, context, batch, ubatch, KV, Flash Attention, offload, and expert-cache arguments. `-bf` supplies the exact prompt bytes, `-n` is the number of greedy decode steps, and `-o` is the trace directory. It also requires `DSV41_TRACE_MEMORY_AUDIT`, `DSV41_TRACE_SWAP_AUDIT`, and `DSV41_TRACE_WATCHDOG_AUDIT` so every run points to its safety evidence. The content-addressed memory audit binds the preflight accelerator and storage attestations; the manifest binds the independently repeated native accelerator attestation.
 
-Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, and NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, and repository path. It rejects tracked or untracked checkout changes and rejects an exporter whose embedded build revision or executable hash does not match that attestation.
+Use `run_llama.py` on the validation host instead of calling the exporter directly. It applies the same zero-swap, watchdog, active-workload, exact-`gfx1151`, and proven-NVMe gates and embeds content-addressed preflight and postflight evidence in the trace. It requires the exact final integration revision, immutable oracle revision, expected oracle-to-candidate binary diff SHA-256, and repository path. It rejects tracked or untracked checkout changes and rejects an exporter whose embedded build revision, executable hash, accelerator identity, or loaded model device does not match that attestation.
 
 `run_matrix.py` copies the four repository corpora byte-for-byte into the NVMe result directory, verifies their fixed hashes, builds exact-length prompt artifacts and content-addressed provenance, runs ds4 and llama.cpp with matched context/decode settings, compares each bundle immediately, and stops at the first divergence. Pass both `--llama-exporter` and `--llama-prompt-builder` from the same build, plus the final integration revision, immutable oracle revision, and expected binary diff SHA-256. Its default context matrix is 32768. Pass later contexts only after the 32K target passes.
 
-The external ds4 exporter is not present in the pinned `/home/papa/src/ds4-v41` checkout. It remains a blocker until a separately built executable is provided and attested. `run_ds4.py` currently has no approved exporter digest and fails closed before inference. After the exporter is implemented and reviewed, add its exact executable SHA-256 and pinned ds4 revision to `APPROVED_EXPORTERS` in `run_ds4.py`; a caller-provided digest alone is not sufficient oracle provenance. The exporter must accept the interface used by `run_ds4.py`:
+The external ds4 exporter is not present in the pinned `/home/papa/src/ds4-v41` checkout. It remains a blocker until a separately built executable is provided and attested. `run_ds4.py` currently has no approved exporter digest and fails closed before inference. After the exporter is implemented and reviewed on an authorized oracle host, add its exact executable SHA-256 and pinned ds4 revision to `APPROVED_EXPORTERS` in `run_ds4.py`; a caller-provided digest alone is not sufficient oracle provenance. Its bundle must include the same KFD-derived `gfx1151` accelerator identity as the llama.cpp trace. The exporter must accept the interface used by `run_ds4.py`:
 
 The unpublished `ds4gguf` documentation revision `e13893ffcb33e90c8852929303e188102df7a8f5` is provenance only. It is not an executable dependency, exporter approval, or fixture source. Executable tests and fixtures stay in this `strix-llama.cpp` stack.
 

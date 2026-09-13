@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -93,16 +94,69 @@ def candidate_attestation(args: argparse.Namespace, exporter_sha256: str) -> dic
 
 def bind_candidate_attestation(
         output: Path,
-        attestation: dict[str, str]) -> None:
+        attestation: dict[str, str],
+        accelerator: dict[str, object]) -> None:
     manifest_path = safe_trace_path(output, "manifest.json")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"cannot bind candidate attestation: {error}") from error
+    if manifest.get("accelerator") != accelerator:
+        raise PreflightError("llama trace accelerator attestation differs from the preflight query")
     manifest["candidate"] = attestation
     temp = manifest_path.with_suffix(".tmp")
     temp.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     os.replace(temp, manifest_path)
+
+
+def validate_accelerator_attestation(
+        record: object,
+        *,
+        expected_device: str = "ROCm0") -> dict[str, object]:
+    if not isinstance(record, dict):
+        raise PreflightError("accelerator attestation is not an object")
+    expected = {
+        "format": "dsv41-accelerator-attestation",
+        "version": 1,
+        "backend_device": expected_device,
+        "architecture": "gfx1151",
+        "gfx_target_version": 110501,
+        "source": "linux-kfd-sysfs",
+    }
+    for key, value in expected.items():
+        if record.get(key) != value:
+            raise PreflightError(f"accelerator attestation {key} mismatch")
+    if not isinstance(record.get("backend_description"), str) or not record["backend_description"]:
+        raise PreflightError("accelerator attestation backend description is missing")
+    pci_device_id = record.get("pci_device_id")
+    if not isinstance(pci_device_id, str) or re.fullmatch(
+            r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", pci_device_id) is None:
+        raise PreflightError("accelerator attestation PCI identity is invalid")
+    if not isinstance(record.get("kfd_node"), str) or not record["kfd_node"].isdigit():
+        raise PreflightError("accelerator attestation KFD node is invalid")
+    if not isinstance(record.get("gpu_id"), int) or record["gpu_id"] <= 0:
+        raise PreflightError("accelerator attestation GPU identity is invalid")
+    return dict(record)
+
+
+def query_accelerator_attestation(exporter: Path, device: str) -> dict[str, object]:
+    try:
+        result = subprocess.run(
+            [str(exporter), "--dsv41-attest-device", device],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise PreflightError(f"cannot query selected accelerator: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise PreflightError(f"selected accelerator query failed: {detail}")
+    try:
+        record = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PreflightError(f"selected accelerator query returned invalid JSON: {error}") from error
+    return validate_accelerator_attestation(record, expected_device=device)
 
 
 def build_command(args: argparse.Namespace, exporter: Path, output: Path) -> list[str]:
@@ -176,6 +230,10 @@ def main() -> int:
         validate_runtime_config(args)
         if args.corpus_sha256 != CORPUS_SHA256[args.corpus_name]:
             raise PreflightError(f"corpus SHA-256 mismatch for {args.corpus_name}")
+        exporter = resolved(args.exporter)
+        if not exporter.is_file() or not os.access(exporter, os.X_OK):
+            raise PreflightError(f"trace exporter is not executable: {exporter}")
+        accelerator = query_accelerator_attestation(exporter, args.device)
         if args.preflight_only:
             audit = run_preflight(
                 model=args.model,
@@ -184,12 +242,10 @@ def main() -> int:
                 repo=args.repo,
                 busy_patterns=args.busy_pattern,
             )
+            audit["accelerator"] = accelerator
             print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
             return 0
 
-        exporter = resolved(args.exporter)
-        if not exporter.is_file() or not os.access(exporter, os.X_OK):
-            raise PreflightError(f"trace exporter is not executable: {exporter}")
         exporter_sha256 = sha256_file(exporter)
         model_sha256 = sha256_file(resolved(args.model))
         if model_sha256 != MODEL_SHA256:
@@ -214,12 +270,15 @@ def main() -> int:
             busy_patterns=args.busy_pattern,
         )
         preflight_audit["runtime"] = "llama.cpp"
+        preflight_audit["accelerator"] = accelerator
         preflight_audit["config"] = {
             "context": args.context,
             "decode_steps": args.decode_steps,
             "batch": args.batch,
             "ubatch": args.ubatch,
             "device": args.device,
+            "device_architecture": accelerator["architecture"],
+            "device_pci_id": accelerator["pci_device_id"],
             "expert_cache_slots": args.expert_cache_slots,
             "expert_cache_mib": args.expert_cache_mib,
             "gpu_layers": args.gpu_layers,
@@ -243,11 +302,15 @@ def main() -> int:
             repo=args.repo,
             busy_patterns=args.busy_pattern,
         )
+        post_accelerator = query_accelerator_attestation(exporter, args.device)
+        if post_accelerator != accelerator:
+            raise PreflightError("selected accelerator identity changed during trace execution")
         postflight_audit["runtime"] = "llama.cpp"
+        postflight_audit["accelerator"] = post_accelerator
         post_audits = write_audits(Path(str(output) + ".audit") / "post", postflight_audit)
         bind_embedded_audits(output, {"pre": pre_audits, "post": post_audits})
         bind_prompt_provenance(output, provenance)
-        bind_candidate_attestation(output, attestation)
+        bind_candidate_attestation(output, attestation, accelerator)
         bundle = TraceBundle(output)
         if bundle.manifest.get("runtime") != "llama.cpp":
             raise PreflightError("llama exporter wrote a non-llama.cpp trace")

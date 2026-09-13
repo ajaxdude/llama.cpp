@@ -1,4 +1,5 @@
 #include "common.h"
+#include "host-attestation.h"
 #include "llama.h"
 
 #include <nlohmann/json.hpp>
@@ -22,13 +23,6 @@ static std::string read_file(const fs::path & path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-static void require_nvme_path(const fs::path & path, const char * label) {
-    const std::string value = fs::absolute(path).lexically_normal().string();
-    if (value == "/mnt/bigspace" || value.rfind("/mnt/bigspace/", 0) == 0) {
-        throw std::runtime_error(std::string(label) + " must not use /mnt/bigspace");
-    }
-}
-
 static std::string argument(int argc, char ** argv, const std::string & name) {
     for (int index = 1; index + 1 < argc; ++index) {
         if (argv[index] == name) {
@@ -48,16 +42,16 @@ static std::string model_architecture(const llama_model * model) {
 
 int main(int argc, char ** argv) {
     try {
-        const fs::path model_path = argument(argc, argv, "--model");
-        const fs::path corpus_path = argument(argc, argv, "--corpus");
-        const fs::path output_path = argument(argc, argv, "--output");
+        fs::path model_path = argument(argc, argv, "--model");
+        fs::path corpus_path = argument(argc, argv, "--corpus");
+        fs::path output_path = argument(argc, argv, "--output");
         const int64_t target_tokens = std::stoll(argument(argc, argv, "--tokens"));
         if (target_tokens < 2) {
             throw std::runtime_error("--tokens must be at least 2");
         }
-        require_nvme_path(model_path, "model");
-        require_nvme_path(corpus_path, "corpus");
-        require_nvme_path(output_path, "prompt output");
+        model_path = dsv41::require_nvme_path(model_path, "model").resolved_path;
+        corpus_path = dsv41::require_nvme_path(corpus_path, "corpus").resolved_path;
+        output_path = dsv41::require_nvme_path(output_path, "prompt output").resolved_path;
         if (fs::exists(output_path)) {
             throw std::runtime_error("prompt output already exists: " + output_path.string());
         }

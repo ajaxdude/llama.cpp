@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
 TRACE_FORMAT = "dsv41-trace"
-TRACE_VERSION = 1
+TRACE_VERSION = 2
 DS4_REVISION = "bd66c402070042bf0a79ad6ece8242de4c93680c"
 MODEL_SHA256 = "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
 REPOSITORY = "halo-box/strix-llama.cpp"
@@ -388,7 +388,9 @@ class TraceBundle:
         return result
 
     def _validate_manifest(self) -> None:
-        for key in ("runtime", "revision", "build", "model", "prompt", "config", "comparison", "environment", "audits"):
+        for key in (
+                "runtime", "revision", "build", "model", "prompt", "accelerator",
+                "config", "comparison", "environment", "audits"):
             if key not in self.manifest:
                 raise TraceError(f"manifest is missing {key}")
         if not isinstance(self.manifest["runtime"], str) or not self.manifest["runtime"]:
@@ -424,6 +426,31 @@ class TraceBundle:
             raise TraceError(f"model SHA-256 must be {MODEL_SHA256}")
         if self.manifest["model"].get("architecture") != "deepseek41":
             raise TraceError("model architecture must be deepseek41")
+        accelerator = self.manifest["accelerator"]
+        if not isinstance(accelerator, dict):
+            raise TraceError("manifest accelerator attestation is invalid")
+        accelerator_expected = {
+            "format": "dsv41-accelerator-attestation",
+            "version": 1,
+            "architecture": "gfx1151",
+            "gfx_target_version": 110501,
+            "source": "linux-kfd-sysfs",
+        }
+        for key, value in accelerator_expected.items():
+            if accelerator.get(key) != value:
+                raise TraceError(f"manifest accelerator {key} mismatch")
+        if not isinstance(accelerator.get("backend_description"), str) or not accelerator["backend_description"]:
+            raise TraceError("manifest accelerator backend description is invalid")
+        if not isinstance(accelerator.get("backend_device"), str) or not accelerator["backend_device"]:
+            raise TraceError("manifest accelerator backend device is invalid")
+        if re.fullmatch(
+                r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]",
+                accelerator.get("pci_device_id", "")) is None:
+            raise TraceError("manifest accelerator PCI identity is invalid")
+        if not isinstance(accelerator.get("kfd_node"), str) or not accelerator["kfd_node"].isdigit():
+            raise TraceError("manifest accelerator KFD node is invalid")
+        if not isinstance(accelerator.get("gpu_id"), int) or accelerator["gpu_id"] <= 0:
+            raise TraceError("manifest accelerator GPU identity is invalid")
         corpus_name = self.manifest["prompt"].get("corpus_name")
         if corpus_name not in CORPUS_SHA256:
             raise TraceError("prompt corpus is not in the fixed correctness corpus set")
@@ -500,6 +527,8 @@ class TraceBundle:
             raise TraceError("logit comparison policy must be byte-identical-f32")
         config = self.manifest["config"]
         if self.manifest["runtime"] == "llama.cpp":
+            if accelerator["backend_device"] != "ROCm0":
+                raise TraceError("llama.cpp accelerator backend device must be ROCm0")
             if config.get("batch") != ADMITTED_BATCH or config.get("ubatch") != ADMITTED_UBATCH:
                 raise TraceError("llama.cpp trace does not use the admitted batch and ubatch")
             if config.get("expert_cache_slots") != REQUIRED_EXPERT_SLOTS or (
@@ -507,6 +536,9 @@ class TraceBundle:
                 raise TraceError("llama.cpp trace does not use the admitted expert cache")
             if config.get("device") != "ROCm0" or config.get("gpu_layers") != 99:
                 raise TraceError("llama.cpp trace does not use the required ROCm0 offload")
+            if config.get("device_architecture") != accelerator["architecture"] or (
+                    config.get("device_pci_id") != accelerator["pci_device_id"]):
+                raise TraceError("llama.cpp trace device identity is not bound to the accelerator attestation")
             if config.get("kv_type_k") != "f16" or config.get("kv_type_v") != "f16" or (
                     config.get("flash_attention") not in (True, 1)) or config.get("load_mode") != 0:
                 raise TraceError("llama.cpp trace inference configuration is invalid")
@@ -554,6 +586,40 @@ class TraceBundle:
             used = record["data"].get("mem_used_bytes")
             if not isinstance(used, int) or used < 0 or used >= SOFT_MEMORY_LIMIT:
                 raise TraceError(f"{phase} memory audit evidence is invalid")
+            storage = record.get("storage")
+            required_storage = {
+                "model", "prompt", "output", "repository", "temporary_directory",
+            }
+            if not isinstance(storage, dict) or set(storage) != required_storage:
+                raise TraceError(f"{phase} memory audit storage evidence is missing")
+            for label, item in storage.items():
+                if not isinstance(label, str) or not isinstance(item, dict):
+                    raise TraceError(f"{phase} memory audit storage evidence is invalid")
+                if item.get("rotational") is not False or not isinstance(item.get("nvme_device"), str):
+                    raise TraceError(f"{phase} memory audit storage is not non-rotational NVMe")
+                if re.fullmatch(r"nvme[0-9]+(?:c[0-9]+)?n[0-9]+", item["nvme_device"]) is None:
+                    raise TraceError(f"{phase} memory audit NVMe device identity is invalid")
+                for path_key in ("resolved_path", "existing_path", "mount_point", "block_device_path"):
+                    value = item.get(path_key)
+                    if not isinstance(value, str) or not value.startswith("/"):
+                        raise TraceError(f"{phase} memory audit {path_key} is invalid")
+                if not isinstance(item.get("filesystem_type"), str) or not item["filesystem_type"]:
+                    raise TraceError(f"{phase} memory audit filesystem type is invalid")
+                if not isinstance(item.get("mount_source"), str) or not item["mount_source"]:
+                    raise TraceError(f"{phase} memory audit mount source is invalid")
+                if not item["mount_source"].startswith("/dev/"):
+                    raise TraceError(f"{phase} memory audit mount source is not a local block device")
+                if re.fullmatch(r"[0-9]+:[0-9]+", item.get("device_number", "")) is None:
+                    raise TraceError(f"{phase} memory audit device number is invalid")
+                if item["nvme_device"] not in Path(item["block_device_path"]).parts:
+                    raise TraceError(f"{phase} memory audit block device ancestry is invalid")
+                try:
+                    Path(item["resolved_path"]).relative_to(Path(item["mount_point"]))
+                    Path(item["existing_path"]).relative_to(Path(item["mount_point"]))
+                except ValueError as error:
+                    raise TraceError(f"{phase} memory audit mount ancestry is invalid") from error
+            if self.manifest["runtime"] == "llama.cpp" and record.get("accelerator") != self.manifest["accelerator"]:
+                raise TraceError(f"{phase} memory audit accelerator evidence mismatch")
         if kind == "swap":
             if record["data"].get("enabled") is not False or record["data"].get("entries") != []:
                 raise TraceError(f"{phase} swap audit evidence does not report zero configured swap")
@@ -886,6 +952,8 @@ def compare_manifests(left: TraceBundle, right: TraceBundle) -> Mismatch | None:
     checks = (
         ("model.sha256", "model_identity"),
         ("model.architecture", "model_identity"),
+        ("accelerator.architecture", "accelerator_identity"),
+        ("accelerator.pci_device_id", "accelerator_identity"),
         ("prompt.sha256", "prompt_identity"),
         ("prompt.byte_count", "prompt_identity"),
         ("expected.prompt_tokens", "tokenizer"),

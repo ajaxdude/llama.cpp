@@ -8,6 +8,7 @@ extern "C" {
 }
 #include "llama.h"
 #include "llama-ext.h"
+#include "host-attestation.h"
 #include "trace-components.h"
 
 #include <nlohmann/json.hpp>
@@ -24,6 +25,7 @@ extern "C" {
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -42,7 +44,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using json = nlohmann::ordered_json;
 
-static constexpr int TRACE_VERSION = 1;
+static constexpr int TRACE_VERSION = 2;
 #if defined(__linux__)
 static constexpr const char * WATCHDOG_SCRIPT_SHA256 =
     "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f";
@@ -103,14 +105,6 @@ static std::vector<uint8_t> read_file(const fs::path & path) {
         throw std::runtime_error("cannot read: " + path.string());
     }
     return result;
-}
-
-static void require_nvme_path(const fs::path & path, const char * label) {
-    const fs::path absolute = fs::absolute(path).lexically_normal();
-    const std::string value = absolute.string();
-    if (value == "/mnt/bigspace" || value.rfind("/mnt/bigspace/", 0) == 0) {
-        throw std::runtime_error(std::string(label) + " must not use /mnt/bigspace");
-    }
 }
 
 static std::string required_environment(const char * name) {
@@ -348,7 +342,7 @@ static void validate_watchdog(const json & data) {
 
 static json audit_reference(const char * environment_name, const char * expected_kind) {
     const fs::path path = required_environment(environment_name);
-    require_nvme_path(path, "audit");
+    dsv41::require_nvme_path(path, "audit");
     const std::vector<uint8_t> bytes = read_file(path);
     json audit;
     try {
@@ -382,6 +376,9 @@ static json audit_reference(const char * environment_name, const char * expected
     };
     if (std::string(expected_kind) == "watchdog") {
         result["data"] = audit["data"];
+    } else if (std::string(expected_kind) == "memory") {
+        result["accelerator"] = audit.value("accelerator", json::object());
+        result["storage"] = audit.value("storage", json::object());
     }
     return result;
 }
@@ -623,9 +620,33 @@ static std::vector<std::string> command_line(int argc, char ** argv) {
     return result;
 }
 
+static json accelerator_json(const dsv41::accelerator_attestation & accelerator) {
+    return {
+        {"format", "dsv41-accelerator-attestation"},
+        {"version", 1},
+        {"backend_device", accelerator.backend_device},
+        {"backend_description", accelerator.backend_description},
+        {"pci_device_id", accelerator.pci_device_id},
+        {"kfd_node", accelerator.kfd_node},
+        {"gpu_id", accelerator.gpu_id},
+        {"gfx_target_version", accelerator.gfx_target_version},
+        {"architecture", accelerator.architecture},
+        {"source", "linux-kfd-sysfs"},
+    };
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
+        if (argc == 3 && std::string(argv[1]) == "--dsv41-attest-device") {
+            common_init();
+            ggml_backend_load_all();
+            const dsv41::accelerator_attestation accelerator =
+                dsv41::require_gfx1151_device(ggml_backend_dev_by_name(argv[2]));
+            std::cout << accelerator_json(accelerator).dump() << '\n';
+            return 0;
+        }
+
         const uint16_t endian = 1;
         if (*reinterpret_cast<const uint8_t *>(&endian) != 1) {
             throw std::runtime_error("trace writer requires a little-endian host");
@@ -646,13 +667,24 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("-n must request at least one deterministic decode step");
         }
 
-        require_nvme_path(params.model.path, "model");
-        require_nvme_path(params.prompt_file, "prompt");
-        require_nvme_path(params.out_file, "trace output");
+        const dsv41::storage_attestation model_storage =
+            dsv41::require_nvme_path(params.model.path, "model");
+        const dsv41::storage_attestation prompt_storage =
+            dsv41::require_nvme_path(params.prompt_file, "prompt");
+        const dsv41::storage_attestation output_storage =
+            dsv41::require_nvme_path(params.out_file, "trace output");
         if (required_environment("HIP_LAUNCH_BLOCKING") != "1") {
             throw std::runtime_error("HIP_LAUNCH_BLOCKING=1 is required for gfx1151 correctness runs");
         }
+        if (params.devices.size() != 1 || params.devices[0] == nullptr) {
+            throw std::runtime_error("trace tool requires exactly one selected execution device");
+        }
+        const dsv41::accelerator_attestation configured_accelerator =
+            dsv41::require_gfx1151_device(params.devices[0]);
         const json memory_audit = audit_reference("DSV41_TRACE_MEMORY_AUDIT", "memory");
+        if (memory_audit.value("accelerator", json::object()) != accelerator_json(configured_accelerator)) {
+            throw std::runtime_error("preflight accelerator audit does not match the selected execution device");
+        }
         const json swap_audit = audit_reference("DSV41_TRACE_SWAP_AUDIT", "swap");
         const json watchdog_audit = audit_reference("DSV41_TRACE_WATCHDOG_AUDIT", "watchdog");
 
@@ -662,9 +694,9 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("parsed prompt differs from exact prompt file bytes");
         }
 
-        const fs::path model_path = fs::absolute(params.model.path).lexically_normal();
-        const fs::path prompt_path = fs::absolute(params.prompt_file).lexically_normal();
-        const fs::path output_path = fs::absolute(params.out_file).lexically_normal();
+        const fs::path model_path = model_storage.resolved_path;
+        const fs::path prompt_path = prompt_storage.resolved_path;
+        const fs::path output_path = output_storage.resolved_path;
         llama_backend_init();
         llama_numa_init(params.numa);
         common_init_result_ptr init = common_init_from_params(params);
@@ -682,6 +714,11 @@ int main(int argc, char ** argv) {
         }
         if (model_devices != std::vector<std::string>{"ROCm0"}) {
             throw std::runtime_error("trace tool requires the loaded model to use only ROCm0");
+        }
+        const dsv41::accelerator_attestation accelerator =
+            dsv41::require_gfx1151_device(llama_model_get_device(model, 0));
+        if (accelerator_json(accelerator) != accelerator_json(configured_accelerator)) {
+            throw std::runtime_error("loaded model device differs from the pre-allocation accelerator attestation");
         }
         const llama_vocab * vocab = llama_model_get_vocab(model);
         const bool add_bos = llama_vocab_get_add_bos(vocab);
@@ -724,11 +761,14 @@ int main(int argc, char ** argv) {
                 {"byte_count", prompt_bytes.size()},
                 {"sha256", sha256_data(prompt_bytes.data(), prompt_bytes.size())},
             }},
+            {"accelerator", accelerator_json(accelerator)},
             {"config", {
                 {"context", llama_n_ctx(ctx)},
                 {"batch", params.n_batch},
                 {"ubatch", params.n_ubatch},
                 {"device", model_devices[0]},
+                {"device_architecture", accelerator.architecture},
+                {"device_pci_id", accelerator.pci_device_id},
                 {"decode_steps", params.n_predict},
                 {"kv_type_k", ggml_type_name(params.cache_type_k)},
                 {"kv_type_v", ggml_type_name(params.cache_type_v)},

@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from argparse import Namespace
 from pathlib import Path
 
@@ -46,12 +47,54 @@ WATCHDOG_JSONL = "".join(
 ).encode("ascii")
 WATCHDOG_JSONL_SHA256 = trace.sha256_bytes(WATCHDOG_JSONL)
 
+ACCELERATOR_ATTESTATION = {
+    "format": "dsv41-accelerator-attestation",
+    "version": 1,
+    "backend_device": "ROCm0",
+    "backend_description": "AMD Radeon Graphics",
+    "pci_device_id": "0000:c1:00.0",
+    "kfd_node": "1",
+    "gpu_id": 1234,
+    "gfx_target_version": 110501,
+    "architecture": "gfx1151",
+    "source": "linux-kfd-sysfs",
+}
+
+def storage_record(path: str) -> dict[str, object]:
+    model_storage = path.startswith("/mnt/models")
+    mount_point = "/mnt/models" if model_storage else "/home"
+    source = "/dev/nvme1n1" if model_storage else "/dev/nvme0n1p3[/home]"
+    device_number = "259:0" if model_storage else "259:3"
+    nvme_device = "nvme1n1" if model_storage else "nvme0n1"
+    return {
+        "resolved_path": path,
+        "existing_path": path,
+        "mount_point": mount_point,
+        "filesystem_type": "xfs" if model_storage else "btrfs",
+        "mount_source": source,
+        "device_number": device_number,
+        "block_device_path": f"/sys/devices/pci/block/{nvme_device}",
+        "nvme_device": nvme_device,
+        "rotational": False,
+    }
+
+
+STORAGE_ATTESTATION = {
+    "model": storage_record("/mnt/models/model.gguf"),
+    "prompt": storage_record("/home/prompt.txt"),
+    "output": storage_record("/home"),
+    "repository": storage_record("/home/repo"),
+    "temporary_directory": storage_record("/home/tmp"),
+}
+
 AUDIT_RECORDS = {
     "memory": {
         "created_unix": 1,
         "kind": "memory",
         "environment": {"HIP_LAUNCH_BLOCKING": "1"},
         "data": {"mem_total_bytes": 128, "mem_available_bytes": 64, "mem_used_bytes": 64},
+        "storage": STORAGE_ATTESTATION,
+        "accelerator": dict(ACCELERATOR_ATTESTATION),
     },
     "swap": {
         "created_unix": 1,
@@ -136,6 +179,7 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
         "revision": trace.DS4_REVISION if runtime == "ds4" else "a" * 40,
         "build": {"sha256": "3" * 64},
         "model": {"sha256": trace.MODEL_SHA256, "byte_count": 123, "architecture": "deepseek41"},
+        "accelerator": dict(ACCELERATOR_ATTESTATION),
         "prompt": {
             "sha256": trace.sha256_bytes(prompt),
             "byte_count": len(prompt),
@@ -158,6 +202,8 @@ def manifest(runtime: str = "llama.cpp", prompt: bytes = b"abc") -> dict:
             "expert_cache_slots": trace.REQUIRED_EXPERT_SLOTS,
             "expert_cache_bytes": trace.REQUIRED_EXPERT_CACHE_BYTES,
             "device": "ROCm0",
+            "device_architecture": "gfx1151",
+            "device_pci_id": "0000:c1:00.0",
             "gpu_layers": 99,
             "load_mode": 0,
             "deepseek41": {
@@ -475,6 +521,13 @@ def replace_event_blob(
 
 
 class TraceFormatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._require_nvme_path = preflight.require_nvme_path
+        preflight.require_nvme_path = lambda path, label, **kwargs: preflight.resolved(path)
+
+    def tearDown(self) -> None:
+        preflight.require_nvme_path = self._require_nvme_path
+
     def test_serialization_preserves_float_bits_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "trace"
@@ -609,6 +662,159 @@ class TraceFormatTests(unittest.TestCase):
         run_llama.validate_runtime_config(valid)
         self.assertEqual(trace.REQUIRED_EXPERT_CACHE_BYTES, 76_441_190_400)
         self.assertEqual(trace.REQUIRED_EXPERT_CACHE_MIB, 72_900)
+
+    def test_accelerator_attestation_rejects_wrong_missing_and_spoofed_architecture(self) -> None:
+        valid = dict(ACCELERATOR_ATTESTATION)
+        self.assertEqual(
+            run_llama.validate_accelerator_attestation(valid),
+            valid,
+        )
+        for key, value, message in (
+                ("architecture", "gfx1100", "architecture mismatch"),
+                ("architecture", None, "architecture mismatch"),
+                ("backend_device", "ROCm1", "backend_device mismatch"),
+                ("gfx_target_version", 110500, "gfx_target_version mismatch"),
+                ("source", "environment", "source mismatch")):
+            invalid = dict(valid)
+            if value is None:
+                del invalid[key]
+            else:
+                invalid[key] = value
+            with self.assertRaisesRegex(preflight.PreflightError, message):
+                run_llama.validate_accelerator_attestation(invalid)
+
+        spoofed = dict(valid)
+        spoofed["gfx_target_version"] = 110500
+        spoofed["architecture"] = "gfx1151"
+        with self.assertRaisesRegex(preflight.PreflightError, "gfx_target_version mismatch"):
+            run_llama.validate_accelerator_attestation(spoofed)
+
+    def test_accelerator_query_fails_closed(self) -> None:
+        valid_result = run_llama.subprocess.CompletedProcess(
+            ["exporter"], 0, json.dumps(ACCELERATOR_ATTESTATION), "")
+        with mock.patch.object(run_llama.subprocess, "run", return_value=valid_result):
+            self.assertEqual(
+                run_llama.query_accelerator_attestation(Path("/exporter"), "ROCm0"),
+                ACCELERATOR_ATTESTATION,
+            )
+
+        failed_result = run_llama.subprocess.CompletedProcess(["exporter"], 1, "", "query failed")
+        with mock.patch.object(run_llama.subprocess, "run", return_value=failed_result):
+            with self.assertRaisesRegex(preflight.PreflightError, "query failed"):
+                run_llama.query_accelerator_attestation(Path("/exporter"), "ROCm0")
+
+    def test_nvme_attestation_uses_mount_and_block_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            xfs = root / "mnt" / "models"
+            btrfs = root / "home"
+            rotating = root / "rotating"
+            ram = root / "ram"
+            network = root / "network"
+            missing = root / "missing"
+            for directory in (xfs, btrfs, rotating, ram, network, missing):
+                directory.mkdir(parents=True)
+                (directory / "data").write_bytes(b"x")
+
+            sys_root = root / "sys"
+            nvme1 = sys_root / "devices" / "pci" / "block" / "nvme1n1"
+            nvme0 = sys_root / "devices" / "pci" / "block" / "nvme0n1"
+            nvme0p3 = nvme0 / "nvme0n1p3"
+            sdb = sys_root / "devices" / "pci" / "block" / "sdb"
+            sdb1 = sdb / "sdb1"
+            for disk, rotational in ((nvme1, "0\n"), (nvme0, "0\n"), (sdb, "1\n")):
+                (disk / "queue").mkdir(parents=True)
+                (disk / "queue" / "rotational").write_text(rotational, encoding="ascii")
+            nvme0p3.mkdir()
+            sdb1.mkdir()
+            dev_block = sys_root / "dev" / "block"
+            dev_block.mkdir(parents=True)
+            (dev_block / "259:0").symlink_to(nvme1, target_is_directory=True)
+            (dev_block / "259:3").symlink_to(nvme0p3, target_is_directory=True)
+            (dev_block / "8:17").symlink_to(sdb1, target_is_directory=True)
+            class_block = sys_root / "class" / "block"
+            (class_block / "nvme0n1p3").mkdir(parents=True)
+            (class_block / "nvme0n1p3" / "dev").write_text("259:3\n", encoding="ascii")
+
+            mountinfo = root / "mountinfo"
+            mountinfo.write_text(
+                f"1 0 259:0 / {xfs.resolve()} rw - xfs /dev/nvme1n1 rw\n"
+                f"2 0 0:35 /home {btrfs.resolve()} rw - btrfs /dev/nvme0n1p3[/home] rw\n"
+                f"3 0 8:17 / {rotating.resolve()} rw - ext4 /dev/sdb1 rw\n"
+                f"4 0 0:42 / {ram.resolve()} rw - tmpfs tmpfs rw\n"
+                f"5 0 0:43 / {network.resolve()} rw - nfs server:/share rw\n"
+                f"6 0 240:1 / {missing.resolve()} rw - ext4 /dev/missing rw\n",
+                encoding="ascii",
+            )
+
+            xfs_result = preflight.storage_attestation(
+                xfs / "data",
+                "xfs",
+                mountinfo_path=mountinfo,
+                sys_dev_block_root=dev_block,
+                sys_class_block_root=class_block,
+            )
+            self.assertEqual(xfs_result["filesystem_type"], "xfs")
+            self.assertEqual(xfs_result["nvme_device"], "nvme1n1")
+
+            btrfs_result = preflight.storage_attestation(
+                btrfs / "new" / "trace",
+                "btrfs",
+                mountinfo_path=mountinfo,
+                sys_dev_block_root=dev_block,
+                sys_class_block_root=class_block,
+            )
+            self.assertEqual(btrfs_result["filesystem_type"], "btrfs")
+            self.assertEqual(btrfs_result["device_number"], "259:3")
+            self.assertEqual(btrfs_result["existing_path"], str(btrfs.resolve()))
+            self.assertEqual(btrfs_result["nvme_device"], "nvme0n1")
+
+            for path, message in (
+                    (rotating / "data", "non-rotational"),
+                    (ram / "data", "local block device"),
+                    (network / "data", "local block device"),
+                    (missing / "data", "cannot be resolved")):
+                with self.assertRaisesRegex(preflight.PreflightError, message):
+                    preflight.storage_attestation(
+                        path,
+                        "invalid",
+                        mountinfo_path=mountinfo,
+                        sys_dev_block_root=dev_block,
+                        sys_class_block_root=class_block,
+                    )
+
+            (xfs / "escape").symlink_to(ram, target_is_directory=True)
+            with self.assertRaisesRegex(preflight.PreflightError, "local block device"):
+                preflight.storage_attestation(
+                    xfs / "escape" / "data",
+                    "symlink escape",
+                    mountinfo_path=mountinfo,
+                    sys_dev_block_root=dev_block,
+                    sys_class_block_root=class_block,
+                )
+            with self.assertRaisesRegex(preflight.PreflightError, "/mnt/bigspace"):
+                preflight.storage_attestation(
+                    Path("/mnt/bigspace/model.gguf"),
+                    "forbidden",
+                    mountinfo_path=mountinfo,
+                    sys_dev_block_root=dev_block,
+                    sys_class_block_root=class_block,
+                )
+
+    def test_preflight_requires_explicit_nvme_tmpdir(self) -> None:
+        with mock.patch.object(
+                preflight,
+                "storage_attestation",
+                return_value=storage_record("/home/test")):
+            with mock.patch.dict(preflight.os.environ, {"HIP_LAUNCH_BLOCKING": "1"}, clear=True):
+                with self.assertRaisesRegex(preflight.PreflightError, "TMPDIR is required"):
+                    preflight.run_preflight(
+                        model=Path("/home/model.gguf"),
+                        prompt=Path("/home/prompt.txt"),
+                        output=Path("/home/trace"),
+                        repo=Path("/home/repo"),
+                        busy_patterns=[],
+                    )
 
     def test_watchdog_lease_rejects_arbitrary_heartbeat_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -915,6 +1121,20 @@ class TraceFormatTests(unittest.TestCase):
                 add_required_events(writer)
             with self.assertRaisesRegex(trace.TraceError, "ds4 revision"):
                 trace.TraceBundle(root)
+
+    def test_rejects_unattested_accelerator_identity(self) -> None:
+        for key, value, message in (
+                ("architecture", "gfx1100", "architecture mismatch"),
+                ("gfx_target_version", 110500, "gfx_target_version mismatch"),
+                ("pci_device_id", "ROCm0", "PCI identity")):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "trace"
+                trace_manifest = manifest()
+                trace_manifest["accelerator"][key] = value
+                with trace.TraceBundleWriter(root, trace_manifest) as writer:
+                    add_required_events(writer)
+                with self.assertRaisesRegex(trace.TraceError, message):
+                    trace.TraceBundle(root)
 
     def test_rejects_wrong_component_schema_and_same_bundle_compare(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

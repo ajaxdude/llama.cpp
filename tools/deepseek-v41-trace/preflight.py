@@ -38,13 +38,137 @@ def resolved(path: Path) -> Path:
     return path.expanduser().resolve()
 
 
-def require_nvme_path(path: Path, label: str) -> Path:
+def _decode_mount_field(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _existing_ancestor(path: Path) -> Path:
+    current = path
+    while not current.exists():
+        if current == current.parent:
+            raise PreflightError(f"path has no existing parent: {path}")
+        current = current.parent
+    return current.resolve(strict=True)
+
+
+def storage_attestation(
+        path: Path,
+        label: str,
+        *,
+        mountinfo_path: Path = Path("/proc/self/mountinfo"),
+        sys_dev_block_root: Path = Path("/sys/dev/block"),
+        sys_class_block_root: Path = Path("/sys/class/block")) -> dict[str, object]:
     path = resolved(path)
     try:
         path.relative_to(FORBIDDEN_ROOT)
     except ValueError:
-        return path
-    raise PreflightError(f"{label} must not use rotational storage: {path}")
+        pass
+    else:
+        raise PreflightError(f"{label} must not use /mnt/bigspace: {path}")
+
+    existing = _existing_ancestor(path)
+    mounts: list[tuple[Path, str, str, str]] = []
+    for line in read_proc_lines(mountinfo_path):
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mount = (
+                Path(_decode_mount_field(fields[4])),
+                fields[separator + 1],
+                _decode_mount_field(fields[separator + 2]),
+                fields[2],
+            )
+        except (IndexError, ValueError) as error:
+            raise PreflightError(f"invalid mountinfo record: {line}") from error
+        try:
+            existing.relative_to(mount[0])
+        except ValueError:
+            continue
+        mounts.append(mount)
+    if not mounts:
+        raise PreflightError(f"{label} mount cannot be resolved: {path}")
+    mount_point, filesystem_type, mount_source, device_number = max(
+        mounts, key=lambda item: len(item[0].parts))
+    if device_number.split(":", 1)[0] == "0":
+        source_device = mount_source.split("[", 1)[0]
+        source_name = Path(source_device).name
+        source_dev_path = sys_class_block_root / source_name / "dev"
+        if not source_device.startswith("/dev/") or not source_dev_path.is_file():
+            raise PreflightError(f"{label} is not backed by a local block device: {path}")
+        try:
+            device_number = source_dev_path.read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise PreflightError(f"{label} backing device identity cannot be read: {error}") from error
+        if re.fullmatch(r"[0-9]+:[0-9]+", device_number) is None:
+            raise PreflightError(f"{label} backing device identity is invalid: {device_number}")
+
+    device_link = sys_dev_block_root / device_number
+    if not device_link.is_symlink():
+        raise PreflightError(f"{label} block device cannot be resolved: {path}")
+    try:
+        block_device = device_link.resolve(strict=True)
+    except OSError as error:
+        raise PreflightError(f"{label} block device cannot be resolved: {error}") from error
+    rotational_path = None
+    for candidate in (block_device, *block_device.parents):
+        path_candidate = candidate / "queue" / "rotational"
+        if path_candidate.is_file():
+            rotational_path = path_candidate
+            break
+    if rotational_path is None:
+        raise PreflightError(f"{label} block device rotational state cannot be resolved: {block_device}")
+    try:
+        rotational = rotational_path.read_text(encoding="ascii").strip()
+    except OSError as error:
+        raise PreflightError(f"{label} block device rotational state cannot be read: {error}") from error
+    if rotational != "0":
+        raise PreflightError(f"{label} must use non-rotational storage: {path}")
+
+    nvme_device = next(
+        (part for part in reversed(block_device.parts) if re.fullmatch(r"nvme[0-9]+(?:c[0-9]+)?n[0-9]+", part)),
+        None,
+    )
+    if nvme_device is None:
+        raise PreflightError(f"{label} must use an NVMe block device: {block_device}")
+    return {
+        "resolved_path": str(path),
+        "existing_path": str(existing),
+        "mount_point": str(mount_point),
+        "filesystem_type": filesystem_type,
+        "mount_source": mount_source,
+        "device_number": device_number,
+        "block_device_path": str(block_device),
+        "nvme_device": nvme_device,
+        "rotational": False,
+    }
+
+
+def require_nvme_path(
+        path: Path,
+        label: str,
+        *,
+        mountinfo_path: Path = Path("/proc/self/mountinfo"),
+        sys_dev_block_root: Path = Path("/sys/dev/block"),
+        sys_class_block_root: Path = Path("/sys/class/block")) -> Path:
+    attestation = storage_attestation(
+        path,
+        label,
+        mountinfo_path=mountinfo_path,
+        sys_dev_block_root=sys_dev_block_root,
+        sys_class_block_root=sys_class_block_root,
+    )
+    return _attested_resolved_path(attestation, label)
+
+
+def _attested_resolved_path(attestation: dict[str, object], label: str) -> Path:
+    resolved_path = attestation["resolved_path"]
+    if not isinstance(resolved_path, str):
+        raise PreflightError(f"{label} resolved path evidence is invalid")
+    return Path(resolved_path)
 
 
 def safe_trace_path(root: Path, relative: Path | str) -> Path:
@@ -603,9 +727,17 @@ def run_preflight(
         repo: Path,
         busy_patterns: list[str],
 ) -> dict[str, object]:
-    model = require_nvme_path(model, "model")
-    prompt = require_nvme_path(prompt, "prompt")
-    output = require_nvme_path(output, "trace output")
+    model_storage = storage_attestation(model, "model")
+    prompt_storage = storage_attestation(prompt, "prompt")
+    output_storage = storage_attestation(output, "trace output")
+    repo_storage = storage_attestation(repo, "repository")
+    tmpdir_value = os.environ.get("TMPDIR")
+    if not tmpdir_value:
+        raise PreflightError("TMPDIR is required for NVMe-only correctness runs")
+    tmp_storage = storage_attestation(Path(tmpdir_value), "temporary directory")
+    model = _attested_resolved_path(model_storage, "model")
+    prompt = _attested_resolved_path(prompt_storage, "prompt")
+    output = _attested_resolved_path(output_storage, "trace output")
     if not model.is_file():
         raise PreflightError(f"model is not a file: {model}")
     if not prompt.is_file():
@@ -629,6 +761,13 @@ def run_preflight(
         "watchdog": watchdog,
         "active_workloads": [],
         "environment": {"HIP_LAUNCH_BLOCKING": "1"},
+        "storage": {
+            "model": model_storage,
+            "prompt": prompt_storage,
+            "output": output_storage,
+            "repository": repo_storage,
+            "temporary_directory": tmp_storage,
+        },
     }
 
 
@@ -674,6 +813,10 @@ def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
             "data": data,
             "environment": audit["environment"],
         }
+        if key == "memory":
+            value["storage"] = audit["storage"]
+            if "accelerator" in audit:
+                value["accelerator"] = audit["accelerator"]
         path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
         result[key] = str(path)
     summary = root / "preflight.json"
