@@ -165,18 +165,6 @@ llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_
     return result;
 }
 
-uint64_t llama_dsv41_expert_payload_bytes(const std::vector<llama_expert_store_tensor> & tensors) {
-    uint64_t result = 0;
-    for (const auto & tensor : tensors) {
-        llama_expert_store_validate_tensor(tensor);
-        result = checked_add(
-                result,
-                checked_mul(tensor.nb[2], tensor.ne[2], "expert payload"),
-                "expert payload");
-    }
-    return result;
-}
-
 uint64_t llama_dsv41_estimate_graph_workspace(uint32_t n_ctx, uint32_t n_ubatch) {
     validate_context(n_ctx);
     if (n_ubatch == 0 || n_ubatch > 2048) {

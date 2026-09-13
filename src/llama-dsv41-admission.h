@@ -71,7 +71,6 @@ struct llama_dsv41_admission_result {
 
 llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_root);
 
-uint64_t llama_dsv41_expert_payload_bytes(const std::vector<llama_expert_store_tensor> & tensors);
 uint64_t llama_dsv41_estimate_graph_workspace(uint32_t n_ctx, uint32_t n_ubatch);
 uint64_t llama_dsv41_engram_staging_bytes(uint32_t n_ubatch);
 uint64_t llama_dsv41_output_bytes(uint32_t n_vocab, uint32_t n_ubatch);
