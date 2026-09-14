@@ -309,6 +309,22 @@ jobs:
               "DYLD_VERSIONED_LIBRARY_PATH", "GGML_BACKEND_PATH", "LD_AUDIT",
               "LD_LIBRARY_PATH", "LD_PRELOAD",
           )
+          HOST_POLICY_STATUS_FIELDS = (
+              "Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb",
+              "NoNewPrivs", "Seccomp", "Seccomp_filters",
+          )
+          HOST_POLICY_CONTROL_PATHS = (
+              "/proc/self/attr/current",
+              "/sys/module/apparmor/parameters/enabled",
+              "/proc/sys/kernel/unprivileged_userns_clone",
+              "/proc/sys/user/max_user_namespaces",
+              "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+              "/sys/kernel/security/lsm",
+              "/sys/kernel/security/apparmor/profiles",
+              "/sys/kernel/security",
+              "/sys/kernel/security/apparmor",
+              "/sys/kernel/security/apparmor/features",
+          )
 
           def bytes_for(value):
               return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
@@ -361,6 +377,354 @@ jobs:
                   "os_gid": os.getgid(), "os_groups": os.getgroups(), "os_uid": os.getuid(),
               })
               return state
+
+          def error_snapshot(path, operation, error, metadata=None):
+              result = {
+                  "error": str(error),
+                  "error_type": type(error).__name__,
+                  "errno": getattr(error, "errno", None),
+                  "operation": operation,
+                  "path": str(path),
+                  "status": "unreadable",
+              }
+              if metadata is not None:
+                  result.update(metadata)
+              return result
+
+          def path_metadata(path, info):
+              kind = "directory" if stat.S_ISDIR(info.st_mode) else "file" if stat.S_ISREG(info.st_mode) else "other"
+              return {
+                  "gid": info.st_gid,
+                  "kind": kind,
+                  "mode": stat.S_IMODE(info.st_mode),
+                  "uid": info.st_uid,
+              }
+
+          def snapshot_path(value):
+              path = Path(value)
+              try:
+                  info = path.lstat()
+              except FileNotFoundError:
+                  return {"path": str(path), "status": "absent"}
+              except OSError as error:
+                  return error_snapshot(path, "lstat", error)
+              metadata = path_metadata(path, info)
+              if metadata["kind"] == "directory":
+                  try:
+                      entries = sorted(os.listdir(path))
+                  except OSError as error:
+                      return error_snapshot(path, "listdir", error, metadata)
+                  encoded = bytes_for(entries)
+                  return {
+                      **metadata,
+                      "entries": entries,
+                      "entries_sha256": hashlib.sha256(encoded).hexdigest(),
+                      "path": str(path),
+                      "status": "present_readable",
+                  }
+              if metadata["kind"] != "file":
+                  return {
+                      **metadata,
+                      "path": str(path),
+                      "status": "present_readable",
+                  }
+              try:
+                  data = path.read_bytes()
+              except OSError as error:
+                  return error_snapshot(path, "read", error, metadata)
+              try:
+                  content = data.decode("ascii")
+                  encoding = "ascii"
+              except UnicodeDecodeError:
+                  content = data.hex()
+                  encoding = "hex"
+              return {
+                  **metadata,
+                  "bytes": len(data),
+                  "content": content,
+                  "content_encoding": encoding,
+                  "content_sha256": hashlib.sha256(data).hexdigest(),
+                  "path": str(path),
+                  "status": "present_readable",
+              }
+
+          def validate_snapshot(snapshot, expected_path):
+              if snapshot.get("path") != expected_path:
+                  raise RuntimeError(f"host policy path differs: {snapshot.get('path')} != {expected_path}")
+              status = snapshot.get("status")
+              if status == "absent":
+                  if set(snapshot) != {"path", "status"}:
+                      raise RuntimeError(f"absent host policy control has extra fields: {expected_path}")
+                  return
+              if status == "unreadable":
+                  allowed = {
+                      "error", "error_type", "errno", "operation", "path", "status",
+                      "gid", "kind", "mode", "uid",
+                  }
+                  if not set(snapshot) <= allowed:
+                      raise RuntimeError(f"unreadable host policy control has extra fields: {expected_path}")
+                  if not isinstance(snapshot.get("operation"), str) or not snapshot["operation"]:
+                      raise RuntimeError(f"unreadable host policy control has no operation: {expected_path}")
+                  if not isinstance(snapshot.get("error_type"), str) or not snapshot["error_type"]:
+                      raise RuntimeError(f"unreadable host policy control has no error type: {expected_path}")
+                  if not isinstance(snapshot.get("error"), str) or not snapshot["error"]:
+                      raise RuntimeError(f"unreadable host policy control has no error: {expected_path}")
+                  if snapshot.get("errno") is not None and not isinstance(snapshot["errno"], int):
+                      raise RuntimeError(f"unreadable host policy control errno is invalid: {expected_path}")
+                  metadata = [name in snapshot for name in ("mode", "uid", "gid", "kind")]
+                  if any(metadata) and not all(metadata):
+                      raise RuntimeError(f"unreadable host policy control metadata is incomplete: {expected_path}")
+                  if all(metadata):
+                      if snapshot["kind"] not in ("directory", "file", "other"):
+                          raise RuntimeError(f"unreadable host policy control kind is invalid: {expected_path}")
+                      for name in ("mode", "uid", "gid"):
+                          if not isinstance(snapshot[name], int) or snapshot[name] < 0:
+                              raise RuntimeError(f"unreadable host policy control {name} is invalid: {expected_path}")
+                  return
+              if status != "present_readable":
+                  raise RuntimeError(f"host policy control status is invalid: {expected_path}")
+              for name in ("mode", "uid", "gid"):
+                  if not isinstance(snapshot.get(name), int) or snapshot[name] < 0:
+                      raise RuntimeError(f"host policy control {name} is invalid: {expected_path}")
+              kind = snapshot.get("kind")
+              if kind == "directory":
+                  expected = {
+                      "entries", "entries_sha256", "gid", "kind", "mode", "path", "status", "uid",
+                  }
+                  if set(snapshot) != expected:
+                      raise RuntimeError(f"host policy directory fields differ: {expected_path}")
+                  entries = snapshot.get("entries")
+                  if not isinstance(entries, list) or entries != sorted(entries) or not all(
+                          isinstance(item, str) for item in entries):
+                      raise RuntimeError(f"host policy directory entries are invalid: {expected_path}")
+                  if snapshot.get("entries_sha256") != hashlib.sha256(bytes_for(entries)).hexdigest():
+                      raise RuntimeError(f"host policy directory entry hash differs: {expected_path}")
+                  return
+              if kind == "other":
+                  if set(snapshot) != {"gid", "kind", "mode", "path", "status", "uid"}:
+                      raise RuntimeError(f"host policy other fields differ: {expected_path}")
+                  return
+              if kind != "file":
+                  raise RuntimeError(f"host policy control kind is invalid: {expected_path}")
+              expected = {
+                  "bytes", "content", "content_encoding", "content_sha256",
+                  "gid", "kind", "mode", "path", "status", "uid",
+              }
+              if set(snapshot) != expected:
+                  raise RuntimeError(f"host policy file fields differ: {expected_path}")
+              encoding = snapshot.get("content_encoding")
+              content = snapshot.get("content")
+              if not isinstance(content, str) or encoding not in ("ascii", "hex"):
+                  raise RuntimeError(f"host policy control content is invalid: {expected_path}")
+              try:
+                  data = content.encode("ascii") if encoding == "ascii" else bytes.fromhex(content)
+              except (UnicodeEncodeError, ValueError) as error:
+                  raise RuntimeError(f"host policy control encoding is invalid: {expected_path}") from error
+              if snapshot.get("bytes") != len(data):
+                  raise RuntimeError(f"host policy control byte count differs: {expected_path}")
+              if snapshot.get("content_sha256") != hashlib.sha256(data).hexdigest():
+                  raise RuntimeError(f"host policy control hash differs: {expected_path}")
+
+          def snapshot_ascii(snapshot):
+              validate_snapshot(snapshot, snapshot.get("path"))
+              if snapshot.get("status") != "present_readable" or snapshot.get("kind") != "file":
+                  return None
+              if snapshot.get("content_encoding") != "ascii":
+                  raise RuntimeError(f"host policy control is not ASCII: {snapshot['path']}")
+              return snapshot["content"]
+
+          def status_field_evidence(status_snapshot):
+              text = snapshot_ascii(status_snapshot)
+              if text is None:
+                  return {
+                      name: {"status": "unavailable"}
+                      for name in HOST_POLICY_STATUS_FIELDS
+                  }
+              fields = {}
+              for line in text.splitlines():
+                  name, separator, value = line.partition(":")
+                  if separator:
+                      fields[name] = value.strip()
+              return {
+                  name: {"raw": fields[name], "status": "present"} if name in fields else {"status": "absent"}
+                  for name in HOST_POLICY_STATUS_FIELDS
+              }
+
+          def root_mount_evidence(mountinfo_snapshot):
+              text = snapshot_ascii(mountinfo_snapshot)
+              if text is None:
+                  return []
+              result = []
+              for line in text.splitlines():
+                  before, separator, after = line.partition(" - ")
+                  fields = before.split()
+                  suffix = after.split()
+                  if not separator or len(fields) < 6 or len(suffix) < 3 or fields[4] != "/":
+                      continue
+                  result.append({
+                      "filesystem_type": suffix[0],
+                      "major_minor": fields[2],
+                      "mount_id": int(fields[0]),
+                      "mount_options": fields[5],
+                      "mount_point": fields[4],
+                      "mount_source": suffix[1],
+                      "optional_fields": fields[6:],
+                      "parent_id": int(fields[1]),
+                      "raw_line": line,
+                      "root": fields[3],
+                      "super_options": suffix[2:],
+                  })
+              return result
+
+          def capture_host_policy_diagnostic(state):
+              try:
+                  uname = os.uname()
+                  uname_evidence = {
+                      "machine": uname.machine,
+                      "nodename": uname.nodename,
+                      "release": uname.release,
+                      "status": "available",
+                      "sysname": uname.sysname,
+                      "version": uname.version,
+                  }
+              except OSError as error:
+                  uname_evidence = {
+                      "error": str(error),
+                      "error_type": type(error).__name__,
+                      "errno": error.errno,
+                      "status": "unavailable",
+                  }
+              status_snapshot = snapshot_path("/proc/self/status")
+              mountinfo_snapshot = snapshot_path("/proc/self/mountinfo")
+              diagnostic = {
+                  "captured_state": state,
+                  "controls": {
+                      path: snapshot_path(path)
+                      for path in HOST_POLICY_CONTROL_PATHS
+                  },
+                  "format": "dsv41-host-policy-diagnostic",
+                  "proc_self_status": {
+                      "fields": status_field_evidence(status_snapshot),
+                      "snapshot": status_snapshot,
+                  },
+                  "root_mount_propagation": {
+                      "root_mounts": root_mount_evidence(mountinfo_snapshot),
+                      "snapshot": mountinfo_snapshot,
+                  },
+                  "uname": uname_evidence,
+                  "version": 1,
+              }
+              validate_host_policy_diagnostic(diagnostic, state)
+              return diagnostic
+
+          def parse_decimal_field(fields, name):
+              item = fields[name]
+              if item.get("status") == "absent":
+                  return None
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return int(item["raw"], 10)
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status field is not decimal: {name}") from error
+
+          def parse_vector_field(fields, name):
+              item = fields[name]
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return [int(value, 10) for value in item["raw"].split()]
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status vector is invalid: {name}") from error
+
+          def parse_hex_field(fields, name):
+              item = fields[name]
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return int(item["raw"], 16)
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status field is not hexadecimal: {name}") from error
+
+          def validate_host_policy_diagnostic(diagnostic, state):
+              if diagnostic.get("format") != "dsv41-host-policy-diagnostic" or diagnostic.get("version") != 1:
+                  raise RuntimeError("host policy diagnostic schema differs")
+              if diagnostic.get("captured_state") != state:
+                  raise RuntimeError("host policy diagnostic state differs")
+              uname = diagnostic.get("uname", {})
+              if uname.get("status") == "available":
+                  if not all(isinstance(uname.get(name), str) for name in (
+                          "sysname", "nodename", "release", "version", "machine")):
+                      raise RuntimeError("host policy uname evidence is invalid")
+              elif uname.get("status") == "unavailable":
+                  if not isinstance(uname.get("error_type"), str) or not isinstance(uname.get("error"), str):
+                      raise RuntimeError("host policy uname error is invalid")
+              else:
+                  raise RuntimeError("host policy uname status is invalid")
+              status = diagnostic.get("proc_self_status", {})
+              snapshot = status.get("snapshot", {})
+              validate_snapshot(snapshot, "/proc/self/status")
+              fields = status.get("fields")
+              if not isinstance(fields, dict) or set(fields) != set(HOST_POLICY_STATUS_FIELDS):
+                  raise RuntimeError("host policy status fields differ")
+              if snapshot.get("status") != "present_readable":
+                  if any(value != {"status": "unavailable"} for value in fields.values()):
+                      raise RuntimeError("unavailable host policy status has values")
+              else:
+                  if parse_vector_field(fields, "Uid") != state["uid"]:
+                      raise RuntimeError("host policy Uid differs")
+                  if parse_vector_field(fields, "Gid") != state["gid"]:
+                      raise RuntimeError("host policy Gid differs")
+                  if parse_vector_field(fields, "Groups") != state["groups"]:
+                      raise RuntimeError("host policy Groups differs")
+                  for field, name in (
+                          ("CapInh", "cap_inh"), ("CapPrm", "cap_prm"), ("CapEff", "cap_eff"),
+                          ("CapBnd", "cap_bnd"), ("CapAmb", "cap_amb")):
+                      if parse_hex_field(fields, field) != state[name]:
+                          raise RuntimeError(f"host policy {field} differs")
+                  if parse_decimal_field(fields, "NoNewPrivs") != state["no_new_privs"]:
+                      raise RuntimeError("host policy NoNewPrivs differs")
+                  for name in ("Seccomp", "Seccomp_filters"):
+                      parse_decimal_field(fields, name)
+              controls = diagnostic.get("controls")
+              if not isinstance(controls, dict) or set(controls) != set(HOST_POLICY_CONTROL_PATHS):
+                  raise RuntimeError("host policy control paths differ")
+              for path in HOST_POLICY_CONTROL_PATHS:
+                  validate_snapshot(controls[path], path)
+              mount = diagnostic.get("root_mount_propagation", {})
+              validate_snapshot(mount.get("snapshot", {}), "/proc/self/mountinfo")
+              roots = mount.get("root_mounts")
+              if not isinstance(roots, list):
+                  raise RuntimeError("host policy root mounts are invalid")
+              if mount["snapshot"].get("status") == "present_readable" and not roots:
+                  raise RuntimeError("host policy root mount is absent")
+              if mount["snapshot"].get("status") != "present_readable" and roots:
+                  raise RuntimeError("unavailable host policy mount has root entries")
+              for item in roots:
+                  if item.get("mount_point") != "/" or not isinstance(item.get("raw_line"), str):
+                      raise RuntimeError("host policy root mount entry is invalid")
+
+          def validate_host_policy_file(binding, state, expected_path):
+              path = Path(binding.get("path", ""))
+              if not path.is_absolute() or path.resolve(strict=True) != path or path != Path(expected_path):
+                  raise RuntimeError("host policy diagnostic path is invalid")
+              info = path.lstat()
+              if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                  raise RuntimeError("host policy diagnostic is not a direct file")
+              if stat.S_IMODE(info.st_mode) != 0o444 or binding.get("mode") != 0o444:
+                  raise RuntimeError("host policy diagnostic mode differs")
+              digest = verify_digest(path, binding.get("sha256"))
+              diagnostic = json.loads(path.read_text(encoding="ascii"))
+              validate_host_policy_diagnostic(diagnostic, state)
+              if binding.get("format") != diagnostic["format"] or binding.get("version") != diagnostic["version"]:
+                  raise RuntimeError("host policy diagnostic binding schema differs")
+              return {
+                  "format": diagnostic["format"],
+                  "mode": 0o444,
+                  "path": str(path),
+                  "sha256": digest,
+                  "version": diagnostic["version"],
+              }
 
           def validate_state(state, uid, gid, cap_bnd):
               if uid <= 0 or gid <= 0:
@@ -465,9 +829,21 @@ jobs:
               ctest = str(Path(config["ctest"]).resolve(strict=True))
               if not os.access(ctest, os.X_OK):
                   raise RuntimeError("CTest is not executable")
+              diagnostic_path = Path(paths["evidence"]) / "host-policy-diagnostic.json"
+              diagnostic = capture_host_policy_diagnostic(state)
+              diagnostic_sha256 = write_exclusive(diagnostic_path, diagnostic)
+              diagnostic_path.chmod(0o444)
+              diagnostic_binding = validate_host_policy_file({
+                  "format": diagnostic["format"],
+                  "mode": 0o444,
+                  "path": str(diagnostic_path),
+                  "sha256": diagnostic_sha256,
+                  "version": diagnostic["version"],
+              }, state, diagnostic_path)
               preflight = {
                   "ctest": ctest, "environment_names": environment_names,
                   "format": "dsv41-ci-runner-preflight", "interpreter": interpreter,
+                  "host_policy_diagnostic": diagnostic_binding,
                   "pid": os.getpid(), "ppid": os.getppid(), "secure_directories": receipts,
                   "state": state, "timestamp_monotonic_ns": time.monotonic_ns(), "version": 1,
               }
@@ -532,6 +908,169 @@ jobs:
               rejected(lambda: validate_environment(
                   {"HOME": "/home/runner", "LD_LIBRARY_PATH": "/lib"},
                   {"environment_allowlist": ["HOME", "LD_LIBRARY_PATH"]}))
+              state_fields = {
+                  "CapAmb": {"raw": "0000000000000000", "status": "present"},
+                  "CapBnd": {"raw": "000000000000000f", "status": "present"},
+                  "CapEff": {"raw": "0000000000000000", "status": "present"},
+                  "CapInh": {"raw": "0000000000000000", "status": "present"},
+                  "CapPrm": {"raw": "0000000000000000", "status": "present"},
+                  "Gid": {"raw": "1001 1001 1001 1001", "status": "present"},
+                  "Groups": {"raw": "", "status": "present"},
+                  "NoNewPrivs": {"raw": "1", "status": "present"},
+                  "Seccomp": {"raw": "2", "status": "present"},
+                  "Seccomp_filters": {"raw": "1", "status": "present"},
+                  "Uid": {"raw": "1001 1001 1001 1001", "status": "present"},
+              }
+              status_text = "".join(f"{name}:\t{value['raw']}\n" for name, value in state_fields.items())
+              status_snapshot = {
+                  "bytes": len(status_text.encode("ascii")),
+                  "content": status_text,
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(status_text.encode("ascii")).hexdigest(),
+                  "gid": 1001,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": "/proc/self/status",
+                  "status": "present_readable",
+                  "uid": 1001,
+              }
+              mount_text = "1 0 0:1 / / rw,relatime shared:1 - rootfs rootfs rw\n"
+              mount_snapshot = {
+                  "bytes": len(mount_text.encode("ascii")),
+                  "content": mount_text,
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(mount_text.encode("ascii")).hexdigest(),
+                  "gid": 1001,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": "/proc/self/mountinfo",
+                  "status": "present_readable",
+                  "uid": 1001,
+              }
+              present_zero = {
+                  "bytes": 2,
+                  "content": "0\n",
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(b"0\n").hexdigest(),
+                  "gid": 0,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": HOST_POLICY_CONTROL_PATHS[0],
+                  "status": "present_readable",
+                  "uid": 0,
+              }
+              present_false = {
+                  **present_zero,
+                  "bytes": 2,
+                  "content": "N\n",
+                  "content_sha256": hashlib.sha256(b"N\n").hexdigest(),
+                  "path": HOST_POLICY_CONTROL_PATHS[4],
+              }
+              absent = {"path": HOST_POLICY_CONTROL_PATHS[1], "status": "absent"}
+              unreadable = {
+                  "error": "Permission denied",
+                  "error_type": "PermissionError",
+                  "errno": 13,
+                  "operation": "read",
+                  "path": HOST_POLICY_CONTROL_PATHS[2],
+                  "status": "unreadable",
+              }
+              directory_entries = ["apparmor", "lsm"]
+              directory = {
+                  "entries": directory_entries,
+                  "entries_sha256": hashlib.sha256(bytes_for(directory_entries)).hexdigest(),
+                  "gid": 0,
+                  "kind": "directory",
+                  "mode": 0o555,
+                  "path": HOST_POLICY_CONTROL_PATHS[3],
+                  "status": "present_readable",
+                  "uid": 0,
+              }
+              controls = {}
+              for path in HOST_POLICY_CONTROL_PATHS:
+                  controls[path] = {"path": path, "status": "absent"}
+              controls[HOST_POLICY_CONTROL_PATHS[0]] = present_zero
+              controls[HOST_POLICY_CONTROL_PATHS[1]] = absent
+              controls[HOST_POLICY_CONTROL_PATHS[2]] = unreadable
+              controls[HOST_POLICY_CONTROL_PATHS[3]] = directory
+              controls[HOST_POLICY_CONTROL_PATHS[4]] = present_false
+              synthetic = {
+                  "captured_state": valid,
+                  "controls": controls,
+                  "format": "dsv41-host-policy-diagnostic",
+                  "proc_self_status": {
+                      "fields": state_fields,
+                      "snapshot": status_snapshot,
+                  },
+                  "root_mount_propagation": {
+                      "root_mounts": root_mount_evidence(mount_snapshot),
+                      "snapshot": mount_snapshot,
+                  },
+                  "uname": {
+                      "machine": "aarch64", "nodename": "runner", "release": "6.11",
+                      "status": "available", "sysname": "Linux", "version": "#1",
+                  },
+                  "version": 1,
+              }
+              validate_host_policy_diagnostic(synthetic, valid)
+              unavailable_status = {
+                  **synthetic,
+                  "proc_self_status": {
+                      "fields": {
+                          name: {"status": "unavailable"}
+                          for name in HOST_POLICY_STATUS_FIELDS
+                      },
+                      "snapshot": {"path": "/proc/self/status", "status": "absent"},
+                  },
+                  "uname": {
+                      "error": "unavailable", "error_type": "OSError",
+                      "errno": None, "status": "unavailable",
+                  },
+              }
+              validate_host_policy_diagnostic(unavailable_status, valid)
+              partial_status = {
+                  **synthetic,
+                  "proc_self_status": {
+                      "fields": {
+                          **state_fields,
+                          "Seccomp_filters": {"status": "absent"},
+                      },
+                      "snapshot": status_snapshot,
+                  },
+              }
+              validate_host_policy_diagnostic(partial_status, valid)
+              unavailable_mount = {
+                  **synthetic,
+                  "root_mount_propagation": {
+                      "root_mounts": [],
+                      "snapshot": {"path": "/proc/self/mountinfo", "status": "absent"},
+                  },
+              }
+              validate_host_policy_diagnostic(unavailable_mount, valid)
+              for mutation in (
+                      {"format": "wrong"},
+                      {"version": 2},
+                      {"captured_state": {**valid, "no_new_privs": 0}},
+                      {"controls": {**controls, "/wrong": {"path": "/wrong", "status": "absent"}}},
+                      {"proc_self_status": {
+                          "fields": {**state_fields, "NoNewPrivs": {"raw": "0", "status": "present"}},
+                          "snapshot": status_snapshot,
+                      }},
+                      {"root_mount_propagation": {"root_mounts": [], "snapshot": mount_snapshot}}):
+                  changed = dict(synthetic)
+                  changed.update(mutation)
+                  rejected(lambda changed=changed: validate_host_policy_diagnostic(changed, valid))
+              for invalid, expected_path in (
+                      ({**present_zero, "content": "1\n"}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "bytes": 1}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "content_sha256": "0" * 64}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**absent, "content": ""}, HOST_POLICY_CONTROL_PATHS[1]),
+                      ({**unreadable, "error": ""}, HOST_POLICY_CONTROL_PATHS[2]),
+                      ({**unreadable, "content": ""}, HOST_POLICY_CONTROL_PATHS[2]),
+                      ({**directory, "entries_sha256": "0" * 64}, HOST_POLICY_CONTROL_PATHS[3]),
+                      ({"path": HOST_POLICY_CONTROL_PATHS[0], "status": "invalid"}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "path": "/wrong"}, HOST_POLICY_CONTROL_PATHS[0])):
+                  rejected(lambda invalid=invalid, expected_path=expected_path: validate_snapshot(invalid, expected_path))
               root = Path(output).resolve().parent / "gate-self-test"
               root.mkdir(mode=0o700)
               with tempfile.TemporaryDirectory(dir=root) as temp:
@@ -559,6 +1098,7 @@ jobs:
                   rejected(lambda: verify_digest(marker, digest))
               Path(output).write_text(json.dumps({
                   "environment": "PASS", "exclusive_and_tamper": "PASS",
+                  "host_policy_diagnostic": "PASS",
                   "interpreter": "PASS", "secure_ancestry": "PASS",
                   "state_matrix": "PASS",
               }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
@@ -618,6 +1158,9 @@ jobs:
               path, digest, before = preflight()
               state = GATE.current_state()
               GATE.validate_state(state, CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              diagnostic = GATE.validate_host_policy_file(
+                  before["host_policy_diagnostic"], state,
+                  Path(CONFIG["paths"]["evidence"]) / "host-policy-diagnostic.json")
               interpreter = GATE.validate_interpreter(CONFIG)
               if any(os.environ.get(name) for name in GATE.FORBIDDEN):
                   raise RuntimeError("target process has a forbidden loader environment")
@@ -628,6 +1171,7 @@ jobs:
                   raise RuntimeError("target process differs from preflight")
               return {
                   "active_forbidden_loader_environment": [],
+                  "host_policy_diagnostic": diagnostic,
                   "interpreter": interpreter,
                   "preflight_path": str(path),
                   "preflight_sha256": digest,
@@ -769,10 +1313,25 @@ jobs:
                       f"marker counts are invalid: entry={entries} duplicate={duplicates} "
                       f"target_skip={target_skips} skips={total_skips}")
 
-          def validate_marker(status, paths):
+          def validate_preflight_diagnostic(paths):
+              evidence = Path(paths["evidence"])
+              preflight_path = evidence / "runner-preflight.json"
+              preflight_sha = hashlib.sha256(preflight_path.read_bytes()).hexdigest()
+              preflight = json.loads(preflight_path.read_text(encoding="ascii"))
+              GATE.validate_state(
+                  preflight["state"], CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              diagnostic = GATE.validate_host_policy_file(
+                  preflight["host_policy_diagnostic"], preflight["state"],
+                  evidence / "host-policy-diagnostic.json")
+              return diagnostic, preflight_path, preflight_sha, preflight
+
+          def validate_marker(status, paths, preflight_evidence=None):
               evidence = Path(paths["evidence"])
               marker_dir = Path(paths["marker"])
               log = (Path(paths["log"]) / "test-deepseek41-trace-ctest.log").read_text(errors="replace")
+              diagnostic, preflight_path, preflight_sha, preflight = (
+                  validate_preflight_diagnostic(paths)
+                  if preflight_evidence is None else preflight_evidence)
               validate_outer(
                   status,
                   junit_values(evidence / "test-deepseek41-trace-ctest.xml"),
@@ -780,11 +1339,6 @@ jobs:
               )
               metadata = json.loads((evidence / "test-deepseek41-trace-ctest-metadata.json").read_text())
               bindings = expected_bindings(metadata)
-              preflight_path = evidence / "runner-preflight.json"
-              preflight_sha = hashlib.sha256(preflight_path.read_bytes()).hexdigest()
-              preflight = json.loads(preflight_path.read_text(encoding="ascii"))
-              GATE.validate_state(
-                  preflight["state"], CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
               if preflight["environment_names"] != CONFIG["environment_allowlist"]:
                   raise RuntimeError("preflight environment allowlist differs")
               if preflight["ctest"] != str(Path(CONFIG["ctest"]).resolve(strict=True)):
@@ -816,6 +1370,7 @@ jobs:
                   "event": "test_method_entry",
                   "function": TARGET_METHOD,
                   "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
+                  "host_policy_diagnostic": diagnostic,
                   "hook_sha256": os.environ["DSV41_CI_HOOK_SHA256"],
                   "interpreter": preflight["interpreter"],
                   "preflight_path": str(preflight_path),
@@ -850,6 +1405,7 @@ jobs:
                   "ctest_execution_count": 1,
                   "duplicate_entry_count": 0,
                   "forbidden_loader_environment": [],
+                  "host_policy_diagnostic": diagnostic,
                   "junit": {"disabled": 0, "failures": 0, "skipped": 0, "tests": 1},
                   "preflight_sha256": preflight_sha,
                   "result": "PASS",
@@ -917,10 +1473,14 @@ jobs:
               }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
 
           def validate(status, output):
+              preflight_evidence = None
               try:
-                  receipt = validate_marker(status, CONFIG["paths"])
+                  preflight_evidence = validate_preflight_diagnostic(CONFIG["paths"])
+                  receipt = validate_marker(status, CONFIG["paths"], preflight_evidence)
               except Exception as error:
                   receipt = {"error": str(error), "result": "FAIL"}
+                  if preflight_evidence is not None:
+                      receipt["host_policy_diagnostic"] = preflight_evidence[0]
                   GATE.write_exclusive(Path(output), receipt)
                   raise
               GATE.write_exclusive(Path(output), receipt)
