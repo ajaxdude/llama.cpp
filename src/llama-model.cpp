@@ -1735,14 +1735,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // With the n-gram table left on disk, a populated mapping would pull the table's
-    // third of the file resident for nothing; readahead alone carries the sequential load.
+    // Do not prefetch files with disk-owned tensor holes. Unsafe contexts load their
+    // resident tensors through bounded staging and discard copied source pages.
     llama_mlocks * mmap_locks = use_mlock && !ml.external.any() ? &pimpl->mlock_mmaps : nullptr;
-    ml.init_mappings(!params.ple_on_disk, mmap_locks);
+    ml.init_mappings(!params.ple_on_disk && !ml.external.any(), mmap_locks);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
-    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+    struct ctx_buf_map {
+        ggml_context * ctx;
+        llama_buf_map  bufs;
+        bool           load_from_mmap;
+        bool           discard_file_cache;
+    };
+    std::vector<ctx_buf_map> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
     bool keep_mappings = false;
 
@@ -1814,6 +1820,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
+                if (use_mlock && ml.external.any() && !is_lazy_mapped) {
+                    size_t lock_first = first;
+                    size_t lock_last = last;
+                    llama_mlock::align_range(&lock_first, &lock_last);
+                    pimpl->mlock_mmaps.emplace_back(new llama_mlock);
+                    auto & mlock_mmap = pimpl->mlock_mmaps.back();
+                    mlock_mmap->init((char *) addr + lock_first);
+                    mlock_mmap->grow_to(lock_last - lock_first);
+                }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
@@ -1850,7 +1865,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
+        const bool load_from_mmap = context_mmap_safe && (ml.use_mmap || is_lazy_mapped);
+        ctx_buf_maps.push_back({ ctx, std::move(buf_map), load_from_mmap, ml.use_mmap && !load_from_mmap });
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1882,16 +1898,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
-    if (!ml.use_mmap) {
+    if (!ml.use_mmap || ml.external.any()) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
-            const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            const auto & buf_map = ctx_buf_map.bufs;
+            return !ctx_buf_map.load_from_mmap && !buf_map.empty() &&
+                    !ggml_backend_buffer_is_host(buf_map.begin()->second);
         });
     }
 
     // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, mmap_locks, params.progress_callback, params.progress_callback_user_data)) {
+    for (auto & ctx_buf_map : ctx_buf_maps) {
+        if (!ml.load_all_data(ctx_buf_map.ctx, ctx_buf_map.bufs, ctx_buf_map.load_from_mmap,
+                    ctx_buf_map.discard_file_cache, mmap_locks,
+                    params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
