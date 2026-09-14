@@ -223,6 +223,11 @@ void test_alignment_and_large_offsets() {
     REQUIRE(lock_last == 2 * lock_granularity);
 }
 
+void test_external_mapping_access_policy() {
+    REQUIRE(llama_mmap::use_sequential_file_advice({}));
+    REQUIRE(!llama_mmap::use_sequential_file_advice({ { 4096, 8192 } }));
+}
+
 void test_published_layout_accounting() {
     const int64_t n_embd = 7680;
     const int64_t n_ff = 1536;
@@ -543,6 +548,7 @@ int main() {
         fixture f;
         test_layout_and_offsets(f);
         test_alignment_and_large_offsets();
+        test_external_mapping_access_policy();
         test_published_layout_accounting();
         test_large_offset_read();
         test_cache_and_remapping(f);

@@ -493,9 +493,12 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        const bool sequential = llama_mmap::use_sequential_file_advice(excluded_ranges);
+        const int file_advice = sequential ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM;
+        const int advice_error = posix_fadvise(fd, 0, 0, file_advice);
+        if (advice_error) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., %s) failed: %s\n",
+                    sequential ? "POSIX_FADV_SEQUENTIAL" : "POSIX_FADV_RANDOM", strerror(advice_error));
         }
         // MAP_POPULATE would fault in excluded ranges too
         if (prefetch && excluded_ranges.empty()) { flags |= MAP_POPULATE; }
@@ -687,6 +690,10 @@ struct llama_mmap::impl {
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
         const ranges & excluded_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges)) {}
 llama_mmap::~llama_mmap() = default;
+
+bool llama_mmap::use_sequential_file_advice(const ranges & excluded_ranges) {
+    return excluded_ranges.empty();
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }

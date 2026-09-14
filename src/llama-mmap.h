@@ -58,6 +58,7 @@ struct llama_mmap {
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
+    static bool use_sequential_file_advice(const ranges & excluded_ranges);
 
 private:
     struct impl;
