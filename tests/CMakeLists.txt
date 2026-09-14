@@ -203,6 +203,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-deepseek41-memory.cpp)
     llama_build_and_test(test-deepseek41-runtime.cpp)
     llama_build_and_test(test-engram.cpp)
+    llama_build_and_test(test-server-child-protocol.cpp)
+    target_include_directories(test-server-child-protocol PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build(test-llama-archs.cpp)
     llama_test(
         test-llama-archs
@@ -225,9 +227,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                 TEST test-deepseek41-trace
                 APPEND PROPERTY ENVIRONMENT
                     "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:llama-deepseek-v41-trace>"
-                    "DSV41_NATIVE_CONTAINMENT_HELPER=$<TARGET_FILE:llama-deepseek-v41-containment-helper>"
                     "DSV41_NATIVE_MANIFEST_BINARY=$<TARGET_FILE:test-deepseek41-trace-manifest>"
                     "DSV41_NATIVE_INJECT_LIBRARY=$<TARGET_FILE:test-deepseek41-trace-injected>")
+            if(LLAMA_DEEPSEEK_V41_NATIVE_CONTAINMENT_TESTS)
+                if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                    message(FATAL_ERROR "Native DeepSeek V4.1 containment tests require Linux")
+                endif()
+                set_property(
+                    TEST test-deepseek41-trace
+                    APPEND PROPERTY ENVIRONMENT
+                        "DSV41_NATIVE_CONTAINMENT_HELPER=$<TARGET_FILE:llama-deepseek-v41-containment-helper>")
+            endif()
         endif()
     endif()
 

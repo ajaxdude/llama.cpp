@@ -258,6 +258,15 @@ DS4_RUNTIME_BUILD = {
     "runtime_libraries": DS4_RUNTIME_LIBRARIES,
     "runtime_libraries_post": copy.deepcopy(DS4_RUNTIME_LIBRARIES),
 }
+DS4_CONTAINMENT_HELPER = {
+    "format": "dsv41-containment-helper",
+    "version": 2,
+    "revision": trace.DS4_REVISION,
+    "filename": "llama-deepseek-v41-containment-helper",
+    "sha256": "d" * 64,
+    "launcher_policy": "zero-supplementary-groups-v1",
+    "supplementary_groups": [],
+}
 DS4_INSTALL_TRUST = {
     "format": "dsv41-install-trust",
     "version": 1,
@@ -303,6 +312,10 @@ DS4_INSTALL_TRUST = {
         }
         for index, (path, digest) in enumerate(
             sorted((
+                (
+                    "/Users/oracle/ds4-install/bin/llama-deepseek-v41-containment-helper",
+                    DS4_CONTAINMENT_HELPER["sha256"],
+                ),
                 ("/Users/oracle/ds4-install/bin/ds4-trace", FIXTURE_DS4_EXPORTER_SHA256),
                 ("/Users/oracle/ds4-install/lib/libds4-runtime.dylib", "a" * 64),
                 ("/Users/oracle/ds4-install/lib/libds4-metal.dylib", "b" * 64),
@@ -319,6 +332,7 @@ DS4_EXPORTER_POLICY = {
     "install_owner_uid": 0,
     "executable_path": "/Users/oracle/ds4-install/bin/ds4-trace",
     "executable_sha256": FIXTURE_DS4_EXPORTER_SHA256,
+    "containment_helper": DS4_CONTAINMENT_HELPER,
     "runtime_profile": DS4_RUNTIME_PROFILE,
     "runtime_receipt": DS4_RUNTIME_RECEIPT,
 }
@@ -2057,6 +2071,14 @@ class TraceFormatTests(unittest.TestCase):
                     "runtime receipt identity",
                 ),
                 (
+                    lambda value: value.pop("containment_helper"),
+                    "missing containment_helper",
+                ),
+                (
+                    lambda value: value["containment_helper"].update({"revision": "a" * 40}),
+                    "containment helper receipt",
+                ),
+                (
                     lambda value: [
                         component.update({"revision": None})
                         for component in value["runtime_receipt"]["components"]
@@ -2203,11 +2225,16 @@ class TraceFormatTests(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             executable.write_bytes(b"approved")
             executable.chmod(0o555)
+            revision = "a" * 40
             policy = {
+                "revision": revision,
                 "install_root": str(install),
                 "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "executable_path": str(executable),
+                "containment_helper": fixture_containment_helper(revision),
                 "runtime_receipt": {"components": []},
             }
+            materialize_policy_runtime(policy)
             events = []
             completed = subprocess.CompletedProcess([str(executable)], 0, b"\xff", b"")
             contained = trace._ContainedRun(completed, None, [], None, True, True)
@@ -4176,11 +4203,16 @@ class TraceFormatTests(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             executable.write_bytes(b"approved")
             executable.chmod(0o555)
+            revision = "a" * 40
             policy = {
+                "revision": revision,
                 "install_root": str(install),
                 "install_owner_uid": os.geteuid() if hasattr(os, "geteuid") else 0,
+                "executable_path": str(executable),
+                "containment_helper": fixture_containment_helper(revision),
                 "runtime_receipt": {"components": []},
             }
+            materialize_policy_runtime(policy)
             result = subprocess.CompletedProcess([str(executable)], 0, b"", b"")
             contained = trace._ContainedRun(result, None, [], mock.Mock(), True, True)
             close_failure = trace._IntegrityFailure(
@@ -4335,6 +4367,43 @@ class TraceFormatTests(unittest.TestCase):
                 verification_unix=TEST_AUTH_ISSUED,
                 seen_run_ids=None,
             )
+
+    def test_ds4_install_trust_producer_binds_containment_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            with isolated_test_install_trust():
+                exporter_identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                runtime_identities = run_ds4.approved_runtime_file_identities(
+                    policy, label="ds4 exporter")
+                trust = run_ds4.exporter_install_trust_evidence(
+                    exporter_identity, runtime_identities, policy)
+                self.assertEqual(
+                    trace.validate_install_trust_evidence(trust, policy),
+                    trust,
+                )
+                self.assertIn(
+                    str(Path(policy["install_root"]) / "bin" / policy["containment_helper"]["filename"]),
+                    {item["path"] for item in trust["files"]},
+                )
+
+                omitted = trace.install_trust_evidence(
+                    exporter_identity, runtime_identities)
+                with self.assertRaisesRegex(
+                        trace.TraceError, "files differ from external approval"):
+                    trace.validate_install_trust_evidence(omitted, policy)
+
+                wrong_helper = copy.deepcopy(policy)
+                wrong_helper["containment_helper"]["sha256"] = "e" * 64
+                with self.assertRaisesRegex(run_ds4.TraceError, "SHA-256 differs"):
+                    run_ds4.exporter_install_trust_evidence(
+                        exporter_identity, runtime_identities, wrong_helper)
 
     def test_install_trust_evidence_rejects_mutability_claims(self) -> None:
         policy = fixture_prompt_builder_policy(b"prompt")

@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "server-child-protocol.h"
 #include "http.h"
 #include "server-models.h"
 #include "server-context.h"
@@ -42,7 +43,6 @@ extern char **environ;
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
-#define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -1053,9 +1053,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
             if (stdout_file) {
                 while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
                     std::string str(buffer);
-                    if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
-                        LOG_DBG("[%5d] %s", port, buffer); // prevent spamming the log
-                        this->handle_child_state(name, str);
+                    std::string state_line(server_child_state_line(str));
+                    if (!state_line.empty()) {
+                        LOG_DBG("[%5d] %s", port, state_line.c_str()); // prevent spamming the log
+                        this->handle_child_state(name, state_line);
                     } else {
                         // forward log
                         LOG("[%5d] %s", port, buffer);
@@ -1110,7 +1111,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
 
         child_proc->stopped.store(true, std::memory_order_release);
-        {
+        if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
+            // Download children never enter stopping_models. Avoid the model lock after DOWNLOADED so remove() can join.
+            cv_stop.notify_all();
+        } else {
             std::lock_guard<std::mutex> lk(this->mutex);
             stopping_models.erase(name);
             cv_stop.notify_all();
@@ -1525,7 +1529,7 @@ void server_models::handle_child_state(const std::string & name, const std::stri
     json payload;
 
     try {
-        json data = json::parse(raw_input.substr(strlen(CMD_CHILD_TO_ROUTER_STATE)));
+        json data = json::parse(raw_input.substr(SERVER_CHILD_STATE_PREFIX.size()));
         state = server_state_from_str(json_value(data, "state", std::string()));
         payload = json_value(data, "payload", json{});
     } catch (const std::exception & e) {
@@ -1716,7 +1720,7 @@ void server_child::notify_to_router(const std::string & state, const json & payl
     std::lock_guard<std::mutex> lk(mtx_stdout);
     common_log_pause(common_log_main());
     fflush(stdout);
-    fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fprintf(stdout, "%s%s\n", SERVER_CHILD_STATE_PREFIX.data(), safe_json_to_str(data).c_str());
     fflush(stdout);
     common_log_resume(common_log_main());
 }
