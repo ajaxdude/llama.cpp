@@ -388,9 +388,8 @@ std::vector<int32_t> llama_dsv41_select_candidate_blocks(
         }
     }
 
-    block_scores.back() = std::numeric_limits<float>::infinity();
-
-    std::vector<int32_t> blocks(n_blocks);
+    const int32_t final_block = (int32_t) n_blocks - 1;
+    std::vector<int32_t> blocks(n_blocks - 1);
     std::iota(blocks.begin(), blocks.end(), 0);
     std::stable_sort(blocks.begin(), blocks.end(), [&](int32_t a, int32_t b) {
         if (block_scores[a] != block_scores[b]) {
@@ -399,8 +398,12 @@ std::vector<int32_t> llama_dsv41_select_candidate_blocks(
         return a < b;
     });
 
-    blocks.resize(std::min<uint32_t>(top_k_blocks, n_blocks));
-    return blocks;
+    const uint32_t n_selected = std::min<uint32_t>(top_k_blocks, n_blocks);
+    std::vector<int32_t> selected;
+    selected.reserve(n_selected);
+    selected.push_back(final_block);
+    selected.insert(selected.end(), blocks.begin(), blocks.begin() + n_selected - 1);
+    return selected;
 }
 
 std::vector<int32_t> llama_dsv41_candidate_rows(
@@ -537,7 +540,7 @@ ggml_tensor * llama_dsv41_build_output(
 
     ggml_tensor * collapsed = llama_dsv41_build_output_collapse(
             ctx, residual, pre, residual->ne[0], hc_mult, residual->ne[2]);
-    ggml_tensor * normalized = ggml_rms_norm(ctx, collapsed, rms_eps);
+    ggml_tensor * normalized = ggml_rms_norm(ctx, ggml_cast(ctx, collapsed, GGML_TYPE_F32), rms_eps);
     normalized = ggml_mul(ctx, normalized, output_norm);
     return ggml_mul_mat(ctx, output, normalized);
 }
