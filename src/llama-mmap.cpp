@@ -460,7 +460,6 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
-#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
 // merge `ranges` and return their complement within [0, limit)
 static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
     llama_mmap::ranges res;
@@ -478,22 +477,21 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
     if (pos < limit) {
         res.emplace_back(pos, limit);
     }
-
     return res;
 }
-#endif
 
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & excluded_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        const bool sequential = llama_mmap::use_sequential_file_advice(excluded_ranges);
+        const bool sequential = llama_mmap::use_sequential_file_advice(strict_exclusion);
         const int file_advice = sequential ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM;
         const int advice_error = posix_fadvise(fd, 0, 0, file_advice);
         if (advice_error) {
@@ -521,10 +519,9 @@ struct llama_mmap::impl {
             }
         };
 
-        if (prefetch > 0) {
-            for (const auto & range : ranges_complement(excluded_ranges, std::min(file->size(), prefetch))) {
-                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
-            }
+        for (const auto & range :
+                llama_mmap::planned_prefetch_ranges(file->size(), prefetch, excluded_ranges, strict_exclusion)) {
+            advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
         }
         for (const auto & range : excluded_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
@@ -597,7 +594,8 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & excluded_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
         GGML_UNUSED(numa);
 
         size = file->size();
@@ -628,7 +626,8 @@ struct llama_mmap::impl {
 
             if (pPrefetchVirtualMemory) {
                 std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-                for (const auto & range : ranges_complement(excluded_ranges, std::min(size, prefetch))) {
+                for (const auto & range :
+                        llama_mmap::planned_prefetch_ranges(size, prefetch, excluded_ranges, strict_exclusion)) {
                     WIN32_MEMORY_RANGE_ENTRY entry;
                     entry.VirtualAddress = (char *) addr + range.first;
                     entry.NumberOfBytes  = (SIZE_T) (range.second - range.first);
@@ -666,11 +665,13 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & excluded_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(excluded_ranges);
+        GGML_UNUSED(strict_exclusion);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -688,11 +689,20 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & excluded_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges)) {}
+        const ranges & excluded_ranges, bool strict_exclusion) :
+    pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges, strict_exclusion)) {}
 llama_mmap::~llama_mmap() = default;
 
-bool llama_mmap::use_sequential_file_advice(const ranges & excluded_ranges) {
-    return excluded_ranges.empty();
+bool llama_mmap::use_sequential_file_advice(bool strict_exclusion) {
+    return !strict_exclusion;
+}
+
+llama_mmap::ranges llama_mmap::planned_prefetch_ranges(
+        size_t file_size, size_t prefetch, const ranges & excluded_ranges, bool strict_exclusion) {
+    if (strict_exclusion || prefetch == 0) {
+        return {};
+    }
+    return ranges_complement(excluded_ranges, std::min(file_size, prefetch));
 }
 
 size_t llama_mmap::size() const { return pimpl->size; }

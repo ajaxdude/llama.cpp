@@ -1492,7 +1492,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const auto & external_ranges = external.for_file(idx);
             excluded.insert(excluded.end(), external_ranges.begin(), external_ranges.end());
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, excluded);
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(
+                    file.get(), prefetch_size, is_numa, excluded, !external_ranges.empty());
             for (const auto & range : external_ranges) {
                 mapping->unmap_fragment(range.first, range.second);
             }

@@ -49,7 +49,7 @@ struct llama_mmap {
 
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & excluded_ranges = {});
+               const ranges & excluded_ranges = {}, bool strict_exclusion = false);
     ~llama_mmap();
 
     size_t size() const;
@@ -58,7 +58,9 @@ struct llama_mmap {
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
-    static bool use_sequential_file_advice(const ranges & excluded_ranges);
+    static bool use_sequential_file_advice(bool strict_exclusion);
+    static ranges planned_prefetch_ranges(
+            size_t file_size, size_t prefetch, const ranges & excluded_ranges, bool strict_exclusion);
 
 private:
     struct impl;

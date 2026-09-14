@@ -224,8 +224,24 @@ void test_alignment_and_large_offsets() {
 }
 
 void test_external_mapping_access_policy() {
-    REQUIRE(llama_mmap::use_sequential_file_advice({}));
-    REQUIRE(!llama_mmap::use_sequential_file_advice({ { 4096, 8192 } }));
+    const size_t page = 4096;
+    const llama_mmap::ranges external = {
+        { 0, page },
+        { 2 * page + 1, 4 * page - 1 },
+        { 5 * page, 6 * page },
+        { 7 * page, 8 * page },
+        { 9 * page, 10 * page },
+    };
+
+    REQUIRE(llama_mmap::use_sequential_file_advice(false));
+    REQUIRE(!llama_mmap::use_sequential_file_advice(true));
+    REQUIRE(llama_mmap::planned_prefetch_ranges(10 * page, 10 * page, external, true).empty());
+    REQUIRE(llama_mmap::planned_prefetch_ranges(10 * page, 10 * page, external, true).empty());
+
+    const auto lazy_ranges = llama_mmap::planned_prefetch_ranges(10 * page, 10 * page, external, false);
+    REQUIRE(lazy_ranges.size() == 4);
+    REQUIRE(lazy_ranges.front() == std::make_pair(page, 2 * page + 1));
+    REQUIRE(lazy_ranges.back() == std::make_pair(8 * page, 9 * page));
 }
 
 void test_published_layout_accounting() {
