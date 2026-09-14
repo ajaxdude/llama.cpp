@@ -143,6 +143,7 @@ class TraceError(RuntimeError):
 
 
 PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS = 5
+PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES = 65536
 PROCESS_TREE_TERM_GRACE_SECONDS = 1
 WINDOWS_CREATE_SUSPENDED = 0x00000004
 WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -932,10 +933,11 @@ class _LinuxNativeHelperProcess:
 
     def _receive_protocol(self, expected: bytes, *, receive_pidfd: bool = False) -> None:
         item_size = array.array("i").itemsize
+        requested_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
         data, ancillary, flags, _address = self._protocol_socket.recvmsg(
             128,
             socket.CMSG_SPACE(item_size),
-            getattr(socket, "MSG_CMSG_CLOEXEC", 0),
+            requested_flags,
         )
         received = []
         for level, kind, content in ancillary:
@@ -943,7 +945,8 @@ class _LinuxNativeHelperProcess:
                 descriptor_bytes = array.array("i")
                 descriptor_bytes.frombytes(content[:item_size])
                 received.extend(descriptor_bytes)
-        if flags != 0 or data != expected:
+        allowed_flags = {0, requested_flags}
+        if flags not in allowed_flags or data != expected:
             for descriptor in received:
                 os.close(descriptor)
             raise TraceError(
@@ -1016,6 +1019,35 @@ class _LinuxNativeHelperProcess:
                 ))
             setattr(self, attribute, None)
         return failures
+
+    def collect_startup_stderr(self) -> tuple[bytes, list[_IntegrityFailure]]:
+        if self._stderr_fd is None:
+            return b"", []
+        descriptor = self._stderr_fd
+        self._stderr_fd = None
+        data = bytearray()
+        failures = []
+        try:
+            while len(data) <= PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES + 1 - len(data),
+                )
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) > PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES:
+                failures.append(_IntegrityFailure(
+                    "linux-helper-stderr-bounds",
+                    TraceError("Linux helper startup stderr exceeded its bound"),
+                ))
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-helper-stderr-read", error))
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            failures.append(_IntegrityFailure("linux-process-fd-close:stderr", error))
+        return bytes(data[:PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES]), failures
 
     def poll(self) -> int | None:
         if self.returncode is not None:
@@ -1400,6 +1432,7 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
         return containment
     except BaseException as primary_error:
         failures = []
+        startup_stderr = b""
         if isinstance(primary_error, ExecutionIntegrityError):
             failures.extend(primary_error.secondary_errors)
             primary_error = primary_error.primary_error or primary_error
@@ -1416,6 +1449,9 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
             else:
                 cleanup = process.abort_blocked()
             failures.extend(cleanup.failures)
+            if cleanup.quiescence_proven:
+                startup_stderr, stderr_failures = process.collect_startup_stderr()
+                failures.extend(stderr_failures)
             close_failures = _close_process_containment(
                 failed_containment,
                 quiescence_proven=cleanup.quiescence_proven,
@@ -1426,7 +1462,9 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
         if failures:
             raise ExecutionIntegrityError(
                 f"Linux containment startup primary failure "
-                f"[{type(primary_error).__name__}: {primary_error}]; "
+                f"[{type(primary_error).__name__}: {primary_error}]"
+                + (f"; helper stderr {startup_stderr!r}" if startup_stderr else "")
+                + "; "
                 f"secondary integrity failures: {_format_integrity_failures(failures)}",
                 primary_error=primary_error,
                 secondary_errors=failures,
@@ -1435,7 +1473,8 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
         if process is not None:
             raise ExecutionIntegrityError(
                 f"Linux containment startup primary failure "
-                f"[{type(primary_error).__name__}: {primary_error}]",
+                f"[{type(primary_error).__name__}: {primary_error}]"
+                + (f"; helper stderr {startup_stderr!r}" if startup_stderr else ""),
                 primary_error=primary_error,
                 secondary_errors=[],
                 quiescence_proven=False,

@@ -3,6 +3,7 @@
 #endif
 
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <csignal>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
+#include <linux/magic.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/securebits.h>
@@ -34,6 +36,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -121,11 +124,115 @@ options parse_options(int argc, char ** argv) {
 
 #if defined(__linux__)
 
-bool retained_fd(int fd, const std::vector<int> & keep_fds, int extra_fd) {
+constexpr uint32_t DIAGNOSTIC_MAGIC = 0x44535634U;
+constexpr uint16_t DIAGNOSTIC_VERSION = 1;
+constexpr size_t DIAGNOSTIC_STAGE_CAPACITY = 48;
+
+struct failure_diagnostic {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t stage_size;
+    int32_t error_number;
+    char stage[DIAGNOSTIC_STAGE_CAPACITY];
+};
+
+static_assert(sizeof(failure_diagnostic) <= PIPE_BUF);
+
+void close_checked(int fd, const char * label);
+
+void report_failure(int fd, const char * stage, int error_number) noexcept {
+    const int saved_errno = errno;
+    failure_diagnostic record {};
+    record.magic = DIAGNOSTIC_MAGIC;
+    record.version = DIAGNOSTIC_VERSION;
+    record.error_number = error_number;
+    while (record.stage_size < DIAGNOSTIC_STAGE_CAPACITY &&
+            stage[record.stage_size] != '\0') {
+        record.stage[record.stage_size] = stage[record.stage_size];
+        ++record.stage_size;
+    }
+    ssize_t written;
+    do {
+        written = write(fd, &record, sizeof(record));
+    } while (written < 0 && errno == EINTR);
+    errno = saved_errno;
+}
+
+[[noreturn]] void fail_stage(
+        int diagnostic_fd,
+        const char * stage,
+        int error_number,
+        int exit_code = 125) noexcept {
+    report_failure(diagnostic_fd, stage, error_number);
+    _exit(exit_code);
+}
+
+std::string receive_failure_diagnostics(int fd) {
+    std::string result;
+    for (size_t count = 0; count < 8; ++count) {
+        failure_diagnostic record {};
+        ssize_t size;
+        do {
+            size = read(fd, &record, sizeof(record));
+        } while (size < 0 && errno == EINTR);
+        if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        if (size == 0) {
+            break;
+        }
+        if (size != static_cast<ssize_t>(sizeof(record)) ||
+                record.magic != DIAGNOSTIC_MAGIC ||
+                record.version != DIAGNOSTIC_VERSION ||
+                record.stage_size == 0 ||
+                record.stage_size > DIAGNOSTIC_STAGE_CAPACITY) {
+            if (!result.empty()) {
+                result += "; ";
+            }
+            result += "invalid setup diagnostic";
+            continue;
+        }
+        if (!result.empty()) {
+            result += "; ";
+        }
+        result += "stage=";
+        result.append(record.stage, record.stage_size);
+        result += " errno=" + std::to_string(record.error_number);
+        if (record.error_number != 0) {
+            result += " (";
+            result += std::strerror(record.error_number);
+            result += ")";
+        }
+    }
+    return result;
+}
+
+[[noreturn]] void throw_setup_failure(int diagnostic_fd, const char * fallback) {
+    const std::string diagnostic = receive_failure_diagnostics(diagnostic_fd);
+    const int close_result = close(diagnostic_fd);
+    const int close_error = close_result == 0 ? 0 : errno;
+    std::string message = fallback;
+    if (!diagnostic.empty()) {
+        message += ": " + diagnostic;
+    }
+    if (close_error != 0) {
+        message += "; diagnostics-close errno=" + std::to_string(close_error);
+        message += " (";
+        message += std::strerror(close_error);
+        message += ")";
+    }
+    throw std::runtime_error(message);
+}
+
+bool retained_fd(
+        int fd,
+        const std::vector<int> & keep_fds,
+        int extra_fd,
+        int second_extra_fd = -1) {
     if (fd >= 0 && fd <= STDERR_FILENO) {
         return true;
     }
-    if (fd == extra_fd) {
+    if (fd == extra_fd || fd == second_extra_fd) {
         return true;
     }
     for (int keep_fd : keep_fds) {
@@ -142,7 +249,10 @@ void close_checked(int fd, const char * label) {
     }
 }
 
-void close_unneeded_fds(const std::vector<int> & keep_fds, int extra_fd) {
+void close_unneeded_fds(
+        const std::vector<int> & keep_fds,
+        int extra_fd,
+        int second_extra_fd = -1) {
     DIR * directory = opendir("/proc/self/fd");
     if (directory == nullptr) {
         throw std::runtime_error("cannot open procfs descriptor directory");
@@ -156,12 +266,29 @@ void close_unneeded_fds(const std::vector<int> & keep_fds, int extra_fd) {
             continue;
         }
         const int fd = static_cast<int>(parsed);
-        if (fd != directory_fd && !retained_fd(fd, keep_fds, extra_fd)) {
+        if (fd != directory_fd &&
+                !retained_fd(fd, keep_fds, extra_fd, second_extra_fd)) {
             close_checked(fd, "unneeded descriptor");
         }
     }
     if (closedir(directory) != 0) {
         throw std::runtime_error("cannot close procfs descriptor directory");
+    }
+}
+
+void verify_private_procfs() {
+    struct statfs filesystem {};
+    if (statfs("/proc", &filesystem) != 0) {
+        throw std::runtime_error("cannot inspect private procfs");
+    }
+    if (static_cast<unsigned long>(filesystem.f_type) !=
+            static_cast<unsigned long>(PROC_SUPER_MAGIC)) {
+        throw std::runtime_error("private procfs has an unexpected filesystem type");
+    }
+    char self_target[32] {};
+    const ssize_t size = readlink("/proc/self", self_target, sizeof(self_target));
+    if (size != 1 || self_target[0] != '1') {
+        throw std::runtime_error("private procfs is not bound to the target PID namespace");
     }
 }
 
@@ -796,38 +923,74 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         int ready_fd,
         int security_fd,
         int namespace_ready_fd,
+        int diagnostic_fd,
         const options & config) {
+    const char * stage = "target-parent-death";
     try {
+        errno = 0;
         set_parent_death(1);
+        stage = "target-session";
+        errno = 0;
         make_isolated_session();
+        stage = "target-namespace-ready-close";
+        errno = 0;
         close_checked(namespace_ready_fd, "target namespace readiness descriptor");
+        stage = "target-bound";
+        errno = 0;
         write_all(ready_fd, "B", 1);
+        stage = "target-mapping-read";
         char mapped = 0;
         ssize_t mapped_size;
         do {
             mapped_size = read(mapping_fd, &mapped, 1);
         } while (mapped_size < 0 && errno == EINTR);
         if (mapped_size != 1 || mapped != 'M') {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, mapped_size < 0 ? errno : 0);
         }
+        stage = "target-mapping-close";
+        errno = 0;
         close_checked(mapping_fd, "target mapping descriptor");
+        stage = "target-privilege-drop";
+        errno = 0;
         const int listener = drop_target_privileges();
+        stage = "target-filter-send";
+        errno = 0;
         send_descriptor(security_fd, "FILTER", listener);
+        stage = "target-listener-close";
+        errno = 0;
         close_checked(listener, "target seccomp listener");
+        stage = "target-isolation-probes";
+        errno = 0;
         verify_target_attack_denials();
+        stage = "target-verified-send";
+        errno = 0;
         send_packet(security_fd, "VERIFIED");
+        stage = "target-go-read";
+        errno = 0;
         if (receive_packet(security_fd) != "GO") {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, 0);
         }
+        stage = "target-security-close";
+        errno = 0;
         close_checked(security_fd, "target security descriptor");
+        stage = "target-parent-death-verify";
+        errno = 0;
         require_parent_death(1);
-        close_unneeded_fds(config.keep_fds, ready_fd);
+        stage = "target-fd-close";
+        errno = 0;
+        close_unneeded_fds(config.keep_fds, ready_fd, diagnostic_fd);
+        stage = "target-isolation-ready";
+        errno = 0;
         write_all(ready_fd, "I", 1);
+        stage = "target-ready-close";
+        errno = 0;
         close_checked(ready_fd, "target readiness descriptor");
+        stage = "target-exec";
+        errno = 0;
         execve(config.exec_path.c_str(), config.target_argv.data(), environ);
-        _exit(127);
+        fail_stage(diagnostic_fd, stage, errno, 127);
     } catch (...) {
-        _exit(125);
+        fail_stage(diagnostic_fd, stage, errno);
     }
 }
 
@@ -835,129 +998,238 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         int release_fd,
         int ready_fd,
         int mapping_fd,
+        int diagnostic_fd,
         int protocol_fd,
         int helper_pidfd,
         const options & config) {
+    const char * stage = "namespace-parent-death";
     try {
+        errno = 0;
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, errno);
         }
+        stage = "namespace-parent-identity";
+        errno = 0;
         if (getppid() != 0 || pidfd_has_exited(helper_pidfd)) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, 0);
         }
+        stage = "namespace-helper-pidfd-close";
+        errno = 0;
         close_checked(helper_pidfd, "namespace helper pidfd");
+        stage = "namespace-protocol-close";
+        errno = 0;
         close_checked(protocol_fd, "namespace protocol descriptor");
+        stage = "namespace-bound";
+        errno = 0;
         write_all(ready_fd, "B", 1);
+        stage = "namespace-mapping-read";
         char mapped = 0;
         ssize_t mapped_size;
         do {
             mapped_size = read(mapping_fd, &mapped, 1);
         } while (mapped_size < 0 && errno == EINTR);
         if (mapped_size != 1 || mapped != 'M') {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, mapped_size < 0 ? errno : 0);
         }
+        stage = "namespace-mapping-close";
+        errno = 0;
         close_checked(mapping_fd, "namespace mapping descriptor");
-        if (setresgid(0, 0, 0) != 0 || setresuid(0, 0, 0) != 0) {
-            _exit(125);
+        stage = "namespace-setresgid";
+        errno = 0;
+        if (setresgid(0, 0, 0) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
         }
-        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0 ||
-                umount2("/proc", MNT_DETACH) != 0 ||
-                mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
-            _exit(125);
+        stage = "namespace-setresuid";
+        errno = 0;
+        if (setresuid(0, 0, 0) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
         }
+        stage = "namespace-mount-private";
+        errno = 0;
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
+        stage = "namespace-unmount-proc";
+        errno = 0;
+        if (umount2("/proc", MNT_DETACH) != 0 && errno != EINVAL) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
+        stage = "namespace-mount-proc";
+        errno = 0;
+        if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
+        stage = "namespace-verify-proc";
+        errno = 0;
+        verify_private_procfs();
+        stage = "namespace-protect-init";
+        errno = 0;
         protect_namespace_init();
+        stage = "namespace-ready";
+        errno = 0;
         write_all(ready_fd, "R", 1);
+        stage = "namespace-release-read";
         char release = 0;
         ssize_t received;
         do {
             received = read(release_fd, &release, 1);
         } while (received < 0 && errno == EINTR);
         if (received != 1 || release != 'X') {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, received < 0 ? errno : 0);
         }
+        stage = "namespace-release-close";
+        errno = 0;
         close_checked(release_fd, "namespace release descriptor");
+        stage = "namespace-setgroups";
+        errno = 0;
         if (setgroups(0, nullptr) != 0) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, errno);
         }
         int target_mapping_pipe[2] {-1, -1};
         int target_ready_pipe[2] {-1, -1};
         int target_security[2] {-1, -1};
-        if (pipe2(target_mapping_pipe, O_CLOEXEC) != 0 ||
-                pipe2(target_ready_pipe, O_CLOEXEC) != 0 ||
-                socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, target_security) != 0) {
-            _exit(125);
+        stage = "namespace-target-mapping-pipe";
+        errno = 0;
+        if (pipe2(target_mapping_pipe, O_CLOEXEC) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
+        stage = "namespace-target-ready-pipe";
+        errno = 0;
+        if (pipe2(target_ready_pipe, O_CLOEXEC) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
+        stage = "namespace-target-security-socket";
+        errno = 0;
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, target_security) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
         }
         int target_pidfd = -1;
         clone_args target_arguments {};
         target_arguments.flags = CLONE_NEWUSER | CLONE_PIDFD;
         target_arguments.pidfd = reinterpret_cast<uintptr_t>(&target_pidfd);
         target_arguments.exit_signal = SIGCHLD;
+        stage = "namespace-target-clone";
+        errno = 0;
         const pid_t target_pid = static_cast<pid_t>(
             syscall(SYS_clone3, &target_arguments, sizeof(target_arguments)));
         if (target_pid < 0) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, errno);
         }
         if (target_pid == 0) {
+            stage = "target-handoff-close";
+            errno = 0;
             close_checked(target_mapping_pipe[1], "target mapping writer");
             close_checked(target_ready_pipe[0], "target readiness reader");
             close_checked(target_security[0], "target security supervisor descriptor");
             run_target_bootstrap(
                 target_mapping_pipe[0], target_ready_pipe[1],
-                target_security[1], ready_fd, config);
+                target_security[1], ready_fd, diagnostic_fd, config);
         }
         namespace_owner owned_target(target_pid, target_pidfd);
+        stage = "namespace-target-parent-close";
+        errno = 0;
         close_checked(target_mapping_pipe[0], "namespace target mapping reader");
         close_checked(target_ready_pipe[1], "namespace target readiness writer");
         close_checked(target_security[1], "namespace target security descriptor");
+        stage = "namespace-target-bound-read";
         char target_ready = 0;
         ssize_t target_ready_size;
         do {
             target_ready_size = read(target_ready_pipe[0], &target_ready, 1);
         } while (target_ready_size < 0 && errno == EINTR);
         if (target_ready_size != 1 || target_ready != 'B') {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, target_ready_size < 0 ? errno : 0);
         }
+        stage = "namespace-target-process-open";
+        errno = 0;
         const std::string target_process_path = "/proc/" + std::to_string(target_pid);
         const int target_process_directory = open(
             target_process_path.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (target_process_directory < 0 || pidfd_has_exited(target_pidfd)) {
-            _exit(125);
+            fail_stage(
+                diagnostic_fd, stage,
+                target_process_directory < 0 ? errno : 0);
         }
+        stage = "namespace-target-map-setgroups";
+        errno = 0;
         write_mapping_file(target_process_directory, "setgroups", "deny\n");
+        stage = "namespace-target-map-uid";
+        errno = 0;
         write_mapping_file(target_process_directory, "uid_map", "65534 0 1\n");
+        stage = "namespace-target-map-gid";
+        errno = 0;
         write_mapping_file(target_process_directory, "gid_map", "65534 0 1\n");
+        stage = "namespace-target-process-close";
+        errno = 0;
         close_checked(target_process_directory, "target process directory");
+        stage = "namespace-target-mapping-release";
+        errno = 0;
         write_all(target_mapping_pipe[1], "M", 1);
+        stage = "namespace-target-mapping-close";
+        errno = 0;
         close_checked(target_mapping_pipe[1], "namespace target mapping writer");
+        stage = "namespace-target-filter-receive";
+        errno = 0;
         const int target_listener = receive_descriptor(target_security[0], "FILTER");
+        stage = "namespace-target-probe-verify";
+        errno = 0;
         verify_target_isolation_probes(target_listener);
+        stage = "namespace-target-verified-read";
+        errno = 0;
         if (receive_packet(target_security[0]) != "VERIFIED") {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, 0);
         }
+        stage = "namespace-parent-death-verify";
+        errno = 0;
         require_parent_death(0);
+        stage = "namespace-identity-verify";
+        errno = 0;
         if (prctl(PR_GET_DUMPABLE) != 0 ||
                 getsid(0) != getpid() || getpgrp() != getpid()) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, errno);
         }
+        stage = "namespace-target-go";
+        errno = 0;
         send_packet(target_security[0], "GO");
+        stage = "namespace-target-security-close";
+        errno = 0;
         close_checked(target_security[0], "namespace target security supervisor descriptor");
+        stage = "namespace-target-isolation-read";
         do {
             target_ready_size = read(target_ready_pipe[0], &target_ready, 1);
         } while (target_ready_size < 0 && errno == EINTR);
+        stage = "namespace-target-ready-close";
+        errno = 0;
         close_checked(target_ready_pipe[0], "namespace target readiness reader");
+        stage = "namespace-parent-death-reverify";
+        errno = 0;
         require_parent_death(0);
+        stage = "namespace-target-isolation-verify";
+        errno = 0;
         if (prctl(PR_GET_DUMPABLE) != 0 ||
                 getsid(0) != getpid() || getpgrp() != getpid() ||
                 target_ready_size != 1 || target_ready != 'I') {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, 0);
         }
+        stage = "namespace-isolation-ready";
+        errno = 0;
         write_all(ready_fd, "I", 1);
+        stage = "namespace-target-wait";
+        errno = 0;
         const int target_status = wait_for_isolated_target(owned_target, target_listener);
+        stage = "namespace-listener-close";
+        errno = 0;
         close_checked(target_listener, "namespace target seccomp listener");
+        stage = "namespace-target-pidfd-close";
+        errno = 0;
         owned_target.close_pidfd();
+        stage = "namespace-descendant-kill";
+        errno = 0;
         if (kill(-1, SIGKILL) != 0 && errno != ESRCH) {
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, errno);
         }
+        stage = "namespace-descendant-reap";
+        errno = 0;
         while (true) {
             const pid_t reaped = waitpid(-1, nullptr, 0);
             if (reaped > 0 || (reaped < 0 && errno == EINTR)) {
@@ -966,13 +1238,17 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
             if (reaped < 0 && errno == ECHILD) {
                 break;
             }
-            _exit(125);
+            fail_stage(diagnostic_fd, stage, reaped < 0 ? errno : 0);
         }
+        stage = "namespace-complete";
+        errno = 0;
         write_all(ready_fd, "C", 1);
+        stage = "namespace-ready-close";
+        errno = 0;
         close_checked(ready_fd, "namespace readiness descriptor");
         _exit(wait_status_exit_code(target_status));
     } catch (...) {
-        _exit(125);
+        fail_stage(diagnostic_fd, stage, errno);
     }
 }
 
@@ -1004,6 +1280,16 @@ int run_linux_helper(options config) {
         close(ready_pipe[1]);
         throw std::runtime_error("cannot create namespace mapping pipe");
     }
+    int diagnostic_pipe[2] {-1, -1};
+    if (pipe2(diagnostic_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+        close(release_pipe[0]);
+        close(release_pipe[1]);
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(mapping_pipe[0]);
+        close(mapping_pipe[1]);
+        throw std::runtime_error("cannot create namespace diagnostic pipe");
+    }
     const int helper_pidfd = static_cast<int>(syscall(SYS_pidfd_open, getpid(), 0));
     if (helper_pidfd < 0) {
         close(release_pipe[0]);
@@ -1012,6 +1298,8 @@ int run_linux_helper(options config) {
         close(ready_pipe[1]);
         close(mapping_pipe[0]);
         close(mapping_pipe[1]);
+        close(diagnostic_pipe[0]);
+        close(diagnostic_pipe[1]);
         throw std::runtime_error("cannot open stable helper identity");
     }
     int namespace_pidfd = -1;
@@ -1028,28 +1316,54 @@ int run_linux_helper(options config) {
         close(ready_pipe[1]);
         close(mapping_pipe[0]);
         close(mapping_pipe[1]);
+        close(diagnostic_pipe[0]);
+        close(diagnostic_pipe[1]);
         close(helper_pidfd);
         throw std::runtime_error(std::string("cannot create target PID namespace: ") + std::strerror(errno));
     }
     if (namespace_init == 0) {
-        close_checked(release_pipe[1], "namespace release writer");
-        close_checked(ready_pipe[0], "namespace readiness reader");
-        close_checked(mapping_pipe[1], "namespace mapping writer");
+        if (close(release_pipe[1]) != 0) {
+            fail_stage(
+                diagnostic_pipe[1],
+                "namespace-release-writer-close",
+                errno);
+        }
+        if (close(ready_pipe[0]) != 0) {
+            fail_stage(
+                diagnostic_pipe[1],
+                "namespace-ready-reader-close",
+                errno);
+        }
+        if (close(mapping_pipe[1]) != 0) {
+            fail_stage(
+                diagnostic_pipe[1],
+                "namespace-mapping-writer-close",
+                errno);
+        }
+        if (close(diagnostic_pipe[0]) != 0) {
+            fail_stage(
+                diagnostic_pipe[1],
+                "namespace-diagnostic-reader-close",
+                errno);
+        }
         run_namespace_init(
-            release_pipe[0], ready_pipe[1], mapping_pipe[0],
+            release_pipe[0], ready_pipe[1], mapping_pipe[0], diagnostic_pipe[1],
             config.protocol_fd, helper_pidfd, config);
     }
     namespace_owner owned_namespace(namespace_init, namespace_pidfd);
     close_checked(release_pipe[0], "helper release reader");
     close_checked(ready_pipe[1], "helper readiness writer");
     close_checked(mapping_pipe[0], "helper mapping reader");
+    close_checked(diagnostic_pipe[1], "helper diagnostic writer");
     char ready = 0;
     ssize_t ready_size;
     do {
         ready_size = read(ready_pipe[0], &ready, 1);
     } while (ready_size < 0 && errno == EINTR);
     if (ready_size != 1 || ready != 'B') {
-        throw std::runtime_error("target PID namespace did not bind helper lifetime");
+        throw_setup_failure(
+            diagnostic_pipe[0],
+            "target PID namespace did not bind helper lifetime");
     }
     const std::string process_path = "/proc/" + std::to_string(namespace_init);
     const int process_directory = open(
@@ -1075,7 +1389,9 @@ int run_linux_helper(options config) {
     } while (ready_size < 0 && errno == EINTR);
     close_checked(helper_pidfd, "helper self pidfd");
     if (ready_size != 1 || ready != 'R') {
-        throw std::runtime_error("target PID namespace setup did not complete");
+        throw_setup_failure(
+            diagnostic_pipe[0],
+            "target PID namespace setup did not complete");
     }
     send_descriptor(config.protocol_fd, "PREPARED", owned_namespace.pidfd());
     if (receive_packet(config.protocol_fd) != "EXEC") {
@@ -1087,7 +1403,9 @@ int run_linux_helper(options config) {
         ready_size = read(ready_pipe[0], &ready, 1);
     } while (ready_size < 0 && errno == EINTR);
     if (ready_size != 1 || ready != 'I') {
-        throw std::runtime_error("target privilege isolation did not complete");
+        throw_setup_failure(
+            diagnostic_pipe[0],
+            "target privilege isolation did not complete");
     }
     send_packet(config.protocol_fd, "RELEASED");
     const int status = owned_namespace.wait();
@@ -1096,8 +1414,11 @@ int run_linux_helper(options config) {
     } while (ready_size < 0 && errno == EINTR);
     close_checked(ready_pipe[0], "helper readiness reader");
     if (ready_size != 1 || ready != 'C') {
-        throw std::runtime_error("target namespace teardown did not complete");
+        throw_setup_failure(
+            diagnostic_pipe[0],
+            "target namespace teardown did not complete");
     }
+    close_checked(diagnostic_pipe[0], "helper diagnostics reader");
     owned_namespace.close_pidfd();
     send_packet(config.protocol_fd, "COMPLETE");
     return wait_status_exit_code(status);

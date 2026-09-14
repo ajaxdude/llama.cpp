@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import array
 import contextlib
 import copy
 import importlib.util
@@ -45,6 +46,96 @@ TEST_RUN_IDS = {
 TEST_CANDIDATE_EXPORTER_POLICY_ID = "test-candidate-exporter"
 TEST_DS4_EXPORTER_POLICY_ID = "test-ds4-exporter"
 TEST_PROMPT_BUILDER_POLICY_ID = "test-prompt-builder"
+NATIVE_TEST_STATE_PACKET_MAX_BYTES = 4096
+NATIVE_TEST_STATE_KEYS = frozenset({
+    "caps",
+    "gids",
+    "groups",
+    "no_new_privs",
+    "pgrp",
+    "pid",
+    "seccomp",
+    "securebits",
+    "sid",
+    "uids",
+})
+
+
+def receive_native_test_pidfd_packet(connection, max_payload_bytes):
+    import array
+    import socket
+
+    item_size = array.array("i").itemsize
+    requested_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+    data, ancillary, flags, _address = connection.recvmsg(
+        max_payload_bytes + 1,
+        socket.CMSG_SPACE(item_size),
+        requested_flags,
+    )
+    descriptors = []
+    try:
+        for level, kind, content in ancillary:
+            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                raise AssertionError("native test packet contained unexpected ancillary data")
+            descriptor_bytes = array.array("i")
+            descriptor_bytes.frombytes(content[:len(content) - len(content) % item_size])
+            descriptors.extend(descriptor_bytes)
+        truncation_flags = (
+            getattr(socket, "MSG_TRUNC", 0) |
+            getattr(socket, "MSG_CTRUNC", 0)
+        )
+        if flags & truncation_flags:
+            raise AssertionError("native test packet was truncated")
+        if flags not in {0, requested_flags}:
+            raise AssertionError(f"native test packet returned unexpected flags {flags}")
+        if len(data) > max_payload_bytes:
+            raise AssertionError("native test packet exceeded its bounded payload")
+        if len(descriptors) != 1:
+            raise AssertionError("native test packet did not provide exactly one pidfd")
+        return data, descriptors.pop()
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+def decode_native_test_report(data):
+    if len(data) > NATIVE_TEST_STATE_PACKET_MAX_BYTES:
+        raise AssertionError("native test report exceeded its bounded payload")
+    try:
+        decoded = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise AssertionError("native test report was not ASCII") from error
+    label, separator, payload = decoded.partition(":")
+    if label == "descendant":
+        if separator or payload:
+            raise AssertionError("descendant report contained an unexpected payload")
+        return label, None
+    if label != "target" or not separator or not payload:
+        raise AssertionError("native test report had an invalid label or payload")
+    try:
+        state = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise AssertionError("native target state was not valid JSON") from error
+    if not isinstance(state, dict) or set(state) != NATIVE_TEST_STATE_KEYS:
+        raise AssertionError("native target state schema did not match")
+    return label, state
+
+
+def finish_native_test_supervisor(supervisor, *, kill_if_running):
+    try:
+        if kill_if_running and supervisor.poll() is None:
+            supervisor.kill()
+        _stdout, stderr = supervisor.communicate(timeout=5)
+        return supervisor.returncode, stderr or ""
+    except subprocess.TimeoutExpired:
+        if supervisor.poll() is None:
+            supervisor.kill()
+        supervisor.communicate(timeout=5)
+        raise
+    finally:
+        for stream in (supervisor.stdin, supervisor.stdout, supervisor.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 WATCHDOG_EVENTS = [
     {
@@ -2771,6 +2862,192 @@ class TraceFormatTests(unittest.TestCase):
         self.assertEqual(protocol.sendall.call_args_list, [mock.call(b"PREPARE")])
         self.assertIsNone(process.namespace_pidfd)
 
+    def test_linux_protocol_accepts_echoed_cmsg_cloexec(self) -> None:
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (b"READY", [], 1073741824, None)
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True):
+            process._receive_protocol(b"READY")
+        protocol.recvmsg.assert_called_once_with(
+            128,
+            trace.socket.CMSG_SPACE(array.array("i").itemsize),
+            1073741824,
+        )
+
+    def test_linux_protocol_rejects_truncation_and_unknown_flags(self) -> None:
+        for flags in (1073741824 | 32, 1073741824 | 8, 536870912):
+            with self.subTest(flags=flags):
+                protocol = mock.Mock()
+                protocol.recvmsg.return_value = (b"READY", [], flags, None)
+                process = trace._LinuxNativeHelperProcess(
+                    ["approved"],
+                    71,
+                    protocol_socket=protocol,
+                    stdin_fd=None,
+                    stdout_fd=None,
+                    stderr_fd=None,
+                )
+                with mock.patch.object(
+                        trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), self.assertRaisesRegex(
+                        trace.TraceError, "protocol expected READY"):
+                    process._receive_protocol(b"READY")
+
+    def test_native_pidfd_packet_rejects_truncation_unknown_flags_and_oversize(self) -> None:
+        import socket
+
+        item_size = array.array("i").itemsize
+        rights = array.array("i", [71]).tobytes()
+        cases = (
+            ((b"ready", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 1073741824 | 32, None), 5),
+            ((b"ready", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 536870912, None), 5),
+            ((b"ready!", [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)], 1073741824, None), 5),
+        )
+        for packet, bound in cases:
+            with self.subTest(flags=packet[2], size=len(packet[0])):
+                connection = mock.Mock()
+                connection.recvmsg.return_value = packet
+                with mock.patch(
+                        "socket.MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                        os, "close") as close, self.assertRaises(AssertionError):
+                    receive_native_test_pidfd_packet(connection, bound)
+                close.assert_called_once_with(71)
+                connection.recvmsg.assert_called_once_with(
+                    bound + 1,
+                    socket.CMSG_SPACE(item_size),
+                    1073741824,
+                )
+
+    def test_native_pidfd_packet_requires_one_descriptor(self) -> None:
+        import socket
+
+        rights = array.array("i", [71, 72]).tobytes()
+        connection = mock.Mock()
+        connection.recvmsg.return_value = (
+            b"ready",
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+            0,
+            None,
+        )
+        with mock.patch.object(os, "close") as close, self.assertRaisesRegex(
+                AssertionError, "exactly one pidfd"):
+            receive_native_test_pidfd_packet(connection, len(b"ready"))
+        self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+
+    def test_linux_protocol_startup_failure_reaps_and_closes_streams(self) -> None:
+        lock = mock.Mock()
+        lock.acquire.return_value = True
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=mock.Mock(),
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=84,
+        )
+        process.root_pidfd = 90
+        primary = trace.TraceError("protocol startup failed")
+        cleanup = trace._ContainmentCleanup([], True)
+        with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
+                trace, "_linux_require_pidfd_support"), mock.patch.object(
+                trace, "_linux_task_ids", return_value={1}), mock.patch.object(
+                trace, "_start_linux_native_helper_process", return_value=process), mock.patch.object(
+                process, "release_exec", side_effect=primary), mock.patch.object(
+                process, "abort_blocked", return_value=cleanup) as abort, mock.patch.object(
+                process, "collect_startup_stderr",
+                return_value=(b"stage=namespace-mount-proc errno=1\n", [])) as collect_stderr, mock.patch.object(
+                process, "close_streams", return_value=[]) as close_streams, mock.patch.object(
+                trace.os, "close"), self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            trace._start_linux_native_helper(["approved"], {})
+        self.assertIs(raised.exception.primary_error, primary)
+        self.assertFalse(raised.exception.quiescence_proven)
+        self.assertIn(
+            "helper stderr b'stage=namespace-mount-proc errno=1\\n'",
+            str(raised.exception),
+        )
+        abort.assert_called_once()
+        collect_stderr.assert_called_once()
+        close_streams.assert_called_once()
+        lock.release.assert_called_once()
+
+    def test_linux_startup_stderr_capture_is_bounded_and_closed(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"exact helper diagnostic\n")
+        os.close(write_fd)
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=mock.Mock(),
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=read_fd,
+        )
+        stderr, failures = process.collect_startup_stderr()
+        self.assertEqual(stderr, b"exact helper diagnostic\n")
+        self.assertEqual(failures, [])
+        self.assertIsNone(process._stderr_fd)
+        with self.assertRaises(OSError):
+            os.fstat(read_fd)
+
+        process._stderr_fd = 84
+        oversized = b"x" * (trace.PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES + 1)
+        with mock.patch.object(trace.os, "read", side_effect=[oversized]), mock.patch.object(
+                trace.os, "close") as close:
+            stderr, failures = process.collect_startup_stderr()
+        self.assertEqual(len(stderr), trace.PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES)
+        self.assertEqual(
+            [failure.component for failure in failures],
+            ["linux-helper-stderr-bounds"],
+        )
+        close.assert_called_once_with(84)
+
+    def test_native_test_report_is_bounded_and_schema_exact(self) -> None:
+        state = {
+            "uids": [65534] * 3,
+            "gids": [65534] * 3,
+            "groups": [],
+            "sid": 3,
+            "pgrp": 3,
+            "pid": 3,
+            "caps": ["0000000000000000"] * 5,
+            "no_new_privs": "1",
+            "seccomp": "2",
+            "securebits": 239,
+        }
+        encoded = (
+            "target:" + json.dumps(state, sort_keys=True, separators=(",", ":"))
+        ).encode("ascii")
+        self.assertEqual(decode_native_test_report(encoded), ("target", state))
+        self.assertEqual(decode_native_test_report(b"descendant"), ("descendant", None))
+        for invalid in (
+                b"x" * (NATIVE_TEST_STATE_PACKET_MAX_BYTES + 1),
+                b"target:{",
+                b"target:{}",
+                b"descendant:payload"):
+            with self.subTest(invalid=invalid[:32]), self.assertRaises(AssertionError):
+                decode_native_test_report(invalid)
+
+    def test_native_supervisor_stderr_is_preserved_and_closed(self) -> None:
+        supervisor = subprocess.Popen(
+            [sys.executable, "-c", "import sys;sys.stderr.write('helper failure')"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        returncode, stderr = finish_native_test_supervisor(
+            supervisor, kill_if_running=False)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr, "helper failure")
+        self.assertTrue(supervisor.stderr.closed)
+
     def test_linux_namespace_authority_precedes_release_completion(self) -> None:
         events = []
         lock = mock.Mock()
@@ -2824,6 +3101,115 @@ class TraceFormatTests(unittest.TestCase):
         self.assertIn("require_parent_death(0);", helper_source)
         self.assertIn("require_parent_death(1);", helper_source)
 
+    def test_linux_native_helper_source_reports_bounded_setup_diagnostics(self) -> None:
+        helper_source = (
+            Path(__file__).parents[1] /
+            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+        ).read_text(encoding="ascii")
+        diagnostic_source = helper_source[
+            helper_source.index("constexpr uint32_t DIAGNOSTIC_MAGIC"):
+            helper_source.index("bool retained_fd(")
+        ]
+        self.assertIn("constexpr size_t DIAGNOSTIC_STAGE_CAPACITY = 48;", diagnostic_source)
+        self.assertIn("static_assert(sizeof(failure_diagnostic) <= PIPE_BUF);", diagnostic_source)
+        self.assertIn("record.magic != DIAGNOSTIC_MAGIC", diagnostic_source)
+        self.assertIn("record.version != DIAGNOSTIC_VERSION", diagnostic_source)
+        self.assertIn("record.stage_size > DIAGNOSTIC_STAGE_CAPACITY", diagnostic_source)
+        self.assertIn("invalid setup diagnostic", diagnostic_source)
+        self.assertIn("count < 8", diagnostic_source)
+        self.assertIn("pipe2(diagnostic_pipe, O_CLOEXEC | O_NONBLOCK)", helper_source)
+        self.assertIn(
+            "run_namespace_init(\n"
+            "            release_pipe[0], ready_pipe[1], mapping_pipe[0], diagnostic_pipe[1],",
+            helper_source,
+        )
+        self.assertGreaterEqual(
+            helper_source.count("throw_setup_failure("),
+            5,
+        )
+        required_stages = {
+            "namespace-parent-death",
+            "namespace-parent-identity",
+            "namespace-mapping-read",
+            "namespace-setresgid",
+            "namespace-setresuid",
+            "namespace-mount-private",
+            "namespace-unmount-proc",
+            "namespace-mount-proc",
+            "namespace-verify-proc",
+            "namespace-protect-init",
+            "namespace-ready",
+            "target-parent-death",
+            "target-session",
+            "target-mapping-read",
+            "target-privilege-drop",
+            "target-isolation-probes",
+            "target-isolation-ready",
+            "target-exec",
+        }
+        stages = [
+            line.split('stage = "', 1)[1].split('"', 1)[0]
+            for line in helper_source.splitlines()
+            if 'stage = "' in line
+        ]
+        self.assertEqual(len(stages), len(set(stages)))
+        self.assertTrue(all(0 < len(stage) <= 48 for stage in stages))
+        self.assertTrue(all(
+            stage.startswith(("namespace-", "target-"))
+            for stage in stages
+        ))
+        for stage in required_stages:
+            self.assertIn(f'"{stage}"', helper_source)
+        child_source = helper_source[
+            helper_source.index("[[noreturn]] void run_target_bootstrap"):
+            helper_source.index("int run_linux_helper")
+        ]
+        self.assertNotIn("_exit(125)", child_source)
+        self.assertIn("fail_stage(diagnostic_fd, stage, errno);", child_source)
+
+    def test_linux_native_tests_do_not_hide_startup_failures(self) -> None:
+        source = (
+            inspect.getsource(self.test_linux_native_helper_parent_death_boundary) +
+            inspect.getsource(self.test_linux_native_helper_forbidden_operations_kill_namespace)
+        )
+        self.assertNotIn("skipTest(", source)
+        self.assertNotIn("'stderr':-3", source)
+        self.assertGreaterEqual(source.count("finish_native_test_supervisor("), 4)
+        self.assertGreaterEqual(source.count("self.fail("), 2)
+
+    def test_linux_native_helper_procfs_overmount_is_verified_and_fail_closed(self) -> None:
+        helper_source = (
+            Path(__file__).parents[1] /
+            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+        ).read_text(encoding="ascii")
+        setup_source = helper_source[
+            helper_source.index('stage = "namespace-mount-private"'):
+            helper_source.index('stage = "namespace-protect-init"')
+        ]
+        self.assertIn(
+            'umount2("/proc", MNT_DETACH) != 0 && errno != EINVAL',
+            setup_source,
+        )
+        self.assertIn(
+            'mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr)',
+            setup_source,
+        )
+        self.assertLess(
+            setup_source.index('stage = "namespace-unmount-proc"'),
+            setup_source.index('stage = "namespace-mount-proc"'),
+        )
+        self.assertLess(
+            setup_source.index('stage = "namespace-mount-proc"'),
+            setup_source.index("verify_private_procfs();"),
+        )
+        verification_source = helper_source[
+            helper_source.index("void verify_private_procfs()"):
+            helper_source.index("void require_initial_signal_state()")
+        ]
+        self.assertIn("PROC_SUPER_MAGIC", verification_source)
+        self.assertIn('readlink("/proc/self"', verification_source)
+        self.assertIn("size != 1 || self_target[0] != '1'", verification_source)
+
     @unittest.skipUnless(
         sys.platform == "linux" and os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER"),
         "native Linux containment helper was not executed on this host",
@@ -2875,7 +3261,7 @@ class TraceFormatTests(unittest.TestCase):
                 "'pass_fds':(target,),"
                 "'_containment_helper_path':f'/proc/self/fd/{helper_fd}',"
                 "'_containment_helper_descriptor':helper_fd,"
-                "'stdout':-3,'stderr':-3}\n"
+                "'stdout':-3}\n"
                 "containment=trace._start_linux_native_helper("
                 "[sys.executable,'-c',sys.argv[2],sys.argv[3],str(os.getpgrp())],launch)\n"
                 "while True: time.sleep(1)\n"
@@ -2892,6 +3278,7 @@ class TraceFormatTests(unittest.TestCase):
                 text=True,
             )
             pidfds = []
+            supervisor_reaped = False
             try:
                 labels = set()
                 target_state = None
@@ -2900,25 +3287,23 @@ class TraceFormatTests(unittest.TestCase):
                         connection, _address = listener.accept()
                     except TimeoutError:
                         if supervisor.poll() is not None:
-                            stderr = supervisor.stderr.read()
-                            self.skipTest(f"native PID namespace unavailable: {stderr.strip()}")
+                            returncode, stderr = finish_native_test_supervisor(
+                                supervisor, kill_if_running=False)
+                            supervisor_reaped = True
+                            self.fail(
+                                f"native helper failed before target report "
+                                f"(exit {returncode}); stderr={stderr!r}")
                         raise
                     with connection:
-                        descriptors = array.array("i")
-                        data, ancillary, flags, _address = connection.recvmsg(
-                            32, socket.CMSG_SPACE(descriptors.itemsize))
-                        self.assertEqual(flags, 0)
-                        for level, kind, content in ancillary:
-                            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                                descriptors.frombytes(content[:descriptors.itemsize])
-                        self.assertEqual(len(descriptors), 1)
-                        decoded = data.decode("ascii")
-                        label, separator, payload = decoded.partition(":")
+                        data, pidfd = receive_native_test_pidfd_packet(
+                            connection, NATIVE_TEST_STATE_PACKET_MAX_BYTES)
+                        pidfds.append(pidfd)
+                        label, state = decode_native_test_report(data)
                         labels.add(label)
-                        if separator:
-                            target_state = json.loads(payload)
-                        pidfds.append(descriptors[0])
+                        if state is not None:
+                            target_state = state
                 self.assertEqual(labels, {"target", "descendant"})
+                self.assertIsNotNone(target_state)
                 self.assertEqual(target_state["uids"], [65534] * 3)
                 self.assertEqual(target_state["gids"], [65534] * 3)
                 self.assertEqual(target_state["groups"], [])
@@ -2928,8 +3313,10 @@ class TraceFormatTests(unittest.TestCase):
                 self.assertEqual(target_state["no_new_privs"], "1")
                 self.assertEqual(target_state["seccomp"], "2")
                 self.assertEqual(target_state["securebits"], 239)
-                supervisor.kill()
-                supervisor.wait(timeout=5)
+                returncode, stderr = finish_native_test_supervisor(
+                    supervisor, kill_if_running=True)
+                supervisor_reaped = True
+                self.assertEqual(returncode, -trace.signal.SIGKILL, stderr)
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline and not all(
                         trace._linux_pidfd_has_exited(pidfd) for pidfd in pidfds):
@@ -2941,9 +3328,8 @@ class TraceFormatTests(unittest.TestCase):
                     if not trace._linux_pidfd_has_exited(pidfd):
                         trace._linux_signal_pidfd(pidfd, trace.signal.SIGKILL)
                     os.close(pidfd)
-                if supervisor.poll() is None:
-                    supervisor.kill()
-                    supervisor.wait(timeout=5)
+                if not supervisor_reaped:
+                    finish_native_test_supervisor(supervisor, kill_if_running=True)
                 listener.close()
 
     @unittest.skipUnless(
@@ -2990,7 +3376,7 @@ class TraceFormatTests(unittest.TestCase):
             "'pass_fds':(target,),"
             "'_containment_helper_path':f'/proc/self/fd/{helper_fd}',"
             "'_containment_helper_descriptor':helper_fd,"
-            "'stdout':-3,'stderr':-3}\n"
+            "'stdout':-3}\n"
             "containment=trace._start_linux_native_helper("
             "[sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4],"
             "str(os.getpgrp()),sys.argv[5]],launch)\n"
@@ -3040,26 +3426,27 @@ class TraceFormatTests(unittest.TestCase):
                         text=True,
                     )
                     target_pidfd = None
+                    supervisor_reaped = False
                     try:
                         try:
                             connection, _address = listener.accept()
                         except TimeoutError:
                             if supervisor.poll() is not None:
-                                stderr = supervisor.stderr.read()
-                                self.skipTest(
-                                    f"native PID namespace unavailable: {stderr.strip()}")
+                                returncode, stderr = finish_native_test_supervisor(
+                                    supervisor, kill_if_running=False)
+                                supervisor_reaped = True
+                                self.fail(
+                                    f"native helper failed before attack report "
+                                    f"(exit {returncode}); stderr={stderr!r}")
                             raise
                         with connection:
-                            descriptors = array.array("i")
-                            data, ancillary, flags, _address = connection.recvmsg(
-                                32, socket.CMSG_SPACE(descriptors.itemsize))
-                            self.assertEqual((data, flags), (b"ready", 0))
-                            for level, kind, content in ancillary:
-                                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                                    descriptors.frombytes(content[:descriptors.itemsize])
-                            self.assertEqual(len(descriptors), 1)
-                            target_pidfd = descriptors[0]
-                        self.assertEqual(supervisor.wait(timeout=10), 125)
+                            data, target_pidfd = receive_native_test_pidfd_packet(
+                                connection, len(b"ready"))
+                            self.assertEqual(data, b"ready")
+                        returncode, stderr = finish_native_test_supervisor(
+                            supervisor, kill_if_running=False)
+                        supervisor_reaped = True
+                        self.assertEqual(returncode, 125, stderr)
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline and not trace._linux_pidfd_has_exited(
                                 target_pidfd):
@@ -3071,9 +3458,8 @@ class TraceFormatTests(unittest.TestCase):
                             if not trace._linux_pidfd_has_exited(target_pidfd):
                                 trace._linux_signal_pidfd(target_pidfd, trace.signal.SIGKILL)
                             os.close(target_pidfd)
-                        if supervisor.poll() is None:
-                            supervisor.kill()
-                            supervisor.wait(timeout=5)
+                        if not supervisor_reaped:
+                            finish_native_test_supervisor(supervisor, kill_if_running=True)
                         listener.close()
 
     def test_linux_native_helper_stream_close_reports_every_failure(self) -> None:
