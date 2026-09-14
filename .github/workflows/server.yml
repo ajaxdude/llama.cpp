@@ -160,8 +160,77 @@ jobs:
           if missing:
               raise SystemExit(f"test-deepseek41-trace environment is incomplete: {missing}")
           PY
+          rm -rf build/deepseek-v41-trace-hook build/deepseek-v41-trace-marker
+          install -d -m 0700 build/deepseek-v41-trace-hook build/deepseek-v41-trace-marker
+          cat > build/deepseek-v41-trace-hook/sitecustomize.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import time
+          import unittest
+          from pathlib import Path
+
+          _TEST_CLASS = "TraceFormatTests"
+          _TEST_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
+          _TEST_ID = f"__main__.{_TEST_CLASS}.{_TEST_METHOD}"
+          _SOURCE = Path(os.environ["DSV41_CI_TEST_SOURCE"]).resolve(strict=True)
+          _MARKER_DIR = Path(os.environ["DSV41_CI_MARKER_DIR"]).resolve(strict=True)
+          _BINDINGS = (
+              "DSV41_NATIVE_TRACE_BINARY",
+              "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY",
+              "DSV41_NATIVE_INJECT_LIBRARY",
+          )
+          _ORIGINAL_CALL_TEST_METHOD = unittest.TestCase._callTestMethod
+
+          def _write_marker(path, payload):
+              descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              try:
+                  os.write(descriptor, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+
+          def _call_test_method(self, method):
+              function = getattr(method, "__func__", method)
+              code = getattr(function, "__code__", None)
+              source = Path(code.co_filename).resolve(strict=True) if code is not None else None
+              if self.__class__.__name__ == _TEST_CLASS and method.__name__ == _TEST_METHOD and source == _SOURCE:
+                  bindings = {}
+                  for name in _BINDINGS:
+                      value = os.environ.get(name)
+                      if not value:
+                          raise RuntimeError(f"missing {name} binding")
+                      bindings[name] = str(Path(value).resolve(strict=True))
+                  payload = {
+                      "bindings": bindings,
+                      "event": "test_method_entry",
+                      "first_line": code.co_firstlineno,
+                      "function": _TEST_METHOD,
+                      "pid": os.getpid(),
+                      "ppid": os.getppid(),
+                      "source": str(source),
+                      "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                      "test_id": self.id(),
+                      "timestamp_monotonic_ns": time.monotonic_ns(),
+                  }
+                  try:
+                      _write_marker(_MARKER_DIR / "entry.json", payload)
+                  except FileExistsError:
+                      duplicate = _MARKER_DIR / f"duplicate-{os.getpid()}-{time.monotonic_ns()}.json"
+                      _write_marker(duplicate, payload)
+                      raise RuntimeError(f"{_TEST_ID} entered more than once")
+              return _ORIGINAL_CALL_TEST_METHOD(self, method)
+
+          unittest.TestCase._callTestMethod = _call_test_method
+          PY
+          chmod 0444 build/deepseek-v41-trace-hook/sitecustomize.py
+          cmake -E sha256sum build/deepseek-v41-trace-hook/sitecustomize.py > build/deepseek-v41-trace-hook/sitecustomize.sha256
           : > build/test-deepseek41-trace-ctest.log
-          ctest --test-dir build \
+          PYTHONPATH="$PWD/build/deepseek-v41-trace-hook${PYTHONPATH:+:$PYTHONPATH}" \
+            DSV41_CI_MARKER_DIR="$PWD/build/deepseek-v41-trace-marker" \
+            DSV41_CI_TEST_SOURCE="$PWD/tests/test-deepseek41-trace.py" \
+            ctest --test-dir build \
             -R '^test-deepseek41-trace$' \
             --output-on-failure \
             --verbose \
@@ -169,6 +238,8 @@ jobs:
             --output-junit test-deepseek41-trace-ctest.xml \
             2>&1 | tee build/test-deepseek41-trace-ctest.log
           python3 - <<'PY'
+          import hashlib
+          import json
           from pathlib import Path
           from xml.etree import ElementTree
 
@@ -188,12 +259,6 @@ jobs:
           log = Path("build/test-deepseek41-trace-ctest.log").read_text(errors="replace")
           if "***Skipped" in log or "***Not Run" in log or "OK (skipped=" in log:
               raise SystemExit("test-deepseek41-trace contained a skipped or not-run test")
-          PY
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
 
           metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
           test = metadata["tests"][0]
@@ -204,29 +269,52 @@ jobs:
           environment = properties["ENVIRONMENT"]
           if isinstance(environment, str):
               environment = environment.split(";")
-          child_environment = dict(os.environ)
+          expected_bindings = {}
           for value in environment:
               name, setting = value.split("=", 1)
-              child_environment[name] = setting
+              if name.startswith("DSV41_NATIVE_"):
+                  expected_bindings[name] = str(Path(setting).resolve(strict=True))
+          if set(expected_bindings) != {
+              "DSV41_NATIVE_TRACE_BINARY",
+              "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY",
+              "DSV41_NATIVE_INJECT_LIBRARY",
+          }:
+              raise SystemExit("test-deepseek41-trace native bindings are invalid")
           test_name = "TraceFormatTests.test_native_watchdog_validation_crosses_private_pid_namespace"
-          result = subprocess.run(
-              [*test["command"], test_name, "--verbose"],
-              cwd=properties["WORKING_DIRECTORY"],
-              env=child_environment,
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              text=True,
-              check=False,
-          )
-          output = result.stdout
-          Path("build/test-deepseek41-trace-linux-pidns.log").write_text(output, encoding="utf-8")
-          print(output, end="")
-          if result.returncode != 0:
-              raise SystemExit(result.returncode)
-          if output.count("Ran 1 test") != 1 or test_name not in output:
-              raise SystemExit("private PID namespace/pidfd test count is not exactly one")
-          if "skipped" in output.lower() or not output.rstrip().endswith("OK"):
-              raise SystemExit("private PID namespace/pidfd test was skipped or did not pass")
+          marker_dir = Path("build/deepseek-v41-trace-marker")
+          entries = list(marker_dir.glob("entry.json"))
+          duplicates = list(marker_dir.glob("duplicate-*.json"))
+          unexpected = [
+              path
+              for path in marker_dir.iterdir()
+              if path not in entries and path not in duplicates
+          ]
+          if len(entries) != 1 or duplicates or unexpected:
+              raise SystemExit(
+                  f"private PID namespace/pidfd entry count is invalid: "
+                  f"entries={len(entries)} duplicates={len(duplicates)} unexpected={len(unexpected)}")
+          marker = json.loads(entries[0].read_text())
+          expected_source = Path("tests/test-deepseek41-trace.py").resolve(strict=True)
+          expected_marker = {
+              "bindings": expected_bindings,
+              "event": "test_method_entry",
+              "function": test_name.split(".", 1)[1],
+              "source": str(expected_source),
+              "source_sha256": hashlib.sha256(expected_source.read_bytes()).hexdigest(),
+              "test_id": f"__main__.{test_name}",
+          }
+          for name, value in expected_marker.items():
+              if marker.get(name) != value:
+                  raise SystemExit(f"private PID namespace/pidfd marker {name} is invalid")
+          if not isinstance(marker.get("first_line"), int) or marker["first_line"] <= 0:
+              raise SystemExit("private PID namespace/pidfd marker first_line is invalid")
+          if not isinstance(marker.get("pid"), int) or marker["pid"] <= 1:
+              raise SystemExit("private PID namespace/pidfd marker pid is invalid")
+          if not isinstance(marker.get("ppid"), int) or marker["ppid"] <= 0:
+              raise SystemExit("private PID namespace/pidfd marker ppid is invalid")
+          if not isinstance(marker.get("timestamp_monotonic_ns"), int) or marker["timestamp_monotonic_ns"] <= 0:
+              raise SystemExit("private PID namespace/pidfd marker timestamp is invalid")
           PY
 
       - name: Upload DeepSeek V4.1 trace CTest evidence
@@ -238,7 +326,9 @@ jobs:
             build/test-deepseek41-trace-ctest-metadata.json
             build/test-deepseek41-trace-ctest.log
             build/test-deepseek41-trace-ctest.xml
-            build/test-deepseek41-trace-linux-pidns.log
+            build/deepseek-v41-trace-hook/sitecustomize.py
+            build/deepseek-v41-trace-hook/sitecustomize.sha256
+            build/deepseek-v41-trace-marker/
           if-no-files-found: error
           retention-days: 7
 
