@@ -1622,6 +1622,101 @@ class TestWatchdogBehavior(unittest.TestCase):
         self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
         self.assertEqual(process.returncode, -signal.SIGKILL)
 
+    def test_cleanup_heartbeat_overrun_still_escalates_and_reaps(
+        self,
+    ) -> None:
+        class ReapingProcess(FakeProcess):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        class DelayedHeartbeatAudit(watchdog.AuditLogger):
+            def __init__(
+                self, clock: FakeClock, fail_heartbeat: bool
+            ) -> None:
+                self.output = io.StringIO()
+                super().__init__(self.output)
+                self.clock = clock
+                self.fail_heartbeat = fail_heartbeat
+
+            def heartbeat(self, sample: dict[str, object]) -> None:
+                self.clock.value += 0.11
+                if self.fail_heartbeat:
+                    raise watchdog.ArtifactError(
+                        "lease", "delayed heartbeat failed"
+                    )
+
+        for fail_heartbeat in (False, True):
+            with self.subTest(fail_heartbeat=fail_heartbeat):
+                clock = FakeClock()
+                process = ReapingProcess()
+                signals = []
+                sleep_calls = []
+                audit = DelayedHeartbeatAudit(
+                    clock, fail_heartbeat
+                )
+
+                def signal_group(
+                    process_group_id: int, signal_number: int
+                ) -> str:
+                    signals.append(signal_number)
+                    return (
+                        f"{signal.Signals(signal_number).name.lower()}_sent"
+                    )
+
+                def strict_sleep(seconds: float) -> None:
+                    self.assertGreaterEqual(seconds, 0)
+                    sleep_calls.append(seconds)
+                    clock.sleep(seconds)
+
+                result = watchdog._graceful_cleanup(
+                    audit,
+                    process,
+                    snapshot(50),
+                    50,
+                    "parent_signal",
+                    128 + signal.SIGTERM,
+                    "wrapper received SIGTERM",
+                    signal.SIGTERM,
+                    0.1,
+                    signal_group,
+                    lambda _process_group_id: (
+                        process.returncode is None
+                    ),
+                    clock.monotonic,
+                    strict_sleep,
+                )
+                records = [
+                    json.loads(line)
+                    for line in audit.output.getvalue().splitlines()
+                ]
+
+                self.assertEqual(
+                    signals, [signal.SIGTERM, signal.SIGKILL]
+                )
+                self.assertEqual(sleep_calls, [])
+                self.assertEqual(process.wait_calls, 1)
+                self.assertEqual(
+                    process.returncode, -signal.SIGKILL
+                )
+                self.assertEqual(
+                    records[-1]["classification"],
+                    "lease_error" if fail_heartbeat else "parent_signal",
+                )
+                self.assertEqual(
+                    result,
+                    (
+                        watchdog.EXIT_LEASE_ERROR
+                        if fail_heartbeat
+                        else 128 + signal.SIGTERM
+                    ),
+                )
+
     def test_invalid_artifact_path_emits_configuration_final(self) -> None:
         result = subprocess.run(
             [

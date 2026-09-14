@@ -1838,7 +1838,10 @@ def _graceful_cleanup(
                     guardian_control_error = exc
                     break
             refresh_heartbeat()
-            sleeper(min(0.05, deadline - monotonic()))
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            sleeper(min(0.05, remaining))
         child.poll()
         if (
             guardian_control_error is not None
