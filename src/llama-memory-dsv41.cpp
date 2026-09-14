@@ -60,6 +60,8 @@ llama_dsv41_memory_config make_model_config(
     config.type_k = type_k;
     config.type_index = type_k;
     config.no_alloc = model.hparams.no_alloc;
+    config.attach_no_alloc_buffers = config.no_alloc;
+    config.engram_enabled = model.hparams.dsv41_engram_layers.any();
     config.expert_enabled = model.requires_synchronous_graph();
     config.ratios.resize(config.n_layer);
     config.kv_sources.clear();
@@ -151,6 +153,8 @@ struct llama_memory_dsv41::impl {
     std::map<llama_seq_id, rollback_state> rollback_states;
 
     explicit impl(llama_dsv41_memory_config config) : config(std::move(config)) {
+        this->config.engram_enabled =
+            this->config.engram_enabled || this->config.engram != nullptr;
         if (this->config.n_ctx == 0 || this->config.n_seq == 0 || this->config.n_ubatch == 0 ||
                 this->config.n_layer == 0 || this->config.raw_window == 0 ||
                 this->config.kv_width == 0 || this->config.index_width == 0 ||
@@ -285,13 +289,25 @@ struct llama_memory_dsv41::impl {
         for (auto & group : groups) {
             const size_t buffer_size =
                 ggml_backend_alloc_ctx_tensors_from_buft_size(group.ctx.get(), group.buft);
-            if (!this->config.no_alloc) {
-                ggml_backend_buffer_t buffer =
-                    ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(), group.buft);
-                if (buffer == nullptr) {
-                    throw std::runtime_error("failed to allocate DeepSeek V4.1 memory buffer");
+            ggml_backend_buffer_t buffer = nullptr;
+            if (this->config.no_alloc && this->config.attach_no_alloc_buffers) {
+                buffer = ggml_backend_buft_alloc_buffer(group.buft, 0);
+                for (ggml_tensor * tensor = ggml_get_first_tensor(group.ctx.get());
+                        tensor != nullptr;
+                        tensor = ggml_get_next_tensor(group.ctx.get(), tensor)) {
+                    tensor->buffer = buffer;
                 }
+            } else if (!this->config.no_alloc) {
+                buffer =
+                    ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(), group.buft);
+            }
+            if (buffer == nullptr && (!this->config.no_alloc || this->config.attach_no_alloc_buffers)) {
+                throw std::runtime_error("failed to allocate DeepSeek V4.1 memory buffer");
+            }
+            if (buffer != nullptr) {
                 group.buffer.reset(buffer);
+            }
+            if (buffer != nullptr && !this->config.no_alloc) {
                 ggml_backend_buffer_clear(buffer, 0);
             }
             backend_layout = hash_string(backend_layout, ggml_backend_buft_name(group.buft));
@@ -962,7 +978,7 @@ size_t llama_memory_dsv41::retained_rollback_count() const {
 }
 
 bool llama_memory_dsv41::engram_enabled() const {
-    return pimpl->config.engram != nullptr;
+    return pimpl->config.engram_enabled;
 }
 
 llama_memory_dsv41_context::llama_memory_dsv41_context(llama_memory_status status) :
@@ -1464,7 +1480,7 @@ llama_dsv41_graph_topology llama_memory_dsv41_context::topology(
     result.n_seqs = transaction ? transaction->seq_ids.size() : ubatch.n_seqs;
     result.n_outputs = n_outputs;
     result.backend_layout = mem->pimpl->backend_layout;
-    result.engram_enabled = mem->pimpl->config.engram != nullptr;
+    result.engram_enabled = mem->pimpl->config.engram_enabled;
     result.expert_enabled = mem->pimpl->config.expert_enabled;
     result.transaction_generation = transaction ? transaction->plan.generation : mem->pimpl->generation;
     if (transaction) {

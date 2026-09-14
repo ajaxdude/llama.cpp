@@ -28,6 +28,8 @@ struct llama_dsv41_memory_config {
     ggml_type type_k = GGML_TYPE_F16;
     ggml_type type_index = GGML_TYPE_F16;
     bool no_alloc = false;
+    bool attach_no_alloc_buffers = false;
+    bool engram_enabled = false;
     bool expert_enabled = false;
     std::vector<uint32_t> kv_sources = { 2, 8, 14, 20 };
     std::vector<uint32_t> index_sources = { 2, 8, 14, 20, 24, 28, 32, 36 };

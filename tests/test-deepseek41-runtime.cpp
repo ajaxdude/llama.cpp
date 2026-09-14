@@ -242,6 +242,22 @@ static void test_candidates() {
     full_scores[0] = 100.0f;
     const auto full = llama_dsv41_select_candidate_blocks(full_scores, 16392, 8, 2048);
     check(std::find(full.begin(), full.end(), 2048) != full.end(), "final full candidate block was not forced");
+
+    const auto inf_tie = llama_dsv41_select_candidate_blocks(
+            std::vector<float>(24, std::numeric_limits<float>::infinity()), 24, 8, 2);
+    check(std::find(inf_tie.begin(), inf_tie.end(), 2) != inf_tie.end(), "final candidate block lost an infinity tie");
+
+    const auto inf_boundary = llama_dsv41_select_candidate_blocks(
+            std::vector<float>(16392, std::numeric_limits<float>::infinity()), 16392, 8, 2048);
+    check(std::find(inf_boundary.begin(), inf_boundary.end(), 2048) != inf_boundary.end(),
+            "final full candidate block lost an infinity tie");
+    std::vector<int32_t> unique_blocks = inf_boundary;
+    std::sort(unique_blocks.begin(), unique_blocks.end());
+    check(std::adjacent_find(unique_blocks.begin(), unique_blocks.end()) == unique_blocks.end(),
+            "candidate selection contains duplicate blocks");
+    check(std::all_of(unique_blocks.begin(), unique_blocks.end(), [](int32_t block) {
+        return block >= 0 && block <= 2048;
+    }), "candidate selection contains an out-of-range block");
 }
 
 static void test_output_collapse() {
@@ -255,6 +271,52 @@ static void test_output_collapse() {
     check(result.size() == 2, "output collapse width mismatch");
     check(std::abs(result[0] - 5.0f) < 1.0e-6f, "output collapse first value mismatch");
     check(std::abs(result[1] - 6.0f) < 1.0e-6f, "output collapse second value mismatch");
+}
+
+static void test_candidate_graph_selection(uint32_t n_visible, uint32_t n_candidate) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4*1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    check(ctx != nullptr, "failed to create candidate graph context");
+
+    ggml_tensor * scores = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, n_visible, 1);
+    std::fill_n(
+            static_cast<float *>(scores->data),
+            ggml_nelements(scores),
+            std::numeric_limits<float>::infinity());
+    ggml_tensor * block_scores = ggml_pool_1d(
+            ctx, scores, GGML_OP_POOL_MAX, 8, 8, 0);
+    ggml_tensor * final_blocks = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, 1, 1);
+    const int32_t final_block = (int32_t) block_scores->ne[0] - 1;
+    static_cast<int32_t *>(final_blocks->data)[0] = final_block;
+    ggml_tensor * candidate_blocks = llama_dsv41_build_candidate_blocks(
+            ctx, block_scores, final_blocks, n_candidate);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, candidate_blocks);
+    check(
+            ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS,
+            "candidate selection graph execution failed");
+
+    const int32_t * ids = static_cast<const int32_t *>(candidate_blocks->data);
+    std::vector<int32_t> selected(ids, ids + n_candidate);
+    check(selected.front() == final_block, "final candidate block is not first");
+    check(std::count(selected.begin(), selected.end(), final_block) == 1,
+            "final candidate block was not retained exactly once");
+    std::vector<int32_t> unique = selected;
+    std::sort(unique.begin(), unique.end());
+    check(std::adjacent_find(unique.begin(), unique.end()) == unique.end(),
+            "candidate graph selected duplicate blocks");
+    check(std::all_of(unique.begin(), unique.end(), [&](int32_t block) {
+        return block >= 0 && block <= final_block;
+    }), "candidate graph selected an out-of-range block");
+
+    ggml_free(ctx);
 }
 
 static void test_graph_contract() {
@@ -429,47 +491,6 @@ static void test_graph_construction() {
               "compressed real row changed");
     }
 
-    ggml_tensor * candidate_scores = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, 24, 2);
-    ggml_tensor * candidate_bias = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F32, 3, 2);
-    float * score_data = static_cast<float *>(candidate_scores->data);
-    float * bias_data = static_cast<float *>(candidate_bias->data);
-    std::fill_n(score_data, 48, -100.0f);
-    std::fill_n(bias_data, 6, 0.0f);
-    score_data[0] = 100.0f;
-    score_data[24] = 100.0f;
-    std::fill(score_data + 9, score_data + 24, -std::numeric_limits<float>::infinity());
-    std::fill(score_data + 24 + 17, score_data + 48, -std::numeric_limits<float>::infinity());
-    bias_data[1] = std::numeric_limits<float>::infinity();
-    bias_data[2] = -std::numeric_limits<float>::infinity();
-    bias_data[3 + 2] = std::numeric_limits<float>::infinity();
-    ggml_tensor * block_scores = ggml_pool_1d(
-            ctx, candidate_scores, GGML_OP_POOL_MAX, 8, 8, 0);
-    block_scores = ggml_add(ctx, block_scores, candidate_bias);
-    ggml_tensor * candidate_ids = ggml_cont(
-            ctx, ggml_argsort_top_k(ctx, block_scores, 2));
-    ggml_set_name(
-            candidate_ids,
-            llama_dsv41_graph_trace_name(
-                "attn.candidate_blocks", 20).c_str());
-    ggml_cgraph * candidate_gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(candidate_gf, candidate_ids);
-    check(
-            ggml_graph_compute_with_ctx(ctx, candidate_gf, 1) ==
-                GGML_STATUS_SUCCESS,
-            "candidate block graph execution failed");
-    const int32_t * ids = static_cast<const int32_t *>(candidate_ids->data);
-    check(
-            ids[0] == 1 && ids[1] == 0 &&
-            ids[2] == 2 && ids[3] == 0,
-            "candidate blocks are not pinned and sorted");
-    check(
-            ggml_is_contiguous(candidate_ids) &&
-            std::string(ggml_get_name(candidate_ids)) ==
-                "dsv41.trace.attn.candidate_blocks.l20",
-            "candidate block trace is not stable and contiguous");
-
     ggml_tensor * prior_ring = ggml_new_tensor_2d(
             ctx, GGML_TYPE_F32, 1, 2);
     ggml_tensor * current_k = ggml_new_tensor_2d(
@@ -578,6 +599,44 @@ static void test_graph_construction() {
     check(combined->src[0] == routed && combined->src[1] == shared,
             "shared expert output is not added to routed output");
 
+    ggml_tensor * exec_residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 4, 1);
+    ggml_tensor * exec_pre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+    ggml_tensor * exec_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+    ggml_tensor * exec_output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+    std::fill_n(static_cast<float *>(exec_residual->data), ggml_nelements(exec_residual), 1.0f);
+    std::fill_n(static_cast<float *>(exec_pre->data), ggml_nelements(exec_pre), 0.25f);
+    std::fill_n(static_cast<float *>(exec_norm->data), ggml_nelements(exec_norm), 1.0f);
+    std::fill_n(static_cast<float *>(exec_output->data), ggml_nelements(exec_output), 1.0f);
+    ggml_tensor * exec_collapse = llama_dsv41_build_output_collapse(
+            ctx, exec_residual, exec_pre, 32, 4, 1);
+    ggml_tensor * exec_norm_input = llama_dsv41_build_output_norm_input(
+            ctx, exec_collapse);
+    check(exec_collapse->type == GGML_TYPE_BF16,
+            "production output collapse is not BF16");
+    check(exec_norm_input->type == GGML_TYPE_F32,
+            "production output RMSNorm input is not F32");
+    ggml_tensor * exec_normalized = ggml_rms_norm(
+            ctx, exec_norm_input, 1.0e-20f);
+    check(exec_normalized->src[0] == exec_norm_input,
+            "production RMSNorm does not consume the F32 collapse");
+    exec_normalized = ggml_mul(ctx, exec_normalized, exec_norm);
+    ggml_tensor * exec_logits = ggml_mul_mat(
+            ctx, exec_output, exec_normalized);
+    ggml_cgraph * exec_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(exec_gf, exec_logits);
+    ggml_backend_t exec_backend = ggml_backend_cpu_init();
+    check(exec_backend != nullptr, "failed to create output graph CPU backend");
+    for (int i = 0; i < ggml_graph_n_nodes(exec_gf); ++i) {
+        check(ggml_backend_supports_op(exec_backend, ggml_graph_node(exec_gf, i)),
+                "CPU backend does not support the production output graph");
+    }
+    ggml_backend_free(exec_backend);
+    check(ggml_graph_compute_with_ctx(ctx, exec_gf, 1) == GGML_STATUS_SUCCESS, "final output graph execution failed");
+    const float * exec_values = static_cast<const float *>(exec_logits->data);
+    check(std::isfinite(exec_values[0]) && std::isfinite(exec_values[1]), "final output graph produced non-finite logits");
+    check(std::abs(exec_values[0] - 32.0f) < 1.0e-4f && std::abs(exec_values[1] - 32.0f) < 1.0e-4f,
+            "final output graph numeric mismatch");
+
     ggml_free(ctx);
 }
 
@@ -589,6 +648,9 @@ int main() {
     test_raw_ring();
     test_candidates();
     test_output_collapse();
+    test_candidate_graph_selection(24, 1);
+    test_candidate_graph_selection(24, 2);
+    test_candidate_graph_selection(16392, 2048);
     test_graph_contract();
     test_graph_construction();
     return 0;

@@ -5,6 +5,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -209,7 +210,73 @@ void test_alignment_and_large_offsets() {
     require_throws([] {
         llama_expert_store_align_read(UINT64_MAX - 4, 8, 4096, UINT64_MAX);
     });
+
+    size_t granularity_first = 1;
+    size_t granularity_last = 1;
+    llama_mlock::align_range(&granularity_first, &granularity_last);
+    const size_t lock_granularity = granularity_last;
+    REQUIRE(granularity_first == 0);
+    REQUIRE(lock_granularity > 1);
+
+    size_t lock_first = lock_granularity + 1;
+    size_t lock_last = 2 * lock_granularity;
+    llama_mlock::align_range(&lock_first, &lock_last);
+    REQUIRE(lock_first == lock_granularity);
+    REQUIRE(lock_last == 2 * lock_granularity);
 }
+
+void test_external_mapping_access_policy() {
+    const size_t page = 4096;
+    const llama_mmap::ranges external = {
+        { 0, page },
+        { 2 * page + 1, 4 * page - 1 },
+        { 5 * page, 6 * page },
+        { 7 * page, 8 * page },
+        { 9 * page, 10 * page },
+    };
+
+    REQUIRE(llama_mmap::use_sequential_file_advice(false));
+    REQUIRE(!llama_mmap::use_sequential_file_advice(true));
+    REQUIRE(llama_mmap::planned_prefetch_ranges(10 * page, 10 * page, external, true).empty());
+
+    const auto lazy_ranges = llama_mmap::planned_prefetch_ranges(10 * page, 10 * page, external, false);
+    REQUIRE(lazy_ranges.size() == 4);
+    REQUIRE(lazy_ranges.front() == std::make_pair(page, 2 * page + 1));
+    REQUIRE(lazy_ranges.back() == std::make_pair(8 * page, 9 * page));
+}
+
+#if defined(__linux__)
+int file_advice_calls = 0;
+
+int fail_file_advice(int, int) {
+    ++file_advice_calls;
+    return EIO;
+}
+
+void test_external_mapping_advice_failure() {
+    temp_file file { ".bin" };
+    {
+        std::ofstream out(file.path, std::ios::binary);
+        REQUIRE(out.good());
+        out.seekp(8191);
+        out.put('\0');
+    }
+
+    llama_file input(file.path.string(), "rb");
+    file_advice_calls = 0;
+    bool continued_after_advice = false;
+    require_throws([&] {
+        llama_mmap mapping(&input, 0, false, { { 4096, 8192 } }, true, fail_file_advice);
+        continued_after_advice = true;
+    });
+    REQUIRE(file_advice_calls == 1);
+    REQUIRE(!continued_after_advice);
+
+    llama_mmap legacy_mapping(&input, 0, false, {}, false, fail_file_advice);
+    REQUIRE(file_advice_calls == 2);
+    REQUIRE(legacy_mapping.addr() != nullptr);
+}
+#endif
 
 void test_published_layout_accounting() {
     const int64_t n_embd = 7680;
@@ -557,6 +624,10 @@ int main() {
         fixture f;
         test_layout_and_offsets(f);
         test_alignment_and_large_offsets();
+        test_external_mapping_access_policy();
+#if defined(__linux__)
+        test_external_mapping_advice_failure();
+#endif
         test_published_layout_accounting();
         test_large_offset_read();
         test_cache_and_remapping(f);

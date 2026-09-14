@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -725,6 +726,41 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        if (no_alloc && gguf_get_n_tensors(metadata) > 0) {
+            const int64_t tensor_count = gguf_get_n_tensors(metadata);
+            const size_t overhead = ggml_tensor_overhead();
+            if ((uint64_t) tensor_count > std::numeric_limits<size_t>::max()/overhead - 1) {
+                throw std::runtime_error("no-allocation metadata tensor count overflows the context size");
+            }
+            ggml_init_params params = {
+                /*.mem_size   =*/ overhead*((size_t) tensor_count + 1),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                throw std::runtime_error("failed to create no-allocation metadata tensor context");
+            }
+            contexts.emplace_back(ctx);
+            for (int64_t i = 0; i < tensor_count; ++i) {
+                ggml_tensor * tensor = ggml_new_tensor(
+                        ctx,
+                        gguf_get_tensor_type(metadata, i),
+                        GGML_MAX_DIMS,
+                        gguf_get_tensor_ne(metadata, i));
+                ggml_set_name(tensor, gguf_get_tensor_name(metadata, i));
+                n_elements += ggml_nelements(tensor);
+                n_bytes += ggml_nbytes(tensor);
+                const auto inserted = weights_map.emplace(
+                        ggml_get_name(tensor),
+                        llama_tensor_weight(0, metadata, tensor));
+                if (!inserted.second) {
+                    throw std::runtime_error(format(
+                            "invalid model: tensor '%s' is duplicated",
+                            ggml_get_name(tensor)));
+                }
+            }
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1206,7 +1242,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            size_data -= nbytes;
+            if (!files.empty()) {
+                size_data -= nbytes;
+            }
             n_created++;
 
             return nullptr;
@@ -1320,12 +1358,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
-        ggml_type type = GGML_TYPE_F32;
-        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid != -1) {
-            type = gguf_get_tensor_type(metadata, tid);
-        }
-
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
             for (size_t dim = 0; dim < ne.size(); dim++) {
@@ -1333,6 +1365,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     return nullptr;
                 }
             }
+        }
+
+        ggml_type type = GGML_TYPE_F32;
+        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        if (tid != -1) {
+            const ggml_tensor * declared = check_tensor_dims(
+                    tn.str(), ne, true, flags & TENSOR_ALLOW_RESHAPE);
+            GGML_ASSERT(declared != nullptr);
+            type = declared->type;
         }
 
         ggml_tensor t_meta;
@@ -1353,10 +1394,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) {
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (tid != -1 && !(flags & TENSOR_DUPLICATED)) {
+            n_created++;
+        }
         return ret;
     }
 
@@ -1428,12 +1474,12 @@ llama_expert_store_tensor llama_model_loader::register_external_tensor(
     }
 
     const llama_tensor_weight & weight = require_weight(name.c_str());
-    if (fnames.at(weight.idx).empty() || fnames.at(weight.idx) == "(file*)") {
+    if (!no_alloc && (fnames.at(weight.idx).empty() || fnames.at(weight.idx) == "(file*)")) {
         throw std::runtime_error(format("external tensor '%s' requires a reopenable source file", name.c_str()));
     }
     llama_expert_store_tensor result;
     result.name = name;
-    result.fname = fnames.at(weight.idx);
+    result.fname = no_alloc ? "(no_alloc)" : fnames.at(weight.idx);
     result.file_index = weight.idx;
     result.layer = layer;
     result.projection = projection;
@@ -1443,7 +1489,15 @@ llama_expert_store_tensor llama_model_loader::register_external_tensor(
         result.nb[i] = tensor->nb[i];
     }
     result.file_offset = weight.offs;
-    result.file_size = files.at(weight.idx)->size();
+    if (no_alloc) {
+        const size_t tensor_size = ggml_nbytes(tensor);
+        if (result.file_offset > std::numeric_limits<size_t>::max() - tensor_size) {
+            throw std::runtime_error(format("external tensor '%s' extent overflows the file size", name.c_str()));
+        }
+        result.file_size = result.file_offset + tensor_size;
+    } else {
+        result.file_size = files.at(weight.idx)->size();
+    }
 
     llama_expert_store_validate_tensor(result);
     external.add(weight);
@@ -1459,7 +1513,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
-        LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
+        LLAMA_LOG_INFO("%s: partial load - used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
     }
     if (n_tensors_moved > 0) {
@@ -1494,7 +1548,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const auto & external_ranges = external.for_file(idx);
             excluded.insert(excluded.end(), external_ranges.begin(), external_ranges.end());
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, excluded);
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(
+                    file.get(), prefetch_size, is_numa, excluded, !external_ranges.empty());
             for (const auto & range : external_ranges) {
                 mapping->unmap_fragment(range.first, range.second);
             }
@@ -1563,6 +1618,8 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
+        bool load_from_mmap,
+        bool discard_file_cache,
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
@@ -1589,12 +1646,44 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
-    std::vector<ggml_backend_buffer_t> host_buffers;
-    std::vector<ggml_backend_event_t> events;
-    std::vector<void *> host_ptrs;
+    struct async_upload_resources {
+        std::vector<ggml_backend_buffer_t> host_buffers;
+        std::vector<ggml_backend_event_t> events;
+        std::vector<void *> host_ptrs;
+        ggml_backend_t backend = nullptr;
+
+        void reset() {
+            for (auto * event : events) {
+                if (backend != nullptr) {
+                    ggml_backend_event_synchronize(event);
+                }
+                ggml_backend_event_free(event);
+            }
+            events.clear();
+            for (auto * buffer : host_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            host_buffers.clear();
+            host_ptrs.clear();
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+
+        ~async_upload_resources() {
+            reset();
+        }
+    } async_upload;
+    async_upload.host_buffers.reserve(n_buffers);
+    async_upload.events.reserve(n_buffers);
+    async_upload.host_ptrs.reserve(n_buffers);
+
+    auto & host_buffers = async_upload.host_buffers;
+    auto & events = async_upload.events;
+    auto & host_ptrs = async_upload.host_ptrs;
+    auto & upload_backend = async_upload.backend;
     size_t buffer_idx = 0; // buffer to use for async loads
-    ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+    upload_backend = [&](const char * func) -> ggml_backend_t {
+        if (load_from_mmap || check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1641,6 +1730,7 @@ bool llama_model_loader::load_all_data(
             if (!buf) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
+                async_upload.reset();
                 return nullptr;
             }
 
@@ -1651,6 +1741,7 @@ bool llama_model_loader::load_all_data(
             if (!event) {
                 LLAMA_LOG_DEBUG("%s: failed to create event for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
+                async_upload.reset();
                 return nullptr;
             }
 
@@ -1661,6 +1752,7 @@ bool llama_model_loader::load_all_data(
         if (!backend) {
             LLAMA_LOG_DEBUG("%s: failed to initialize backend for device %s for async uploads\n", func,
                 ggml_backend_dev_name(dev));
+            async_upload.reset();
             return nullptr;
         }
 
@@ -1681,7 +1773,7 @@ bool llama_model_loader::load_all_data(
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
-    if (!use_mmap) {
+    if (!load_from_mmap) {
         std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
             const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
             const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
@@ -1707,7 +1799,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        const bool from_mapping = load_from_mmap || lazy.has(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1815,20 +1907,15 @@ bool llama_model_loader::load_all_data(
                     }
                 }
             }
+            if (discard_file_cache) {
+                file->discard_cache(weight->offs, n_size);
+            }
         }
 
         size_done += n_size;
     }
 
-    // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
-    }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
+    async_upload.reset();
 
     // check validation results
     bool validation_failed = false;

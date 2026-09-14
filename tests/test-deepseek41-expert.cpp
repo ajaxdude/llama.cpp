@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -125,7 +126,8 @@ struct fixture {
 
     llama_dsv41_expert_runtime make_runtime(
             size_t slots,
-            llama_dsv41_expert_runtime::upload_fn upload = {}) const {
+            llama_dsv41_expert_runtime::upload_fn upload = {},
+            llama_dsv41_expert_runtime::publish_fn before_publish = {}) const {
         llama_dsv41_expert_runtime_params params;
         params.cache_slots = slots;
         params.cache_bytes = cache_bytes(slots);
@@ -134,7 +136,8 @@ struct fixture {
                 tensors,
                 params,
                 [](const llama_expert_store_tensor &) { return ggml_backend_cpu_buffer_type(); },
-                std::move(upload));
+                std::move(upload),
+                std::move(before_publish));
     }
 };
 
@@ -259,6 +262,19 @@ void test_capacity_and_upload_failure(const fixture & f) {
     REQUIRE(failing.remap(0, { 0 }).front() == 0);
     REQUIRE(calls == after_failure + 3);
     failing.release(0);
+}
+
+void test_publication_allocation_failure(const fixture & f) {
+    size_t attempts = 0;
+    auto runtime = f.make_runtime(1, {}, [&] {
+        if (attempts++ == 0) {
+            throw std::bad_alloc();
+        }
+    });
+
+    require_throws([&] { runtime.remap(0, { 0 }); });
+    REQUIRE(runtime.remap(0, { 1 }).front() == 0);
+    runtime.release(0);
 }
 
 void test_graph_callbacks(const fixture & f) {
@@ -553,6 +569,7 @@ int main() {
         test_configuration(f);
         test_remap_upload_and_eviction(f);
         test_capacity_and_upload_failure(f);
+        test_publication_allocation_failure(f);
         test_graph_callbacks(f);
         test_graph_upload_failure_sentinel(f);
         test_grovemoe_lookup_ids();

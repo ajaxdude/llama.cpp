@@ -415,9 +415,8 @@ std::vector<int32_t> llama_dsv41_select_candidate_blocks(
         }
     }
 
-    block_scores.back() = std::numeric_limits<float>::infinity();
-
-    std::vector<int32_t> blocks(n_blocks);
+    const int32_t final_block = (int32_t) n_blocks - 1;
+    std::vector<int32_t> blocks(n_blocks - 1);
     std::iota(blocks.begin(), blocks.end(), 0);
     std::stable_sort(blocks.begin(), blocks.end(), [&](int32_t a, int32_t b) {
         if (block_scores[a] != block_scores[b]) {
@@ -426,8 +425,12 @@ std::vector<int32_t> llama_dsv41_select_candidate_blocks(
         return a < b;
     });
 
-    blocks.resize(std::min<uint32_t>(top_k_blocks, n_blocks));
-    return blocks;
+    const uint32_t n_selected = std::min<uint32_t>(top_k_blocks, n_blocks);
+    std::vector<int32_t> selected;
+    selected.reserve(n_selected);
+    selected.push_back(final_block);
+    selected.insert(selected.end(), blocks.begin(), blocks.begin() + n_selected - 1);
+    return selected;
 }
 
 std::vector<int32_t> llama_dsv41_candidate_rows(
@@ -531,6 +534,57 @@ ggml_tensor * llama_dsv41_build_shared_softmax(
     return ggml_soft_max(ctx, scores);
 }
 
+ggml_tensor * llama_dsv41_build_candidate_blocks(
+        ggml_context * ctx,
+        ggml_tensor * block_scores,
+        ggml_tensor * final_blocks,
+        uint32_t n_candidate) {
+    if (block_scores == nullptr || final_blocks == nullptr ||
+            block_scores->type != GGML_TYPE_F32 ||
+            final_blocks->type != GGML_TYPE_I32 ||
+            final_blocks->ne[0] != 1 ||
+            final_blocks->ne[1] != block_scores->ne[1]) {
+        throw std::runtime_error("DeepSeek V4.1 candidate graph shape mismatch");
+    }
+
+    const int64_t n_blocks = block_scores->ne[0];
+    const int64_t n_tokens = block_scores->ne[1];
+    if (n_candidate == 0 || n_candidate > (uint32_t) n_blocks) {
+        throw std::runtime_error("DeepSeek V4.1 candidate graph width is invalid");
+    }
+    if (n_candidate == 1) {
+        return ggml_cont(ctx, final_blocks);
+    }
+
+    ggml_tensor * local = ggml_reshape_2d(
+            ctx, ggml_arange(ctx, 0.0f, (float) (n_blocks - 1), 1.0f),
+            n_blocks - 1, 1);
+    local = ggml_repeat_4d(
+            ctx, local, n_blocks - 1, n_tokens, 1, 1);
+    ggml_tensor * final_f32 = ggml_cast(ctx, final_blocks, GGML_TYPE_F32);
+    ggml_tensor * shift = ggml_step(
+            ctx, ggml_scale_bias(
+                ctx, ggml_sub(ctx, local, final_f32), 1.0f, 0.5f));
+    ggml_tensor * ordinary_ids = ggml_cast(
+            ctx, ggml_add(ctx, local, shift), GGML_TYPE_I32);
+
+    ggml_tensor * ordinary_scores = ggml_get_rows(
+            ctx,
+            ggml_reshape_3d(ctx, block_scores, 1, n_blocks, n_tokens),
+            ordinary_ids);
+    ordinary_scores = ggml_reshape_2d(
+            ctx, ordinary_scores, n_blocks - 1, n_tokens);
+    ggml_tensor * selected_local = ggml_argsort_top_k(
+            ctx, ordinary_scores, n_candidate - 1);
+    ggml_tensor * selected = ggml_get_rows(
+            ctx,
+            ggml_reshape_3d(ctx, ordinary_ids, 1, n_blocks - 1, n_tokens),
+            selected_local);
+    selected = ggml_reshape_2d(
+            ctx, selected, n_candidate - 1, n_tokens);
+    return ggml_cont(ctx, ggml_concat(ctx, final_blocks, selected, 0));
+}
+
 ggml_tensor * llama_dsv41_build_output_collapse(
         ggml_context * ctx,
         ggml_tensor * residual,
@@ -550,6 +604,15 @@ ggml_tensor * llama_dsv41_build_output_collapse(
     return ggml_cast(ctx, collapsed, GGML_TYPE_BF16);
 }
 
+ggml_tensor * llama_dsv41_build_output_norm_input(
+        ggml_context * ctx,
+        ggml_tensor * collapsed) {
+    if (collapsed == nullptr || collapsed->type != GGML_TYPE_BF16) {
+        throw std::runtime_error("DeepSeek V4.1 output collapse must be BF16");
+    }
+    return ggml_cast(ctx, collapsed, GGML_TYPE_F32);
+}
+
 ggml_tensor * llama_dsv41_build_output(
         ggml_context * ctx,
         ggml_tensor * residual,
@@ -564,7 +627,8 @@ ggml_tensor * llama_dsv41_build_output(
 
     ggml_tensor * collapsed = llama_dsv41_build_output_collapse(
             ctx, residual, pre, residual->ne[0], hc_mult, residual->ne[2]);
-    ggml_tensor * normalized = ggml_rms_norm(ctx, collapsed, rms_eps);
+    ggml_tensor * normalized = ggml_rms_norm(
+            ctx, llama_dsv41_build_output_norm_input(ctx, collapsed), rms_eps);
     normalized = ggml_mul(ctx, normalized, output_norm);
     return ggml_mul_mat(ctx, output, normalized);
 }
