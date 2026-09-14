@@ -164,6 +164,7 @@ public:
     const llama_dsv41_memory_config & config() const;
     llama_dsv41_memory_accounting accounting() const;
     std::vector<int32_t> sequence_candidate_ids(llama_seq_id seq_id) const;
+    size_t retained_rollback_count() const;
     bool engram_enabled() const;
 
 private:

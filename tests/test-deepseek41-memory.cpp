@@ -651,7 +651,7 @@ struct engram_test_file {
 static void test_engram_transaction() {
     const llama_engram_layout layout = make_engram_layout();
     engram_test_file file(layout);
-    auto config = small_config(8, 1, 4);
+    auto config = small_config(2048, 1, 4);
     auto runtime = std::make_unique<llama_dsv41_engram_runtime>(
             layout, file.extents, config.n_ubatch);
     llama_dsv41_engram_runtime * runtime_ptr = runtime.get();
@@ -707,6 +707,19 @@ static void test_engram_transaction() {
     check(memory.seq_pos_max(0) == 2, "Engram commit position mismatch");
     check(memory.seq_rm(0, 2, -1), "Engram suffix rollback at transaction boundary failed");
     check(memory.seq_pos_max(0) == 1, "Engram suffix rollback did not restore position");
+
+    for (llama_pos pos = 2; pos < 1024; ++pos) {
+        llama_memory_dsv41_context decode(
+                &memory, std::vector<llama_ubatch> { make_ubatch(pos, 1, 0) });
+        check(decode.apply(), "long Engram decode prepare failed");
+        decode.commit();
+        check(memory.retained_rollback_count() == 1,
+              "Engram decode retained more than the immediate rollback state");
+    }
+    check(memory.seq_rm(0, 1023, -1), "long Engram decode immediate rollback failed");
+    check(memory.seq_pos_max(0) == 1022, "long Engram decode rollback restored the wrong position");
+    check(memory.retained_rollback_count() == 0,
+          "Engram rollback retained an obsolete rollback state");
 }
 #endif
 
