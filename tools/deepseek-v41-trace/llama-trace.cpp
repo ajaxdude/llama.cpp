@@ -485,7 +485,7 @@ static json runtime_libraries_json(
         }
     }
 
-    const fs::path build_info_module = module_path(function_address(&llama_commit));
+    const fs::path build_info_module = module_path(function_address(&common_init));
     const fs::path llama_module = module_path(function_address(&llama_model_load_from_file));
     const fs::path ggml_module = module_path(function_address(&ggml_init));
     const fs::path selected_backend_module = module_path(selected_backend);

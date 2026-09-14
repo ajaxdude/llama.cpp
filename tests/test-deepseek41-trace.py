@@ -265,7 +265,7 @@ DS4_CONTAINMENT_HELPER = {
     "revision": trace.DS4_REVISION,
     "filename": "llama-deepseek-v41-containment-helper",
     "sha256": "d" * 64,
-    "launcher_policy": "namespace-cleared-supplementary-groups-v1",
+    "launcher_policy": "zero-supplementary-groups-v1",
     "supplementary_groups": [],
 }
 DS4_INSTALL_TRUST = {
@@ -626,7 +626,7 @@ def fixture_containment_helper(revision: str, digest: str = "d" * 64) -> dict[st
         "revision": revision,
         "filename": "llama-deepseek-v41-containment-helper",
         "sha256": digest,
-        "launcher_policy": "namespace-cleared-supplementary-groups-v1",
+        "launcher_policy": "zero-supplementary-groups-v1",
         "supplementary_groups": [],
     }
 
@@ -849,7 +849,7 @@ def isolated_test_install_trust(*, process_containment: bool = True):
                 module, "_path_mode_for_trust", side_effect=path_mode_for_trust))
             stack.enter_context(mock.patch.object(
                 module, "_has_access_control_entries", return_value=False))
-            if process_containment and sys.platform == "darwin":
+            if process_containment and sys.platform in {"darwin", "linux"}:
                 stack.enter_context(module._test_only_process_group_containment())
         yield
 
@@ -2613,6 +2613,25 @@ class TraceFormatTests(unittest.TestCase):
         )
         numeric_kill.assert_not_called()
 
+    def test_linux_test_containment_does_not_execute_fixture_helper(self) -> None:
+        process = mock.Mock(pid=71)
+        launch = {
+            "_containment_helper_path": "/fixture/helper",
+            "_containment_helper_descriptor": 44,
+            "stdout": subprocess.PIPE,
+        }
+        with mock.patch.object(trace.sys, "platform", "linux"), (
+                trace._test_only_process_group_containment()), mock.patch.object(
+                    trace.subprocess, "Popen", return_value=process) as popen:
+            containment = trace._start_contained_process(["/fixture/exporter"], launch)
+        self.assertIs(containment.process, process)
+        self.assertEqual(containment.test_process_group_id, 71)
+        popen.assert_called_once_with(
+            ["/fixture/exporter"],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+
     def test_linux_native_helper_boundary_precedes_target_release(self) -> None:
         start_source = inspect.getsource(trace._start_linux_native_helper)
         spawn_source = inspect.getsource(trace._start_linux_native_helper_process)
@@ -2643,7 +2662,7 @@ class TraceFormatTests(unittest.TestCase):
             helper_source.index('!= \"EXEC\"'),
         )
 
-    def test_linux_native_helper_clears_groups_before_mapping(self) -> None:
+    def test_linux_native_helper_requires_zero_group_service(self) -> None:
         helper_source = (
             Path(__file__).parents[1] /
             "tools/deepseek-v41-trace/linux-containment-helper.cpp"
@@ -2660,20 +2679,21 @@ class TraceFormatTests(unittest.TestCase):
             helper_source.index("[[noreturn]] void run_target_bootstrap"):
             helper_source.index("[[noreturn]] void run_namespace_init")
         ]
+        self.assertIn("--check-launcher-groups", helper_source)
+        self.assertIn("supplementary-groups=0", helper_source)
+        self.assertIn(
+            'require_zero_supplementary_groups("containment launcher");',
+            run_source,
+        )
+        self.assertLess(
+            run_source.index('require_zero_supplementary_groups("containment launcher");'),
+            run_source.index("require_initial_signal_state();"),
+        )
         self.assertLess(
             run_source.index("require_initial_signal_state();"),
             run_source.index("CLONE_NEWUSER"),
         )
-        self.assertNotIn("require_zero_supplementary_groups", helper_source)
-        self.assertIn("setgroups(0, nullptr)", init_source)
-        self.assertLess(
-            init_source.index('stage = "namespace-groups-clear"'),
-            init_source.index('write_all(ready_fd, "B", 1)'),
-        )
-        self.assertLess(
-            init_source.index('stage = "namespace-groups-cleared-verify"'),
-            init_source.index('write_all(ready_fd, "B", 1)'),
-        )
+        self.assertNotIn("setgroups(", helper_source)
         self.assertLess(
             init_source.index('stage = "namespace-groups-verify"'),
             init_source.index('stage = "namespace-setresgid"'),
@@ -2683,7 +2703,25 @@ class TraceFormatTests(unittest.TestCase):
             target_source.index('stage = "target-privilege-drop"'),
         )
         parent_source = inspect.getsource(trace._start_linux_native_helper)
-        self.assertNotIn("_require_zero_supplementary_groups", parent_source)
+        self.assertLess(
+            parent_source.index("_require_zero_supplementary_groups()"),
+            parent_source.index("_start_linux_native_helper_process"),
+        )
+
+    def test_linux_parent_requires_zero_group_service_before_spawn(self) -> None:
+        with mock.patch.object(trace.os, "getgroups", return_value=[]):
+            trace._require_zero_supplementary_groups()
+        with mock.patch.object(trace.os, "getgroups", return_value=[10, 39, 105]), (
+                self.assertRaisesRegex(
+                    trace.TraceError,
+                    "requires zero supplementary groups; found 3")):
+            trace._require_zero_supplementary_groups()
+        query_error = PermissionError(1, "Operation not permitted")
+        with mock.patch.object(trace.os, "getgroups", side_effect=query_error), (
+                self.assertRaisesRegex(
+                    trace.TraceError,
+                    "cannot query Linux containment launcher supplementary groups")):
+            trace._require_zero_supplementary_groups()
 
     def test_posix_spawn_does_not_run_registered_atfork_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

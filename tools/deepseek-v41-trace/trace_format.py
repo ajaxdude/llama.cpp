@@ -1243,6 +1243,17 @@ def _all_catchable_signals() -> set[int]:
     }
 
 
+def _require_zero_supplementary_groups() -> None:
+    try:
+        groups = os.getgroups()
+    except OSError as error:
+        raise TraceError(
+            f"cannot query Linux containment launcher supplementary groups: {error}") from error
+    if groups:
+        raise TraceError(
+            f"Linux containment launcher requires zero supplementary groups; found {len(groups)}")
+
+
 def _start_linux_native_helper_process(
         command: list[str],
         launch: dict[str, Any],
@@ -1459,6 +1470,7 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
     pidfd = None
     exec_released = False
     try:
+        _require_zero_supplementary_groups()
         _linux_require_pidfd_support()
         if len(_linux_task_ids()) != 1:
             raise TraceError("Linux native containment requires a single-threaded Python supervisor")
@@ -1547,12 +1559,15 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
 def _start_contained_process(command: list[str], launch: dict[str, Any]) -> _ProcessContainment:
     if sys.platform == "win32":
         return _start_windows_job_process(command, launch)
-    if sys.platform == "linux":
-        return _start_linux_native_helper(command, launch)
-    if sys.platform == "darwin" and getattr(_TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False):
+    if sys.platform in {"linux", "darwin"} and getattr(
+            _TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False):
+        launch.pop("_containment_helper_path", None)
+        launch.pop("_containment_helper_descriptor", None)
         launch["start_new_session"] = True
         process = subprocess.Popen(command, **launch)
         return _ProcessContainment(process=process, test_process_group_id=process.pid)
+    if sys.platform == "linux":
+        return _start_linux_native_helper(command, launch)
     raise TraceError("proven process containment is unavailable on this platform")
 
 
@@ -2506,7 +2521,7 @@ def _validate_containment_helper_policy(
             record["revision"] != revision) or (
             record["filename"] != "llama-deepseek-v41-containment-helper") or re.fullmatch(
                 r"[0-9a-f]{64}", record.get("sha256", "")) is None or (
-            record["launcher_policy"] != "namespace-cleared-supplementary-groups-v1") or (
+            record["launcher_policy"] != "zero-supplementary-groups-v1") or (
             record["supplementary_groups"] != []):
         raise TraceError(f"{label} containment helper receipt is invalid")
     result = dict(record)

@@ -226,7 +226,7 @@ static json runtime_libraries_json(const fs::path & executable) {
         throw std::runtime_error("loaded runtime component set differs from the receipt");
     }
     const std::array<std::pair<const char *, fs::path>, 3> fixed_roles = {{
-        {"llama-common", module_path(function_address(&llama_commit))},
+        {"llama-common", module_path(function_address(&common_init))},
         {"llama", module_path(function_address(&llama_model_load_from_file))},
         {"ggml-base", module_path(function_address(&ggml_init))},
     }};
