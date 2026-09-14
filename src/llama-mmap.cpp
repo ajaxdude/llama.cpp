@@ -7,6 +7,7 @@
 #include <cstring>
 #include <climits>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -174,6 +175,11 @@ struct llama_file::impl {
     bool has_direct_io() const {
         // Windows uses cached CRT I/O until FILE_FLAG_NO_BUFFERING support is added.
         return false;
+    }
+
+    void discard_cache(size_t offset, size_t length) const {
+        GGML_UNUSED(offset);
+        GGML_UNUSED(length);
     }
 
     ~impl() {
@@ -375,6 +381,19 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    void discard_cache(size_t offset, size_t length) const {
+#if defined(POSIX_FADV_DONTNEED)
+        const int file_id = fd == -1 ? fileno(fp) : fd;
+        const int result = posix_fadvise(file_id, offset, length, POSIX_FADV_DONTNEED);
+        if (result != 0) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(result));
+        }
+#else
+        GGML_UNUSED(offset);
+        GGML_UNUSED(length);
+#endif
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -409,6 +428,7 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+void llama_file::discard_cache(size_t offset, size_t length) const { pimpl->discard_cache(offset, length); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
@@ -783,6 +803,18 @@ struct llama_mlock::impl {
 
     impl() : addr(NULL), size(0), failed_already(false) {}
 
+    static void align_range(size_t * first, size_t * last) {
+        const size_t granularity = lock_granularity();
+        *first &= ~(granularity - 1);
+        const size_t remainder = *last & (granularity - 1);
+        if (remainder != 0) {
+            if (*last > std::numeric_limits<size_t>::max() - (granularity - remainder)) {
+                throw std::runtime_error("mlock range overflow");
+            }
+            *last += granularity - remainder;
+        }
+    }
+
     void init(void * ptr) {
         GGML_ASSERT(addr == NULL && size == 0);
         addr = ptr;
@@ -815,6 +847,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+void llama_mlock::align_range(size_t * first, size_t * last) { impl::align_range(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

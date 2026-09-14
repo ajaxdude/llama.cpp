@@ -593,7 +593,6 @@ llama_expert_store::lease llama_expert_store::acquire(const std::vector<llama_ex
     }
 
     auto lease_impl = std::make_unique<lease::impl>();
-    lease_impl->store = pimpl;
     lease_impl->remapped_slots.reserve(request_keys.size());
     for (const auto & keys : request_keys) {
         std::vector<uint32_t> remapped;
@@ -603,13 +602,16 @@ llama_expert_store::lease llama_expert_store::acquire(const std::vector<llama_ex
         }
         lease_impl->remapped_slots.push_back(std::move(remapped));
     }
+    lease_impl->pinned_slots.reserve(unique_keys.size());
     for (const expert_key & key : unique_keys) {
-        const uint32_t slot_id = resident.at(key);
+        lease_impl->pinned_slots.push_back(resident.at(key));
+    }
+    for (uint32_t slot_id : lease_impl->pinned_slots) {
         auto & entry = pimpl->slots[slot_id];
         entry.last_use = ++pimpl->use_clock;
         entry.pins++;
-        lease_impl->pinned_slots.push_back(slot_id);
     }
+    lease_impl->store = pimpl;
 
     pimpl->counters.hits += unique_keys.size() - misses.size();
     pimpl->counters.misses += misses.size();

@@ -31,6 +31,8 @@ struct llama_file {
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
 
+    void discard_cache(size_t offset, size_t length) const;
+
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
@@ -69,6 +71,7 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    static void align_range(size_t * first, size_t * last);
     static const bool SUPPORTED;
 
 private:

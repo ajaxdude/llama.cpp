@@ -295,6 +295,8 @@ struct llama_model_loader {
     bool load_all_data(
             struct ggml_context * ctx,
             llama_buf_map & bufs,
+            bool load_from_mmap,
+            bool discard_file_cache,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);

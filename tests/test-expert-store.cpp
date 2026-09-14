@@ -208,6 +208,19 @@ void test_alignment_and_large_offsets() {
     require_throws([] {
         llama_expert_store_align_read(UINT64_MAX - 4, 8, 4096, UINT64_MAX);
     });
+
+    size_t granularity_first = 1;
+    size_t granularity_last = 1;
+    llama_mlock::align_range(&granularity_first, &granularity_last);
+    const size_t lock_granularity = granularity_last;
+    REQUIRE(granularity_first == 0);
+    REQUIRE(lock_granularity > 1);
+
+    size_t lock_first = lock_granularity + 1;
+    size_t lock_last = 2 * lock_granularity;
+    llama_mlock::align_range(&lock_first, &lock_last);
+    REQUIRE(lock_first == lock_granularity);
+    REQUIRE(lock_last == 2 * lock_granularity);
 }
 
 void test_published_layout_accounting() {
