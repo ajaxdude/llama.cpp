@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-arch.h"
+#include "llama-expert-store.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 
@@ -116,6 +117,38 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    struct external_read {
+        void add(const llama_tensor_weight & w);
+
+        bool any() const {
+            return !ranges.empty();
+        }
+
+        bool has(const ggml_tensor * t) const {
+            return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        const llama_mmap::ranges & for_file(uint32_t idx) const {
+            static const llama_mmap::ranges none;
+
+            const auto it = ranges.find(idx);
+            return it == ranges.end() ? none : it->second;
+        }
+
+        bool intersects(uint32_t idx, size_t first, size_t last) const {
+            for (const auto & range : for_file(idx)) {
+                if (range.first < last && first < range.second) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+    private:
+        std::map<uint32_t, llama_mmap::ranges> ranges;
+        std::set<std::string>                  tensors;
+    } external;
 
     llama_files files;
     std::vector<std::string> fnames; // one per entry of files, for readers that outlive the loader
@@ -239,6 +272,12 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    llama_expert_store_tensor register_external_tensor(
+            const std::string & name,
+            int32_t layer,
+            llama_expert_projection projection,
+            const std::initializer_list<int64_t> & ne);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
@@ -256,6 +295,8 @@ struct llama_model_loader {
     bool load_all_data(
             struct ggml_context * ctx,
             llama_buf_map & bufs,
+            bool load_from_mmap,
+            bool discard_file_cache,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);

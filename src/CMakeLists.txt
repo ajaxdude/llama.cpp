@@ -18,6 +18,8 @@ set(LLAMA_CORE_SOURCES
     llama-cparams.cpp
     llama-dsv41.cpp
     llama-dsv41-engram.cpp
+    llama-dsv41-expert.cpp
+    llama-expert-store.cpp
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp

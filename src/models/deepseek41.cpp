@@ -1,5 +1,6 @@
 #include "llama-dsv41.h"
 #include "llama-dsv41-engram.h"
+#include "llama-dsv41-expert.h"
 #include "llama-hparams.h"
 #include "models.h"
 
@@ -148,7 +149,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-[[noreturn]] void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
+void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
@@ -160,6 +161,31 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     const int64_t hc_mult         = hparams.dsv4_hc_mult;
     const int64_t hc_dim          = hc_mult*n_embd;
     const int64_t hc_mix_dim      = (2 + hc_mult)*hc_mult;
+
+    const std::vector<llama_expert_store_tensor> expert_tensors =
+        llama_dsv41_register_expert_tensors([&](const std::string & name,
+                                                int32_t layer,
+                                                llama_expert_projection projection,
+                                                const std::initializer_list<int64_t> & ne) {
+            return ml.register_external_tensor(name, layer, projection, ne);
+        });
+    if (params.expert_cache_bytes == 0 || params.expert_cache_slots <= 0) {
+        throw std::runtime_error(
+                "DeepSeek V4.1 requires non-zero expert_cache_bytes and expert_cache_slots before tensor allocation");
+    }
+    llama_dsv41_expert_runtime_params expert_params;
+    expert_params.cache_bytes = params.expert_cache_bytes;
+    expert_params.cache_slots = params.expert_cache_slots;
+    expert_params.direct_io = true;
+    expert_params.allow_buffered_io = false;
+    expert_params.no_alloc = ml.no_alloc;
+    experts = std::make_shared<llama_dsv41_expert_runtime>(
+            expert_tensors,
+            expert_params,
+            [this](const llama_expert_store_tensor & tensor) {
+                return select_moe_buft(
+                        tensor.layer, tensor.type, tensor.ne[0], tensor.ne[1], params.expert_cache_slots);
+            });
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -203,9 +229,9 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", il), { n_expert }, 0);
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", il), { n_expert }, TENSOR_NOT_REQUIRED);
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", il), { n_embd }, 0);
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        layer.ffn_up_exps = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd, n_ff_exp, n_expert }, 0);
+        layer.ffn_gate_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_GATE);
+        layer.ffn_down_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_DOWN);
+        layer.ffn_up_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_UP);
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd, n_ff_exp*n_expert_shared }, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { n_ff_exp*n_expert_shared, n_embd }, 0);
         layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", il), { n_embd, n_ff_exp*n_expert_shared }, 0);
@@ -245,9 +271,38 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    throw std::runtime_error(
-            std::string("DeepSeek V4.1 Engram metadata and disk extents are valid, but execution is blocked: ") +
-            llama_dsv41_runtime_dependency_error());
+}
+
+bool llama_model_deepseek41::requires_synchronous_graph() const {
+    return experts != nullptr;
+}
+
+std::string llama_model_deepseek41::consume_runtime_error() const {
+    return experts ? experts->consume_error() : std::string();
+}
+
+void llama_model_deepseek41::release_runtime_work() const {
+    if (experts) {
+        experts->release_all();
+    }
+}
+
+void llama_model_deepseek41::release_runtime_work_after_sync(ggml_backend_sched_t sched) const {
+    if (experts) {
+        experts->release_all_after_sync(sched);
+    }
+}
+
+void llama_model_deepseek41::acquire_runtime_context() const {
+    if (experts) {
+        experts->acquire_context();
+    }
+}
+
+void llama_model_deepseek41::release_runtime_context() const {
+    if (experts) {
+        experts->release_context();
+    }
 }
 
 [[noreturn]] std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params &) const {
