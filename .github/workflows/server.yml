@@ -94,12 +94,20 @@ jobs:
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
+      - name: Python setup
+        id: setup_python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: -r tools/server/tests/requirements.txt
+
       - name: Build
         id: cmake_build
         run: |
           cmake -B build \
             -DGGML_SCHED_NO_REALLOC=ON \
-            -DLLAMA_OPENSSL=OFF
+            -DLLAMA_OPENSSL=OFF \
+            -DPython3_EXECUTABLE="$(command -v python3)"
           cmake --build build --config Release -j $(nproc) --target \
             llama-server \
             llama-deepseek-v41-trace \
@@ -119,13 +127,6 @@ jobs:
           hf_bucket: ggml-org/cache
           save: true
 
-      - name: Python setup
-        id: setup_python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          pip-install: -r tools/server/tests/requirements.txt
-
       - name: DeepSeek V4.1 trace CTest
         id: deepseek_v41_trace_ctest
         run: |
@@ -133,12 +134,40 @@ jobs:
           ctest --test-dir build --show-only=json-v1 -R '^test-deepseek41-trace$' > build/test-deepseek41-trace-ctest-metadata.json
           python3 - <<'PY'
           import json
+          import subprocess
+          import sys
           from pathlib import Path
 
           metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
           tests = metadata.get("tests", [])
           if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
               raise SystemExit(f"expected exactly one test-deepseek41-trace selector match, got {len(tests)}")
+          command = tests[0].get("command", [])
+          if not command or not isinstance(command[0], str) or not Path(command[0]).is_absolute():
+              raise SystemExit("test-deepseek41-trace interpreter is absent or relative")
+          registered_interpreter = Path(command[0]).resolve(strict=True)
+          selected_interpreter = Path(sys.executable).resolve(strict=True)
+          if registered_interpreter != selected_interpreter:
+              raise SystemExit(
+                  f"test-deepseek41-trace interpreter mismatch: "
+                  f"registered={registered_interpreter} selected={selected_interpreter}")
+          registered_version = subprocess.check_output(
+              [str(registered_interpreter), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+              text=True,
+          ).strip()
+          if registered_version != "3.11" or sys.version_info[:2] != (3, 11):
+              raise SystemExit(
+                  f"test-deepseek41-trace requires Python 3.11: "
+                  f"registered={registered_version} selected={sys.version_info.major}.{sys.version_info.minor}")
+          Path("build/test-deepseek41-trace-python.json").write_text(
+              json.dumps({
+                  "registered_interpreter": str(registered_interpreter),
+                  "registered_version": registered_version,
+                  "selected_interpreter": str(selected_interpreter),
+                  "selected_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+              }, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
           properties = {
               item["name"]: item["value"]
               for item in tests[0].get("properties", [])
@@ -182,6 +211,7 @@ jobs:
               "DSV41_NATIVE_INJECT_LIBRARY",
           )
           _ORIGINAL_CALL_TEST_METHOD = unittest.TestCase._callTestMethod
+          _ORIGINAL_ADD_SKIP = unittest.TextTestResult.addSkip
 
           def _write_marker(path, payload):
               descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -222,7 +252,25 @@ jobs:
                       raise RuntimeError(f"{_TEST_ID} entered more than once")
               return _ORIGINAL_CALL_TEST_METHOD(self, method)
 
+          def _add_skip(self, test, reason):
+              method = getattr(test, getattr(test, "_testMethodName", ""), None)
+              function = getattr(method, "__func__", method)
+              code = getattr(function, "__code__", None)
+              source = Path(code.co_filename).resolve(strict=True) if code is not None else None
+              test_id = test.id()
+              payload = {
+                  "event": "test_skip",
+                  "reason": reason,
+                  "source": str(source) if source is not None else None,
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest() if source is not None else None,
+                  "test_id": test_id,
+              }
+              digest = hashlib.sha256(test_id.encode("ascii")).hexdigest()
+              _write_marker(_MARKER_DIR / f"skip-{digest}.json", payload)
+              return _ORIGINAL_ADD_SKIP(self, test, reason)
+
           unittest.TestCase._callTestMethod = _call_test_method
+          unittest.TextTestResult.addSkip = _add_skip
           PY
           chmod 0444 build/deepseek-v41-trace-hook/sitecustomize.py
           cmake -E sha256sum build/deepseek-v41-trace-hook/sitecustomize.py > build/deepseek-v41-trace-hook/sitecustomize.sha256
@@ -240,6 +288,7 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
+          import sys
           from pathlib import Path
           from xml.etree import ElementTree
 
@@ -257,8 +306,8 @@ jobs:
           if actual != expected:
               raise SystemExit(f"test-deepseek41-trace JUnit result is invalid: {actual}")
           log = Path("build/test-deepseek41-trace-ctest.log").read_text(errors="replace")
-          if "***Skipped" in log or "***Not Run" in log or "OK (skipped=" in log:
-              raise SystemExit("test-deepseek41-trace contained a skipped or not-run test")
+          if "***Skipped" in log or "***Not Run" in log:
+              raise SystemExit("test-deepseek41-trace was skipped or not run")
 
           metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
           test = metadata["tests"][0]
@@ -285,10 +334,11 @@ jobs:
           marker_dir = Path("build/deepseek-v41-trace-marker")
           entries = list(marker_dir.glob("entry.json"))
           duplicates = list(marker_dir.glob("duplicate-*.json"))
+          skips = list(marker_dir.glob("skip-*.json"))
           unexpected = [
               path
               for path in marker_dir.iterdir()
-              if path not in entries and path not in duplicates
+              if path not in entries and path not in duplicates and path not in skips
           ]
           if len(entries) != 1 or duplicates or unexpected:
               raise SystemExit(
@@ -315,6 +365,20 @@ jobs:
               raise SystemExit("private PID namespace/pidfd marker ppid is invalid")
           if not isinstance(marker.get("timestamp_monotonic_ns"), int) or marker["timestamp_monotonic_ns"] <= 0:
               raise SystemExit("private PID namespace/pidfd marker timestamp is invalid")
+          if sys.platform != "linux":
+              raise SystemExit(f"test-deepseek41-trace requires Linux, got {sys.platform}")
+          if len(skips) != 1:
+              raise SystemExit(f"test-deepseek41-trace approved skip count is invalid: {len(skips)}")
+          approved_skip = json.loads(skips[0].read_text())
+          expected_skip = {
+              "event": "test_skip",
+              "reason": "Linux uses subreaper and pidfd containment",
+              "source": str(expected_source),
+              "source_sha256": hashlib.sha256(expected_source.read_bytes()).hexdigest(),
+              "test_id": "__main__.TraceFormatTests.test_unproven_posix_containment_fails_closed_before_setsid_escape",
+          }
+          if approved_skip != expected_skip:
+              raise SystemExit("test-deepseek41-trace skip identity is invalid")
           PY
 
       - name: Upload DeepSeek V4.1 trace CTest evidence
@@ -324,6 +388,7 @@ jobs:
           name: deepseek-v41-trace-ctest-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             build/test-deepseek41-trace-ctest-metadata.json
+            build/test-deepseek41-trace-python.json
             build/test-deepseek41-trace-ctest.log
             build/test-deepseek41-trace-ctest.xml
             build/deepseek-v41-trace-hook/sitecustomize.py
