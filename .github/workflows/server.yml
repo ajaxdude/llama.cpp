@@ -98,8 +98,14 @@ jobs:
         id: cmake_build
         run: |
           cmake -B build \
-            -DGGML_SCHED_NO_REALLOC=ON
-          cmake --build build --config Release -j $(nproc) --target llama-server
+            -DGGML_SCHED_NO_REALLOC=ON \
+            -DLLAMA_OPENSSL=OFF
+          cmake --build build --config Release -j $(nproc) --target \
+            llama-server \
+            llama-deepseek-v41-trace \
+            llama-deepseek-v41-containment-helper \
+            test-deepseek41-trace-manifest \
+            test-deepseek41-trace-injected
 
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -119,6 +125,122 @@ jobs:
         with:
           python-version: '3.11'
           pip-install: -r tools/server/tests/requirements.txt
+
+      - name: DeepSeek V4.1 trace CTest
+        id: deepseek_v41_trace_ctest
+        run: |
+          set -o pipefail
+          ctest --test-dir build --show-only=json-v1 -R '^test-deepseek41-trace$' > build/test-deepseek41-trace-ctest-metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
+          tests = metadata.get("tests", [])
+          if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
+              raise SystemExit(f"expected exactly one test-deepseek41-trace selector match, got {len(tests)}")
+          properties = {
+              item["name"]: item["value"]
+              for item in tests[0].get("properties", [])
+          }
+          environment = properties.get("ENVIRONMENT", [])
+          if isinstance(environment, str):
+              environment = environment.split(";")
+          required = (
+              "DSV41_NATIVE_TRACE_BINARY=",
+              "DSV41_NATIVE_CONTAINMENT_HELPER=",
+              "DSV41_NATIVE_MANIFEST_BINARY=",
+              "DSV41_NATIVE_INJECT_LIBRARY=",
+          )
+          missing = [
+              name
+              for name in required
+              if not any(value.startswith(name) for value in environment)
+          ]
+          if missing:
+              raise SystemExit(f"test-deepseek41-trace environment is incomplete: {missing}")
+          PY
+          : > build/test-deepseek41-trace-ctest.log
+          ctest --test-dir build \
+            -R '^test-deepseek41-trace$' \
+            --output-on-failure \
+            --verbose \
+            --no-tests=error \
+            --output-junit test-deepseek41-trace-ctest.xml \
+            2>&1 | tee build/test-deepseek41-trace-ctest.log
+          python3 - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = ElementTree.parse("build/test-deepseek41-trace-ctest.xml").getroot()
+          expected = {
+              "tests": 1,
+              "failures": 0,
+              "disabled": 0,
+              "skipped": 0,
+          }
+          actual = {
+              name: int(report.attrib.get(name, -1))
+              for name in expected
+          }
+          if actual != expected:
+              raise SystemExit(f"test-deepseek41-trace JUnit result is invalid: {actual}")
+          log = Path("build/test-deepseek41-trace-ctest.log").read_text(errors="replace")
+          if "***Skipped" in log or "***Not Run" in log or "OK (skipped=" in log:
+              raise SystemExit("test-deepseek41-trace contained a skipped or not-run test")
+          PY
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
+          test = metadata["tests"][0]
+          properties = {
+              item["name"]: item["value"]
+              for item in test.get("properties", [])
+          }
+          environment = properties["ENVIRONMENT"]
+          if isinstance(environment, str):
+              environment = environment.split(";")
+          child_environment = dict(os.environ)
+          for value in environment:
+              name, setting = value.split("=", 1)
+              child_environment[name] = setting
+          test_name = "TraceFormatTests.test_native_watchdog_validation_crosses_private_pid_namespace"
+          result = subprocess.run(
+              [*test["command"], test_name, "--verbose"],
+              cwd=properties["WORKING_DIRECTORY"],
+              env=child_environment,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+              check=False,
+          )
+          output = result.stdout
+          Path("build/test-deepseek41-trace-linux-pidns.log").write_text(output, encoding="utf-8")
+          print(output, end="")
+          if result.returncode != 0:
+              raise SystemExit(result.returncode)
+          if output.count("Ran 1 test") != 1 or test_name not in output:
+              raise SystemExit("private PID namespace/pidfd test count is not exactly one")
+          if "skipped" in output.lower() or not output.rstrip().endswith("OK"):
+              raise SystemExit("private PID namespace/pidfd test was skipped or did not pass")
+          PY
+
+      - name: Upload DeepSeek V4.1 trace CTest evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: deepseek-v41-trace-ctest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/test-deepseek41-trace-ctest-metadata.json
+            build/test-deepseek41-trace-ctest.log
+            build/test-deepseek41-trace-ctest.xml
+            build/test-deepseek41-trace-linux-pidns.log
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Tests
         id: server_integration_tests
