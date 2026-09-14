@@ -118,6 +118,8 @@ build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o SET_ROWS
 build-dsv41-trace-rocm/bin/test-backend-ops -b ROCm0 -o CPY
 ```
 
+Native Linux containment tests are not enabled by default because generic hosted runners do not provide the required mount policy. A dedicated single-purpose runner must set `-DLLAMA_DEEPSEEK_V41_NATIVE_CONTAINMENT_TESTS=ON` and use exactly one administrator-provisioned host configuration: `kernel.apparmor_restrict_unprivileged_userns=0`, or a narrowly scoped AppArmor allow policy for the unchanged receipt-bound helper user namespace, `MS_PRIVATE`, private procfs, and verification sequence. Exact AppArmor policy syntax is host-specific and is not supplied here. The test and production launcher still fail closed when the required namespace operations are unavailable.
+
 Do not change host ROCm packages for this run. Vulkan can provide secondary coverage, but it cannot replace the required ROCm low-level and oracle evidence. The llama runner selects `ROCm0` explicitly, invokes the exact exporter for a pre-allocation device attestation, and rejects the run unless the backend PCI identity maps to exactly one KFD node reporting `gfx1151`. The native exporter repeats the query before model allocation and verifies that the loaded model still uses the same device.
 
 Static repository builds skip this shared-library trace component instead of failing configuration.
