@@ -144,6 +144,7 @@ class TraceError(RuntimeError):
 
 PROCESS_TREE_CLEANUP_TIMEOUT_SECONDS = 5
 PROCESS_STARTUP_DIAGNOSTIC_MAX_BYTES = 65536
+LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS = 8
 PROCESS_TREE_TERM_GRACE_SECONDS = 1
 WINDOWS_CREATE_SUSPENDED = 0x00000004
 WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -908,6 +909,12 @@ def _test_only_process_group_containment() -> Iterable[None]:
         _TEST_PROCESS_GROUP_CONTAINMENT.enabled = previous
 
 
+def _linux_fd_is_close_on_exec(descriptor: int) -> bool:
+    import fcntl
+
+    return bool(fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC)
+
+
 class _LinuxNativeHelperProcess:
     def __init__(
             self,
@@ -936,31 +943,81 @@ class _LinuxNativeHelperProcess:
         requested_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
         data, ancillary, flags, _address = self._protocol_socket.recvmsg(
             128,
-            socket.CMSG_SPACE(item_size),
+            socket.CMSG_SPACE(item_size * LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
             requested_flags,
         )
         received = []
+        rights_records = 0
+        ancillary_error = None
         for level, kind, content in ancillary:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                descriptor_bytes = array.array("i")
-                descriptor_bytes.frombytes(content[:item_size])
-                received.extend(descriptor_bytes)
-        allowed_flags = {0, requested_flags}
-        if flags not in allowed_flags or data != expected:
+            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                ancillary_error = "Linux containment helper sent unexpected ancillary data"
+                continue
+            rights_records += 1
+            complete_size = len(content) - len(content) % item_size
+            descriptor_bytes = array.array("i")
+            descriptor_bytes.frombytes(content[:complete_size])
+            received.extend(descriptor_bytes)
+            if len(content) == 0 or complete_size != len(content):
+                ancillary_error = "Linux containment helper sent malformed descriptor data"
+
+        def reject(message: str) -> None:
+            failures = []
             for descriptor in received:
-                os.close(descriptor)
-            raise TraceError(
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    failures.append(_IntegrityFailure(
+                        "linux-helper-received-fd-close", error))
+            primary = TraceError(message)
+            if failures:
+                raise ExecutionIntegrityError(
+                    f"{message}; secondary integrity failures: "
+                    f"{_format_integrity_failures(failures)}",
+                    primary_error=primary,
+                    secondary_errors=failures,
+                    quiescence_proven=False,
+                ) from primary
+            raise primary
+
+        allowed_flags = {0, requested_flags}
+        if flags not in allowed_flags:
+            reject(
+                f"Linux containment helper protocol returned unexpected flags {flags}")
+        if data != expected:
+            reject(
                 f"Linux containment helper protocol expected {expected.decode('ascii')}")
+        if ancillary_error is not None:
+            reject(ancillary_error)
+        if rights_records > 1:
+            reject("Linux containment helper sent multiple descriptor records")
         if receive_pidfd:
             if len(received) != 1:
-                for descriptor in received:
+                reject("Linux containment helper did not provide one namespace pidfd")
+            descriptor = received[0]
+            try:
+                close_on_exec = _linux_fd_is_close_on_exec(descriptor)
+            except BaseException as error:
+                failures = []
+                try:
                     os.close(descriptor)
-                raise TraceError("Linux containment helper did not provide one namespace pidfd")
-            self.namespace_pidfd = received[0]
+                except BaseException as close_error:
+                    failures.append(_IntegrityFailure(
+                        "linux-helper-received-fd-close", close_error))
+                raise ExecutionIntegrityError(
+                    f"Linux containment helper namespace pidfd validation failed "
+                    f"[{type(error).__name__}: {error}]"
+                    + (f"; secondary integrity failures: "
+                       f"{_format_integrity_failures(failures)}" if failures else ""),
+                    primary_error=error,
+                    secondary_errors=failures,
+                    quiescence_proven=False,
+                ) from error
+            if not close_on_exec:
+                reject("Linux containment helper namespace pidfd is not close-on-exec")
+            self.namespace_pidfd = descriptor
         elif received:
-            for descriptor in received:
-                os.close(descriptor)
-            raise TraceError("Linux containment helper sent an unexpected descriptor")
+            reject("Linux containment helper sent an unexpected descriptor")
 
     def release_exec(self) -> None:
         self._receive_protocol(b"READY")

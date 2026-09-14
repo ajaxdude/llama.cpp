@@ -2878,15 +2878,54 @@ class TraceFormatTests(unittest.TestCase):
             process._receive_protocol(b"READY")
         protocol.recvmsg.assert_called_once_with(
             128,
-            trace.socket.CMSG_SPACE(array.array("i").itemsize),
+            trace.socket.CMSG_SPACE(
+                array.array("i").itemsize *
+                trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
+            1073741824,
+        )
+
+    def test_linux_protocol_accepts_one_cloexec_pidfd(self) -> None:
+        rights = array.array("i", [71]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace, "_linux_fd_is_close_on_exec", return_value=True) as cloexec:
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertEqual(process.namespace_pidfd, 71)
+        cloexec.assert_called_once_with(71)
+        protocol.recvmsg.assert_called_once_with(
+            128,
+            trace.socket.CMSG_SPACE(
+                array.array("i").itemsize *
+                trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
             1073741824,
         )
 
     def test_linux_protocol_rejects_truncation_and_unknown_flags(self) -> None:
+        rights = array.array("i", [71, 72]).tobytes()
         for flags in (1073741824 | 32, 1073741824 | 8, 536870912):
             with self.subTest(flags=flags):
                 protocol = mock.Mock()
-                protocol.recvmsg.return_value = (b"READY", [], flags, None)
+                protocol.recvmsg.return_value = (
+                    b"READY",
+                    [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+                    flags,
+                    None,
+                )
                 process = trace._LinuxNativeHelperProcess(
                     ["approved"],
                     71,
@@ -2896,9 +2935,247 @@ class TraceFormatTests(unittest.TestCase):
                     stderr_fd=None,
                 )
                 with mock.patch.object(
-                        trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), self.assertRaisesRegex(
-                        trace.TraceError, "protocol expected READY"):
+                        trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                        trace.os, "close") as close, self.assertRaisesRegex(
+                        trace.TraceError, "unexpected flags"):
                     process._receive_protocol(b"READY")
+                self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+
+    def test_linux_protocol_rejects_two_pidfds_in_one_record(self) -> None:
+        rights = array.array("i", [71, 72]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, mock.patch.object(
+                trace, "_linux_fd_is_close_on_exec") as cloexec, self.assertRaisesRegex(
+                trace.TraceError, "one namespace pidfd"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+        cloexec.assert_not_called()
+
+    def test_linux_protocol_rejects_multiple_rights_records(self) -> None:
+        first = array.array("i", [71]).tobytes()
+        second = array.array("i", [72]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [
+                (trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, first),
+                (trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, second),
+            ],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "multiple descriptor records"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+
+    def test_linux_protocol_rejects_malformed_rights_payload(self) -> None:
+        malformed = array.array("i", [71]).tobytes() + b"x"
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, malformed)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "malformed descriptor data"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        close.assert_called_once_with(71)
+
+    def test_linux_protocol_rejects_unexpected_ancillary_and_closes_rights(self) -> None:
+        rights = array.array("i", [71]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [
+                (trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights),
+                (trace.socket.SOL_SOCKET, 12345, b"unexpected"),
+            ],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "unexpected ancillary data"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        close.assert_called_once_with(71)
+
+    def test_linux_protocol_rejects_pidfd_without_cloexec(self) -> None:
+        rights = array.array("i", [71]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace, "_linux_fd_is_close_on_exec", return_value=False), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "not close-on-exec"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        close.assert_called_once_with(71)
+
+    def test_linux_protocol_fcntl_failure_closes_pidfd(self) -> None:
+        rights = array.array("i", [71]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"PREPARED",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        primary = OSError("fcntl failed")
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace, "_linux_fd_is_close_on_exec", side_effect=primary), mock.patch.object(
+                trace.os, "close") as close, self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertIs(raised.exception.primary_error, primary)
+        self.assertFalse(raised.exception.quiescence_proven)
+        close.assert_called_once_with(71)
+
+    def test_linux_protocol_wrong_payload_closes_every_received_fd(self) -> None:
+        rights = array.array("i", [71, 72]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"WRONG",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "protocol expected PREPARED"):
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+
+    def test_linux_protocol_close_failure_still_closes_remaining_fds(self) -> None:
+        rights = array.array("i", [71, 72]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"WRONG",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        close_error = OSError("close failed")
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close", side_effect=[close_error, None]) as close, self.assertRaises(
+                trace.ExecutionIntegrityError) as raised:
+            process._receive_protocol(b"PREPARED", receive_pidfd=True)
+        self.assertEqual(close.call_args_list, [mock.call(71), mock.call(72)])
+        self.assertEqual(
+            [failure.component for failure in raised.exception.secondary_errors],
+            ["linux-helper-received-fd-close"],
+        )
+        self.assertFalse(raised.exception.quiescence_proven)
+
+    def test_linux_protocol_rejects_descriptor_on_payload_only_message(self) -> None:
+        rights = array.array("i", [71]).tobytes()
+        protocol = mock.Mock()
+        protocol.recvmsg.return_value = (
+            b"READY",
+            [(trace.socket.SOL_SOCKET, trace.socket.SCM_RIGHTS, rights)],
+            1073741824,
+            None,
+        )
+        process = trace._LinuxNativeHelperProcess(
+            ["approved"],
+            71,
+            protocol_socket=protocol,
+            stdin_fd=None,
+            stdout_fd=None,
+            stderr_fd=None,
+        )
+        with mock.patch.object(
+                trace.socket, "MSG_CMSG_CLOEXEC", 1073741824, create=True), mock.patch.object(
+                trace.os, "close") as close, self.assertRaisesRegex(
+                trace.TraceError, "unexpected descriptor"):
+            process._receive_protocol(b"READY")
+        close.assert_called_once_with(71)
 
     def test_native_pidfd_packet_rejects_truncation_unknown_flags_and_oversize(self) -> None:
         import socket
