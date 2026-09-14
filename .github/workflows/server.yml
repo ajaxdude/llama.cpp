@@ -728,7 +728,7 @@ jobs:
                   raise RuntimeError(f"CTest JUnit result is invalid: {junit}")
               if "***Skipped" in log or "***Not Run" in log:
                   raise RuntimeError("CTest was skipped or not run")
-              start_pattern = re.compile(r"^\s*Start\s+\d+:\s+test-deepseek41-trace\s*$")
+              start_pattern = re.compile(r"^\s*Start\s+[1-9]\d*:\s+test-deepseek41-trace\s*$")
               starts = sum(start_pattern.fullmatch(line) is not None for line in log.splitlines())
               if starts != 1:
                   raise RuntimeError(f"registered CTest execution count is invalid: {starts}")
@@ -756,8 +756,12 @@ jobs:
                   if isinstance(node, ast.ClassDef) and node.name == "TraceFormatTests":
                       for member in node.body:
                           if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == TARGET_METHOD:
-                              return member.lineno
+                              return min([member.lineno, *(decorator.lineno for decorator in member.decorator_list)])
               raise RuntimeError("target method is absent")
+
+          def validate_first_line(actual, expected):
+              if actual != expected:
+                  raise RuntimeError(f"target first line differs: actual={actual} expected={expected}")
 
           def validate_counts(entries, duplicates, target_skips, total_skips):
               if entries != 1 or duplicates != 0 or target_skips != 0 or total_skips != 1:
@@ -810,7 +814,6 @@ jobs:
                   "active_forbidden_loader_environment": [],
                   "bindings": bindings,
                   "event": "test_method_entry",
-                  "first_line": target_first_line(source),
                   "function": TARGET_METHOD,
                   "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
                   "hook_sha256": os.environ["DSV41_CI_HOOK_SHA256"],
@@ -826,6 +829,7 @@ jobs:
               for name, value in expected.items():
                   if marker.get(name) != value:
                       raise RuntimeError(f"target entry marker {name} differs")
+              validate_first_line(marker.get("first_line"), target_first_line(source))
               if not isinstance(marker.get("pid"), int) or marker["pid"] <= 1:
                   raise RuntimeError("target entry marker PID is invalid")
               if not isinstance(marker.get("ppid"), int) or marker["ppid"] <= 0:
@@ -884,6 +888,21 @@ jobs:
               rejected(lambda: validate_outer(
                   0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
                   "Start 35: test-deepseek41-trace\nStart 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 0: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 35: wrong-test\n"))
+              decorated = ast.parse(
+                  "class TraceFormatTests:\n"
+                  "    @staticmethod\n"
+                  "    def test_native_watchdog_validation_crosses_private_pid_namespace():\n"
+                  "        pass\n")
+              member = decorated.body[0].body[0]
+              first_line = min([member.lineno, *(item.lineno for item in member.decorator_list)])
+              validate_first_line(first_line, 2)
+              rejected(lambda: validate_first_line(member.lineno, 2))
               validate_counts(1, 0, 0, 1)
               for counts in ((0, 0, 0, 1), (1, 1, 0, 1), (1, 0, 1, 1), (1, 0, 0, 2)):
                   rejected(lambda counts=counts: validate_counts(*counts))
