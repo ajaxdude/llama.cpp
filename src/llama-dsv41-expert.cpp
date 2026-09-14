@@ -81,6 +81,7 @@ struct llama_dsv41_expert_runtime::impl {
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> contexts;
     std::vector<ggml_backend_buffer_ptr> buffers;
     upload_fn upload;
+    publish_fn before_publish;
     size_t bytes_cache = 0;
     size_t bytes_staging = 0;
     uint64_t use_clock = 0;
@@ -93,7 +94,9 @@ struct llama_dsv41_expert_runtime::impl {
             std::vector<llama_expert_store_tensor> tensors,
             const llama_dsv41_expert_runtime_params & params,
             buft_selector select_buft,
-            upload_fn upload) : params(params), upload(std::move(upload)) {
+            upload_fn upload,
+            publish_fn before_publish)
+        : params(params), upload(std::move(upload)), before_publish(std::move(before_publish)) {
         if (params.cache_bytes == 0 || params.cache_slots == 0) {
             throw std::runtime_error("DeepSeek V4.1 expert cache byte and slot capacity must be non-zero");
         }
@@ -322,23 +325,33 @@ struct llama_dsv41_expert_runtime::impl {
             }
         }
 
-        state.pinned_slots.clear();
+        std::vector<uint32_t> pinned_slots;
+        pinned_slots.reserve(unique.size());
         for (int32_t expert_id : unique) {
             const uint32_t slot = resident.at(expert_id);
-            logical_slot & entry = state.slots[slot];
-            entry.last_use = ++use_clock;
-            entry.pins++;
-            state.pinned_slots.push_back(slot);
+            pinned_slots.push_back(slot);
         }
-        state.lease = std::move(lease);
 
         std::vector<int32_t> result;
         result.reserve(expert_ids.size());
         for (int32_t expert_id : expert_ids) {
             result.push_back((int32_t) resident.at(expert_id));
         }
-        state.active_ids = expert_ids;
-        state.active_remap = result;
+        std::vector<int32_t> active_ids = expert_ids;
+        std::vector<int32_t> active_remap = result;
+
+        if (before_publish) {
+            before_publish();
+        }
+        for (uint32_t slot : pinned_slots) {
+            logical_slot & entry = state.slots[slot];
+            entry.last_use = ++use_clock;
+            entry.pins++;
+        }
+        state.pinned_slots = std::move(pinned_slots);
+        state.lease = std::move(lease);
+        state.active_ids = std::move(active_ids);
+        state.active_remap = std::move(active_remap);
         return result;
     }
 
@@ -365,8 +378,10 @@ llama_dsv41_expert_runtime::llama_dsv41_expert_runtime(
         std::vector<llama_expert_store_tensor> tensors,
         const llama_dsv41_expert_runtime_params & params,
         buft_selector select_buft,
-        upload_fn upload)
-    : pimpl(std::make_unique<impl>(this, std::move(tensors), params, std::move(select_buft), std::move(upload))) {
+        upload_fn upload,
+        publish_fn before_publish)
+    : pimpl(std::make_unique<impl>(
+            this, std::move(tensors), params, std::move(select_buft), std::move(upload), std::move(before_publish))) {
 }
 
 llama_dsv41_expert_runtime::~llama_dsv41_expert_runtime() = default;
