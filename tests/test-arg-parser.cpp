@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "fit.h"
 #include "llama.h"
 #include "speculative.h"
 
@@ -174,12 +175,17 @@ static void test(void) {
         common_params default_params;
         const auto model_params = common_model_params_to_llama(default_params);
         auto context_params = common_context_params_to_llama(default_params);
+        assert(model_params.dsv41_admission_sequences == 1);
         assert(model_params.dsv41_admission_ubatch == 32);
         common_context_params_apply_arch_defaults("deepseek41", default_params, context_params);
+        assert(default_params.n_parallel == 1);
+        assert(context_params.n_seq_max == 1);
         assert(context_params.n_ubatch == 32);
 
         common_params explicit_params;
-        std::vector<std::string> explicit_argv = { "binary_name", "-m", "model_file.gguf", "-ub", "37" };
+        std::vector<std::string> explicit_argv = {
+            "binary_name", "-m", "model_file.gguf", "-ub", "37", "-np", "3",
+        };
         assert(common_params_parse(
                 explicit_argv.size(),
                 list_str_to_char(explicit_argv).data(),
@@ -188,9 +194,48 @@ static void test(void) {
         const auto explicit_model_params = common_model_params_to_llama(explicit_params);
         auto explicit_context_params = common_context_params_to_llama(explicit_params);
         assert(explicit_params.n_ubatch_explicit);
+        assert(explicit_params.n_parallel_explicit);
+        assert(explicit_model_params.dsv41_admission_sequences == 3);
         assert(explicit_model_params.dsv41_admission_ubatch == 37);
         common_context_params_apply_arch_defaults("deepseek41", explicit_params, explicit_context_params);
+        assert(explicit_params.n_parallel == 3);
+        assert(explicit_context_params.n_seq_max == 3);
         assert(explicit_context_params.n_ubatch == 37);
+    }
+
+    {
+        common_params server_params;
+        std::vector<std::string> server_argv = { "binary_name", "-m", "model_file.gguf" };
+        assert(common_params_parse(
+                server_argv.size(),
+                list_str_to_char(server_argv).data(),
+                server_params,
+                LLAMA_EXAMPLE_SERVER));
+        assert(server_params.n_parallel == -1);
+        assert(!server_params.n_parallel_explicit);
+
+        server_params.n_parallel = 4;
+        server_params.kv_unified = true;
+        server_params.kv_unified_per_slot = 32768;
+        server_params.n_ctx = 4 * server_params.kv_unified_per_slot;
+        server_params.n_ctx_auto_sized = true;
+
+        const auto model_params = common_model_params_to_llama(server_params);
+        auto context_params = common_context_params_to_llama(server_params);
+        assert(model_params.dsv41_admission_sequences == 1);
+        assert(model_params.dsv41_admission_context == 32768);
+
+        auto fit_context_params = context_params;
+        common_fit_context_params_apply_arch_defaults("deepseek41", model_params, fit_context_params);
+        assert(fit_context_params.n_seq_max == 1);
+        assert(fit_context_params.n_ctx == 32768);
+        assert(fit_context_params.n_ubatch == 32);
+
+        common_context_params_apply_arch_defaults("deepseek41", server_params, context_params);
+        assert(server_params.n_parallel == 1);
+        assert(server_params.n_ctx == 32768);
+        assert(context_params.n_seq_max == 1);
+        assert(context_params.n_ctx == 32768);
     }
 
     std::vector<std::string> argv;

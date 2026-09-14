@@ -261,7 +261,9 @@ llama_context::llama_context(
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
-    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    const uint32_t n_ubatch = params.n_ubatch == UINT32_MAX ?
+            model.default_context_ubatch() : params.n_ubatch;
+    cparams.n_ubatch = std::min(cparams.n_batch, n_ubatch == 0 ? params.n_batch : n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -3749,7 +3751,7 @@ llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
-        /*.n_ubatch                    =*/ 512,
+        /*.n_ubatch                    =*/ UINT32_MAX,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,

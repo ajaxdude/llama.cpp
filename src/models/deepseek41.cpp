@@ -827,6 +827,10 @@ uint32_t llama_model_deepseek41::default_context_size() const {
     return admission ? admission->result.n_ctx : LLAMA_DSV41_ADMISSION_CONTEXT;
 }
 
+uint32_t llama_model_deepseek41::default_context_ubatch() const {
+    return admission ? admission->result.n_ubatch : LLAMA_DSV41_ADMISSION_UBATCH;
+}
+
 void llama_model_deepseek41::validate_context_params(const llama_cparams & cparams) const {
     if (!admission) {
         throw std::runtime_error("DeepSeek V4.1 context has no host-memory admission result");

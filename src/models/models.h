@@ -1339,6 +1339,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     void acquire_runtime_context() const override;
     void release_runtime_context() const override;
     uint32_t default_context_size() const override;
+    uint32_t default_context_ubatch() const override;
     void validate_context_params(const llama_cparams & cparams) const override;
     void validate_memory_accounting(uint64_t state_bytes, uint64_t graph_workspace_bytes) const override;
 

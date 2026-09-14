@@ -14,6 +14,7 @@ static constexpr uint64_t LLAMA_DSV41_WATCHDOG_EMERGENCY_BYTES = 118ULL << 30;
 static constexpr uint64_t LLAMA_DSV41_ADMISSION_HARD_BYTES     = 120ULL << 30;
 static constexpr uint64_t LLAMA_DSV41_ADMISSION_MARGIN_BYTES   =   2ULL << 30;
 static constexpr uint32_t LLAMA_DSV41_ADMISSION_CONTEXT        = 32768;
+static constexpr uint32_t LLAMA_DSV41_ADMISSION_UBATCH         = 32;
 
 struct llama_dsv41_host_memory {
     uint64_t total = 0;
@@ -35,7 +36,7 @@ struct llama_dsv41_admission_params {
     uint32_t n_ctx = LLAMA_DSV41_ADMISSION_CONTEXT;
     uint32_t n_batch = 2048;
     uint32_t n_seq = 1;
-    uint32_t n_ubatch = 2048;
+    uint32_t n_ubatch = LLAMA_DSV41_ADMISSION_UBATCH;
     uint32_t n_outputs_max = 2048;
     uint32_t n_outputs_max_per_seq = 2048;
     uint32_t n_vocab = 0;

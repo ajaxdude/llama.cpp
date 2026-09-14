@@ -9,7 +9,7 @@ HIP_LAUNCH_BLOCKING=1 \
 ./scripts/strix_memory_watchdog.py -- \
     ./build/bin/llama-server \
     -m /mnt/models/deepseek-v41/DeepSeek-V4.1-Flash-Q2.gguf \
-    -c 32768 -b 2048 -ub 32 -ngl 99 -dev ROCm0 \
+    -c 32768 -b 2048 -ub 32 -np 1 -ngl 99 -dev ROCm0 \
     --expert-cache-slots 192 --expert-cache-mib 72900
 ```
 

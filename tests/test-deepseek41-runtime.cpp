@@ -585,7 +585,7 @@ static void test_graph_construction() {
     ggml_free(ctx);
 }
 
-struct reservation_test_model final : llama_model {
+struct reservation_test_model : llama_model {
     mutable bool active = false;
     mutable uint32_t acquisitions = 0;
     mutable uint32_t releases = 0;
@@ -622,6 +622,18 @@ struct reservation_test_model final : llama_model {
     }
 };
 
+struct default_ubatch_test_model final : reservation_test_model {
+    uint32_t default_context_ubatch() const override {
+        return 32;
+    }
+
+    void validate_context_params(const llama_cparams & cparams) const override {
+        if (cparams.n_ubatch != 32) {
+            throw std::runtime_error("unexpected context ubatch");
+        }
+    }
+};
+
 static llama_context_params reservation_context_params() {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 32;
@@ -629,6 +641,35 @@ static llama_context_params reservation_context_params() {
     params.n_ubatch = 1;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     return params;
+}
+
+static void test_default_context_ubatch() {
+    default_ubatch_test_model model;
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 1024;
+    params.n_batch = 1024;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    check(params.n_ubatch == UINT32_MAX, "public context defaults do not preserve model-aware ubatch selection");
+
+    llama_context * context = llama_init_from_model(&model, params);
+    check(context != nullptr, "public default context did not use the model ubatch");
+    check(llama_n_ubatch(context) == 32, "public default context resolved the wrong model ubatch");
+    llama_free(context);
+
+    params.n_ubatch = 512;
+    context = llama_init_from_model(&model, params);
+    check(context == nullptr, "explicit context ubatch was silently replaced by the model default");
+    llama_free(context);
+
+    reservation_test_model standard_model;
+    params = llama_context_default_params();
+    params.n_ctx = 1024;
+    params.n_batch = 1024;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    context = llama_init_from_model(&standard_model, params);
+    check(context != nullptr, "public default context failed for a standard model");
+    check(llama_n_ubatch(context) == 512, "standard model default ubatch changed");
+    llama_free(context);
 }
 
 static void test_runtime_context_reservation() {
@@ -684,6 +725,7 @@ int main() {
     test_output_collapse();
     test_graph_contract();
     test_graph_construction();
+    test_default_context_ubatch();
     test_runtime_context_reservation();
     return 0;
 }

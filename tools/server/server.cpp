@@ -150,7 +150,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 unless the model requires a safer default\n");
 
             params.n_parallel = 4;
             params.kv_unified = true;
@@ -165,6 +165,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     if (ctx_pool_auto_sized) {
         params.n_ctx = params.n_parallel * params.kv_unified_per_slot;
+        params.n_ctx_auto_sized = true;
         SRV_INF("--kv-unified-per-slot: sizing KV pool to n_parallel * kv_unified_per_slot = %d * %d = %d\n", params.n_parallel,
                 params.kv_unified_per_slot, params.n_ctx);
     }
