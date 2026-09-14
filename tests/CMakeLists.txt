@@ -196,6 +196,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
+    llama_build_and_test(test-deepseek41-admission.cpp)
     llama_build_and_test(test-deepseek41-schema.cpp)
     llama_build_and_test(test-deepseek41-engram.cpp)
     llama_build_and_test(test-deepseek41-expert.cpp)

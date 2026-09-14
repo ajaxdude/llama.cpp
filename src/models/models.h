@@ -1323,7 +1323,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     };
 
     struct engram_model;
+    struct admission_model;
     std::shared_ptr<engram_model> engram;
+    std::shared_ptr<admission_model> admission;
     std::shared_ptr<llama_dsv41_expert_runtime> experts;
 
     std::unique_ptr<llama_dsv41_engram_runtime> create_memory_engram_runtime(size_t max_tokens) const;
@@ -1336,6 +1338,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     void release_runtime_work_after_sync(ggml_backend_sched_t sched) const override;
     void acquire_runtime_context() const override;
     void release_runtime_context() const override;
+    uint32_t default_context_size() const override;
+    uint32_t default_context_ubatch() const override;
+    void validate_context_params(const llama_cparams & cparams) const override;
+    void validate_memory_accounting(uint64_t state_bytes, uint64_t graph_workspace_bytes) const override;
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

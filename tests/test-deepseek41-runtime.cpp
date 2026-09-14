@@ -1,5 +1,8 @@
 #include "../src/llama-dsv41.h"
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
+#include "../src/llama-graph.h"
+#include "../src/llama-model.h"
 #include "../tools/deepseek-v41-trace/trace-components.h"
 
 #include "ggml-backend.h"
@@ -13,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -686,6 +690,136 @@ static void test_graph_construction() {
     ggml_free(ctx);
 }
 
+struct reservation_test_model : llama_model {
+    mutable bool active = false;
+    mutable uint32_t acquisitions = 0;
+    mutable uint32_t releases = 0;
+
+    reservation_test_model() : llama_model(llama_model_default_params()) {
+        arch = LLM_ARCH_BERT;
+        hparams.vocab_only = true;
+        hparams.n_ctx_train = 32;
+        hparams.causal_attn = true;
+    }
+
+    void acquire_runtime_context() const override {
+        ++acquisitions;
+        if (active) {
+            throw std::runtime_error("duplicate runtime context");
+        }
+        active = true;
+    }
+
+    void release_runtime_context() const override {
+        check(active, "runtime context released without acquisition");
+        active = false;
+        ++releases;
+    }
+
+    void load_stats(llama_model_loader &) override {}
+    void load_hparams(llama_model_loader &) override {}
+    void load_vocab(llama_model_loader &) override {}
+    bool load_tensors(llama_model_loader &) override { return true; }
+    void load_arch_hparams(llama_model_loader &) override {}
+    void load_arch_tensors(llama_model_loader &) override {}
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override {
+        return nullptr;
+    }
+};
+
+struct default_ubatch_test_model final : reservation_test_model {
+    uint32_t default_context_ubatch() const override {
+        return 32;
+    }
+
+    void validate_context_params(const llama_cparams & cparams) const override {
+        if (cparams.n_ubatch != 32) {
+            throw std::runtime_error("unexpected context ubatch");
+        }
+    }
+};
+
+static llama_context_params reservation_context_params() {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 32;
+    params.n_batch = 1;
+    params.n_ubatch = 1;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    return params;
+}
+
+static void test_default_context_ubatch() {
+    default_ubatch_test_model model;
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 1024;
+    params.n_batch = 1024;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    check(params.n_ubatch == UINT32_MAX, "public context defaults do not preserve model-aware ubatch selection");
+
+    llama_context * context = llama_init_from_model(&model, params);
+    check(context != nullptr, "public default context did not use the model ubatch");
+    check(llama_n_ubatch(context) == 32, "public default context resolved the wrong model ubatch");
+    llama_free(context);
+
+    params.n_ubatch = 512;
+    context = llama_init_from_model(&model, params);
+    check(context == nullptr, "explicit context ubatch was silently replaced by the model default");
+    llama_free(context);
+
+    reservation_test_model standard_model;
+    params = llama_context_default_params();
+    params.n_ctx = 1024;
+    params.n_batch = 1024;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    context = llama_init_from_model(&standard_model, params);
+    check(context != nullptr, "public default context failed for a standard model");
+    check(llama_n_ubatch(context) == 512, "standard model default ubatch changed");
+    llama_free(context);
+}
+
+static void test_runtime_context_reservation() {
+    reservation_test_model model;
+    auto first = std::make_unique<llama_context>(model, reservation_context_params());
+    check(model.active && model.acquisitions == 1 && model.releases == 0,
+            "first runtime context did not acquire the model reservation");
+
+    llama_sampler * invalid_sampler = llama_sampler_init_greedy();
+    llama_sampler_seq_config sampler_config = { 0, invalid_sampler };
+    llama_context_params duplicate_params = reservation_context_params();
+    duplicate_params.samplers = &sampler_config;
+    duplicate_params.n_samplers = 1;
+    std::string duplicate_error;
+    try {
+        auto duplicate = std::make_unique<llama_context>(model, duplicate_params);
+    } catch (const std::runtime_error & error) {
+        duplicate_error = error.what();
+    }
+    check(duplicate_error.find("duplicate runtime context") != std::string::npos,
+            "duplicate reservation did not reject before later constructor validation");
+    check(model.active && model.acquisitions == 2 && model.releases == 0,
+            "duplicate reservation changed the active context");
+    first.reset();
+    check(!model.active && model.releases == 1,
+            "successful context destruction did not release the reservation");
+
+    reservation_test_model failed_model;
+    std::string construction_error;
+    try {
+        auto failed = std::make_unique<llama_context>(failed_model, duplicate_params);
+    } catch (const std::runtime_error & error) {
+        construction_error = error.what();
+    }
+    check(construction_error.find("backend samplers must be of type") != std::string::npos,
+            "test constructor did not fail after acquiring the reservation");
+    check(!failed_model.active && failed_model.acquisitions == 1 && failed_model.releases == 1,
+            "failed context construction did not release the reservation");
+    auto recovered = std::make_unique<llama_context>(failed_model, reservation_context_params());
+    check(failed_model.active && failed_model.acquisitions == 2,
+            "failed construction prevented a later context from acquiring");
+    recovered.reset();
+    llama_sampler_free(invalid_sampler);
+}
+
 int main() {
     test_hparams();
     test_source_maps();
@@ -699,5 +833,7 @@ int main() {
     test_candidate_graph_selection(16392, 2048);
     test_graph_contract();
     test_graph_construction();
+    test_default_context_ubatch();
+    test_runtime_context_reservation();
     return 0;
 }

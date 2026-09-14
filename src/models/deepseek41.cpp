@@ -1,9 +1,13 @@
+#include "llama-dsv41-admission.h"
 #include "llama-dsv41.h"
 #include "llama-dsv41-engram.h"
 #include "llama-dsv41-expert.h"
+#include "llama-cparams.h"
 #include "llama-hparams.h"
 #include "llama-memory-dsv41.h"
 #include "models.h"
+
+#include "ggml-alloc.h"
 
 #include <algorithm>
 #include <array>
@@ -35,6 +39,10 @@ std::string llama_dsv41_graph_trace_name(
 struct llama_model_deepseek41::engram_model {
     llama_engram_layout layout;
     std::array<llama_dsv41_engram_extent, LLAMA_ENGRAM_LAYERS> extents;
+};
+
+struct llama_model_deepseek41::admission_model {
+    llama_dsv41_admission_result result;
 };
 
 std::unique_ptr<llama_dsv41_engram_runtime> llama_model_deepseek41::create_memory_engram_runtime(
@@ -616,23 +624,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                                                 const std::initializer_list<int64_t> & ne) {
             return ml.register_external_tensor(name, layer, projection, ne);
         });
-    if (params.expert_cache_bytes == 0 || params.expert_cache_slots <= 0) {
-        throw std::runtime_error(
-                "DeepSeek V4.1 requires non-zero expert_cache_bytes and expert_cache_slots before tensor allocation");
-    }
-    llama_dsv41_expert_runtime_params expert_params;
-    expert_params.cache_bytes = params.expert_cache_bytes;
-    expert_params.cache_slots = params.expert_cache_slots;
-    expert_params.direct_io = true;
-    expert_params.allow_buffered_io = false;
-    expert_params.no_alloc = ml.no_alloc;
-    experts = std::make_shared<llama_dsv41_expert_runtime>(
-            expert_tensors,
-            expert_params,
-            [this](const llama_expert_store_tensor & tensor) {
-                return select_moe_buft(
-                        tensor.layer, tensor.type, tensor.ne[0], tensor.ne[1], params.expert_cache_slots);
-            });
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -676,9 +667,6 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", il), { n_expert }, 0);
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", il), { n_expert }, TENSOR_NOT_REQUIRED);
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", il), { n_embd }, 0);
-        layer.ffn_gate_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_GATE);
-        layer.ffn_down_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_DOWN);
-        layer.ffn_up_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_UP);
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd, n_ff_exp*n_expert_shared }, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { n_ff_exp*n_expert_shared, n_embd }, 0);
         layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", il), { n_embd, n_ff_exp*n_expert_shared }, 0);
@@ -701,7 +689,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
             create_tensor(
                     tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il),
-                    { LLAMA_ENGRAM_ROW_BYTES, (int64_t) extent.rows },
+                    { LLAMA_ENGRAM_ROW_BYTES, (int64_t) engram->extents[index].rows },
                     TENSOR_SKIP);
             layer.engram_q_norm = create_tensor(
                     tn(LLM_TENSOR_ENGRAM_Q_NORM, "weight", il),
@@ -718,6 +706,111 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    uint64_t dense_tensor_bytes = 0;
+    for (const auto & item : ml.ctx_map) {
+        const uint64_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                item.second.get(), item.first.buft);
+        if (bytes > UINT64_MAX - dense_tensor_bytes) {
+            throw std::runtime_error("DeepSeek V4.1 dense allocated tensor byte count overflow");
+        }
+        dense_tensor_bytes += bytes;
+    }
+
+    llama_dsv41_admission_params admission_params;
+    admission_params.soft_bytes = params.dsv41_memory_soft_bytes == 0 ?
+            LLAMA_DSV41_ADMISSION_SOFT_BYTES : params.dsv41_memory_soft_bytes;
+    admission_params.watchdog_bytes = params.dsv41_memory_watchdog_bytes == 0 ?
+            LLAMA_DSV41_WATCHDOG_EMERGENCY_BYTES : params.dsv41_memory_watchdog_bytes;
+    admission_params.hard_bytes = params.dsv41_memory_hard_bytes == 0 ?
+            LLAMA_DSV41_ADMISSION_HARD_BYTES : params.dsv41_memory_hard_bytes;
+    admission_params.safety_margin_bytes = params.dsv41_memory_safety_margin_bytes == 0 ?
+            LLAMA_DSV41_ADMISSION_MARGIN_BYTES : params.dsv41_memory_safety_margin_bytes;
+    admission_params.configured_cache_bytes = params.expert_cache_bytes;
+    admission_params.configured_cache_slots = std::max(params.expert_cache_slots, 0);
+    admission_params.n_ctx = params.dsv41_admission_context == 0 ?
+            LLAMA_DSV41_ADMISSION_CONTEXT : params.dsv41_admission_context;
+    admission_params.n_batch = params.dsv41_admission_batch == 0 ? 2048 : params.dsv41_admission_batch;
+    admission_params.n_seq = params.dsv41_admission_sequences == 0 ? 1 : params.dsv41_admission_sequences;
+    admission_params.n_ubatch = std::min(
+            admission_params.n_batch,
+            params.dsv41_admission_ubatch == 0 ?
+                    32U : params.dsv41_admission_ubatch);
+    admission_params.n_outputs_max = std::min(
+            admission_params.n_batch,
+            params.dsv41_admission_outputs == 0 ?
+                    admission_params.n_batch : params.dsv41_admission_outputs);
+    admission_params.n_outputs_max = std::max(admission_params.n_outputs_max, admission_params.n_seq);
+    admission_params.n_outputs_max_per_seq = std::min(
+            admission_params.n_outputs_max,
+            params.dsv41_admission_outputs_per_seq == 0 ?
+                    admission_params.n_outputs_max : params.dsv41_admission_outputs_per_seq);
+    admission_params.n_vocab = n_vocab;
+    admission_params.n_expert_used = n_expert_used;
+    admission = std::make_shared<admission_model>();
+    if (ml.no_alloc) {
+        if (params.expert_cache_bytes == 0 || params.expert_cache_slots <= 0) {
+            throw std::runtime_error(
+                    "DeepSeek V4.1 no-allocation loading requires non-zero expert_cache_bytes and expert_cache_slots");
+        }
+        admission->result.category = "no_alloc";
+        admission->result.n_ctx = admission_params.n_ctx;
+        admission->result.n_batch = admission_params.n_batch;
+        admission->result.n_seq = admission_params.n_seq;
+        admission->result.n_ubatch = admission_params.n_ubatch;
+        admission->result.n_outputs_max = admission_params.n_outputs_max;
+        admission->result.n_outputs_max_per_seq = admission_params.n_outputs_max_per_seq;
+        admission->result.expert_cache_bytes = params.expert_cache_bytes;
+        admission->result.expert_slots = params.expert_cache_slots;
+    } else {
+        admission_params.state_bytes = llama_dsv41_measure_model_state_bytes(
+                *this,
+                params.dsv41_admission_type_k,
+                params.dsv41_admission_offload_kqv,
+                admission_params.n_ctx,
+                admission_params.n_seq,
+                admission_params.n_ubatch);
+        admission_params.direct_io = true;
+        std::vector<enum ggml_backend_dev_type> device_types;
+        device_types.reserve(devices.size());
+        for (const auto & device : devices) {
+            device_types.push_back(ggml_backend_dev_type(device.dev));
+            ggml_backend_dev_props properties;
+            ggml_backend_dev_get_props(device.dev, &properties);
+            if (properties.memory_total > UINT64_MAX - admission_params.device_reported_bytes) {
+                throw std::runtime_error("DeepSeek V4.1 device-reported memory byte count overflow");
+            }
+            admission_params.device_reported_bytes += properties.memory_total;
+        }
+        admission_params.unified_memory = llama_dsv41_has_unified_topology(device_types);
+        const std::string procfs_root = params.dsv41_procfs_root == nullptr ? "/proc" : params.dsv41_procfs_root;
+        admission->result = llama_dsv41_admit(
+                llama_dsv41_read_host_memory(procfs_root),
+                dense_tensor_bytes,
+                expert_tensors,
+                admission_params);
+        LLAMA_LOG_INFO("%s\n", admission->result.describe().c_str());
+    }
+
+    llama_dsv41_expert_runtime_params expert_params;
+    expert_params.cache_bytes = admission->result.expert_cache_bytes;
+    expert_params.cache_slots = admission->result.expert_slots;
+    expert_params.direct_io = true;
+    expert_params.allow_buffered_io = false;
+    expert_params.no_alloc = ml.no_alloc;
+    experts = std::make_shared<llama_dsv41_expert_runtime>(
+            expert_tensors,
+            expert_params,
+            [this](const llama_expert_store_tensor & tensor) {
+                return select_moe_buft(
+                        tensor.layer, tensor.type, tensor.ne[0], tensor.ne[1], admission->result.expert_slots);
+            });
+
+    for (int32_t il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        layer.ffn_gate_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_GATE);
+        layer.ffn_down_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_DOWN);
+        layer.ffn_up_exps = experts->cache_tensor(il, LLAMA_EXPERT_PROJECTION_UP);
+    }
 }
 
 bool llama_model_deepseek41::requires_synchronous_graph() const {
@@ -750,6 +843,72 @@ void llama_model_deepseek41::release_runtime_context() const {
     if (experts) {
         experts->release_context();
     }
+}
+
+uint32_t llama_model_deepseek41::default_context_size() const {
+    return admission ? admission->result.n_ctx : LLAMA_DSV41_ADMISSION_CONTEXT;
+}
+
+uint32_t llama_model_deepseek41::default_context_ubatch() const {
+    return admission ? admission->result.n_ubatch : LLAMA_DSV41_ADMISSION_UBATCH;
+}
+
+void llama_model_deepseek41::validate_context_params(const llama_cparams & cparams) const {
+    if (hparams.no_alloc) {
+        return;
+    }
+    if (!admission) {
+        throw std::runtime_error("DeepSeek V4.1 context has no host-memory admission result");
+    }
+    const uint32_t n_outputs_max = std::min(cparams.n_outputs_max, cparams.n_batch);
+    const uint32_t output_rows = std::max(n_outputs_max, cparams.n_seq_max);
+    const uint32_t n_outputs_max_per_seq = std::min(cparams.n_outputs_max_per_seq, output_rows);
+    const bool has_layer_embeddings = std::any_of(
+            cparams.embeddings_layer_inp.begin(),
+            cparams.embeddings_layer_inp.end(),
+            [](bool enabled) { return enabled; });
+    if (cparams.n_ctx > admission->result.n_ctx ||
+            cparams.n_batch > admission->result.n_batch ||
+            cparams.n_seq_max > admission->result.n_seq ||
+            cparams.n_ubatch > admission->result.n_ubatch ||
+            output_rows > admission->result.n_outputs_max ||
+            n_outputs_max_per_seq > admission->result.n_outputs_max_per_seq ||
+            cparams.embeddings ||
+            cparams.embeddings_nextn ||
+            has_layer_embeddings) {
+        llama_dsv41_admission_result failure = admission->result;
+        failure.category = "context";
+        throw std::runtime_error(format(
+                "%s, requested_context=%u, requested_batch=%u, requested_sequences=%u, requested_ubatch=%u, "
+                "requested_outputs=%u, requested_outputs_per_seq=%u, embeddings=%s, embeddings_nextn=%s, "
+                "layer_embeddings=%s",
+                failure.describe().c_str(),
+                cparams.n_ctx,
+                cparams.n_batch,
+                cparams.n_seq_max,
+                cparams.n_ubatch,
+                output_rows,
+                n_outputs_max_per_seq,
+                cparams.embeddings ? "true" : "false",
+                cparams.embeddings_nextn ? "true" : "false",
+                has_layer_embeddings ? "true" : "false"));
+    }
+}
+
+void llama_model_deepseek41::validate_memory_accounting(
+        uint64_t state_bytes,
+        uint64_t graph_workspace_bytes) const {
+    if (hparams.no_alloc) {
+        return;
+    }
+    if (!admission) {
+        throw std::runtime_error("DeepSeek V4.1 context has no host-memory admission result");
+    }
+    admission->result = llama_dsv41_validate_runtime_memory(
+            admission->result,
+            state_bytes,
+            graph_workspace_bytes);
+    LLAMA_LOG_INFO("%s\n", admission->result.describe().c_str());
 }
 
 namespace {

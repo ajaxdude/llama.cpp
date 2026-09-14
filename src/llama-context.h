@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -255,6 +256,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    bool consume_pending_config_error();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -288,6 +291,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    std::string pending_config_error;
+    bool runtime_context_acquired = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

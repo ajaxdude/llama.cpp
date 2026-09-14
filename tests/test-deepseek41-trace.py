@@ -6235,8 +6235,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_approved_watchdog_is_exact(self) -> None:
         expected = {
-            "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f":
-                "778db6f50eae04e6c232c69b9575bdbd0747962b",
+            "98313ee0edabe42455f103f68bcbc6cba0e8e117afae8db658e17a18b87038f9":
+                "bbf182a48123f64c65d56ba48c0fc0c2b1d375f7",
         }
         self.assertEqual(preflight.APPROVED_WATCHDOGS, expected)
         self.assertEqual(trace.APPROVED_WATCHDOGS, expected)

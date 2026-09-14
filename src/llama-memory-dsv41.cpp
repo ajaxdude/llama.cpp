@@ -485,6 +485,28 @@ llama_memory_dsv41::llama_memory_dsv41(
             model, type_k, offload, n_ctx, n_seq, n_ubatch, std::move(engram))) {
 }
 
+uint64_t llama_dsv41_measure_model_state_bytes(
+        const llama_model & model,
+        ggml_type type_k,
+        bool offload,
+        uint32_t n_ctx,
+        uint32_t n_seq,
+        uint32_t n_ubatch) {
+    llama_dsv41_memory_config config =
+        make_model_config(model, type_k, offload, n_ctx, n_seq, n_ubatch, nullptr);
+    config.no_alloc = true;
+    const llama_memory_dsv41 memory(std::move(config));
+
+    uint64_t total = 0;
+    for (const auto & entry : memory.memory_breakdown()) {
+        if (entry.second > std::numeric_limits<uint64_t>::max() - total) {
+            throw std::runtime_error("DeepSeek V4.1 state allocation byte count overflow");
+        }
+        total += entry.second;
+    }
+    return total;
+}
+
 llama_memory_dsv41::~llama_memory_dsv41() = default;
 
 llama_memory_context_ptr llama_memory_dsv41::init_batch(

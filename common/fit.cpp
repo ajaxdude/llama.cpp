@@ -6,9 +6,10 @@
 
 #include <array>
 #include <cassert>
-#include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,43 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+void common_fit_context_params_apply_arch_defaults(
+        const char * architecture,
+        const llama_model_params & mparams,
+        llama_context_params & cparams) {
+    if (architecture == nullptr || strcmp(architecture, "deepseek41") != 0) {
+        return;
+    }
+
+    cparams.n_ctx = cparams.n_ctx == 0 ?
+            mparams.dsv41_admission_context :
+            std::min(cparams.n_ctx, mparams.dsv41_admission_context);
+    cparams.n_batch = std::min(cparams.n_batch, mparams.dsv41_admission_batch);
+    cparams.n_seq_max = std::min(cparams.n_seq_max, mparams.dsv41_admission_sequences);
+    cparams.n_ubatch = cparams.n_ubatch == 0 || cparams.n_ubatch == UINT32_MAX ?
+            mparams.dsv41_admission_ubatch :
+            std::min(cparams.n_ubatch, mparams.dsv41_admission_ubatch);
+    cparams.n_outputs_max = cparams.n_outputs_max == 0 ?
+            mparams.dsv41_admission_outputs :
+            std::min(cparams.n_outputs_max, mparams.dsv41_admission_outputs);
+    cparams.n_outputs_max_per_seq = cparams.n_outputs_max_per_seq == 0 ?
+            mparams.dsv41_admission_outputs_per_seq :
+            std::min(cparams.n_outputs_max_per_seq, mparams.dsv41_admission_outputs_per_seq);
+}
+
+void common_fit_context_bounds_apply_arch_defaults(
+        const char * architecture,
+        const llama_model_params & mparams,
+        uint32_t & n_ctx_max,
+        uint32_t & n_ctx_min) {
+    if (architecture == nullptr || strcmp(architecture, "deepseek41") != 0) {
+        return;
+    }
+
+    n_ctx_max = mparams.dsv41_admission_context;
+    n_ctx_min = n_ctx_max;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -34,7 +72,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        std::string * architecture_out = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -62,7 +101,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_params cparams_copy = *cparams;
+    char architecture[128] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0) {
+        common_fit_context_params_apply_arch_defaults(architecture, mparams_copy, cparams_copy);
+        if (architecture_out != nullptr) {
+            *architecture_out = architecture;
+        }
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -260,11 +307,15 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    std::string architecture;
+    dmds_t dmds_full = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &architecture);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
-    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
-    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
+    uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+    uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
+    common_fit_context_bounds_apply_arch_defaults(
+            architecture.c_str(), *mparams, n_ctx_max, n_ctx_min_total);
 
     // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {

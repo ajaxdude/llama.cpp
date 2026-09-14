@@ -217,6 +217,30 @@ class TestWatchdogBehavior(unittest.TestCase):
         )
 
     @staticmethod
+    def _open_fd_identities() -> tuple[tuple[int, int, int, int], ...]:
+        fd_root = (
+            Path("/proc/self/fd")
+            if Path("/proc/self/fd").exists()
+            else Path("/dev/fd")
+        )
+        identities = []
+        for name in os.listdir(fd_root):
+            try:
+                descriptor = int(name)
+                status = os.fstat(descriptor)
+                identities.append(
+                    (
+                        descriptor,
+                        status.st_dev,
+                        status.st_ino,
+                        status.st_mode,
+                    )
+                )
+            except (OSError, ValueError):
+                pass
+        return tuple(sorted(identities))
+
+    @staticmethod
     def _write_procfs_fixture(root: Path) -> None:
         (root / "meminfo").write_text(
             "MemTotal: 131072 kB\nMemAvailable: 65536 kB\n",
@@ -226,6 +250,44 @@ class TestWatchdogBehavior(unittest.TestCase):
             "Filename Type Size Used Priority\n",
             encoding="utf-8",
         )
+
+    def _wait_for_ints(
+        self,
+        path: Path,
+        count: int,
+        message: str,
+        process: subprocess.Popen[str] | None = None,
+    ) -> tuple[int, ...]:
+        deadline = time.monotonic() + 5
+        while True:
+            values = (
+                path.read_text(encoding="utf-8").split()
+                if path.exists()
+                else []
+            )
+            if len(values) == count:
+                try:
+                    return tuple(int(value) for value in values)
+                except ValueError:
+                    pass
+            if process is not None and process.poll() is not None:
+                detail = process.stderr.read() if process.stderr else ""
+                self.fail(f"{message}: {detail}")
+            if time.monotonic() >= deadline:
+                self.fail(message)
+            time.sleep(0.01)
+
+    def _wait_for_json(self, path: Path, message: str) -> Any:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if path.exists():
+                    return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+            if time.monotonic() >= deadline:
+                self.fail(message)
+            time.sleep(0.01)
 
     @staticmethod
     def _lease_arguments(root: Path) -> list[str]:
@@ -303,18 +365,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                         child_pid = None
                         grandchild_pid = None
                         try:
-                            deadline = time.monotonic() + 5
-                            while not pid_file.exists():
-                                if time.monotonic() >= deadline:
-                                    self.fail(
-                                        "child process group did not start"
-                                    )
-                                time.sleep(0.01)
                             child_pid, grandchild_pid = (
-                                int(value)
-                                for value in pid_file.read_text(
-                                    encoding="utf-8"
-                                ).split()
+                                self._wait_for_ints(
+                                    pid_file,
+                                    2,
+                                    "child process group did not start",
+                                )
                             )
                             time.sleep(0.05)
                             wrapper.send_signal(signal_number)
@@ -405,14 +461,20 @@ class TestWatchdogBehavior(unittest.TestCase):
         sys.platform.startswith("linux"),
         "Linux guardian lifecycle",
     )
-    def test_parent_signal_grace_outlives_guardian_pulse_timeout(
+    def test_parent_signal_grace_outlives_guard_heartbeat_timeout(
         self,
     ) -> None:
         child_code = (
-            "import os,signal,sys,time;"
-            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-            "open(sys.argv[1],'w').write(str(os.getpid()));"
-            "time.sleep(30)"
+            "import os,signal,sys,time\n"
+            "from pathlib import Path\n"
+            "from runpy import run_path\n"
+            "start_guard=run_path(sys.argv[1])["
+            "'start_process_group_lease_guard']\n"
+            "start_guard("
+            "Path(sys.argv[1]),expected_procfs_root=Path(sys.argv[2]))\n"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+            "open(sys.argv[3],'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -437,6 +499,8 @@ class TestWatchdogBehavior(unittest.TestCase):
                         sys.executable,
                         "-c",
                         child_code,
+                        str(SCRIPT_PATH),
+                        str(root),
                         str(pid_file),
                     ],
                     stderr=audit,
@@ -444,14 +508,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                 )
                 child_pid = None
                 try:
-                    deadline = time.monotonic() + 5
-                    while not pid_file.exists():
-                        if time.monotonic() >= deadline:
-                            self.fail("child process did not become ready")
-                        time.sleep(0.01)
-                    child_pid = int(
-                        pid_file.read_text(encoding="utf-8")
-                    )
+                    child_pid = self._wait_for_ints(
+                        pid_file,
+                        1,
+                        "child process did not become ready",
+                        wrapper,
+                    )[0]
                     started = time.monotonic()
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -493,19 +555,29 @@ class TestWatchdogBehavior(unittest.TestCase):
         sys.platform.startswith("linux"),
         "Linux guardian lifecycle",
     )
-    def test_parent_signal_allows_exit_after_pulse_deadline(self) -> None:
+    def test_parent_signal_allows_guarded_exit_after_heartbeat_deadline(
+        self,
+    ) -> None:
         child_code = (
             "import os,signal,sys,time\n"
+            "from pathlib import Path\n"
+            "from runpy import run_path\n"
+            "start_guard=run_path(sys.argv[1])["
+            "'start_process_group_lease_guard']\n"
+            "start_guard("
+            "Path(sys.argv[1]),expected_procfs_root=Path(sys.argv[2]))\n"
             "def stop(_signal,_frame):\n"
-            " time.sleep(0.25)\n"
+            " time.sleep(0.6)\n"
+            " open(sys.argv[4],'w').write('handled')\n"
             " raise SystemExit(0)\n"
             "signal.signal(signal.SIGTERM,stop)\n"
-            "open(sys.argv[1],'w').write(str(os.getpid()))\n"
+            "open(sys.argv[3],'w').write(str(os.getpid()))\n"
             "time.sleep(30)\n"
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             pid_file = root / "pid"
+            handled_file = root / "handled"
             stderr_path = root / "stderr.jsonl"
             self._write_procfs_fixture(root)
             with stderr_path.open("w", encoding="utf-8") as audit:
@@ -517,26 +589,30 @@ class TestWatchdogBehavior(unittest.TestCase):
                         str(root),
                         *self._lease_arguments(root),
                         "--grace-seconds",
-                        "0.4",
+                        "1.2",
                         "--sample-interval-seconds",
                         "0.05",
                         "--heartbeat-max-age-seconds",
-                        "0.1",
+                        "0.3",
                         "--",
                         sys.executable,
                         "-c",
                         child_code,
+                        str(SCRIPT_PATH),
+                        str(root),
                         str(pid_file),
+                        str(handled_file),
                     ],
                     stderr=audit,
                     text=True,
                 )
                 try:
-                    deadline = time.monotonic() + 5
-                    while not pid_file.exists():
-                        if time.monotonic() >= deadline:
-                            self.fail("child process did not become ready")
-                        time.sleep(0.01)
+                    self._wait_for_ints(
+                        pid_file,
+                        1,
+                        "child process did not become ready",
+                        wrapper,
+                    )
                     started = time.monotonic()
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -557,10 +633,10 @@ class TestWatchdogBehavior(unittest.TestCase):
                 for record in records
                 if record["event"] == "process_group_signal"
             ]
-            self.assertGreaterEqual(elapsed, 0.2)
-            self.assertLess(elapsed, 0.4)
+            self.assertGreaterEqual(elapsed, 0.55)
             self.assertEqual(wrapper.returncode, 128 + signal.SIGTERM)
             self.assertEqual(signals, ["SIGTERM"])
+            self.assertTrue(handled_file.exists())
             self.assertEqual(records[-1]["child_returncode"], 0)
 
     @unittest.skipUnless(
@@ -682,16 +758,10 @@ class TestWatchdogBehavior(unittest.TestCase):
             child_pid = None
             grandchild_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not pid_path.exists():
-                    if time.monotonic() >= deadline:
-                        self.fail("child process group did not start")
-                    time.sleep(0.01)
-                child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_path.read_text(
-                        encoding="utf-8"
-                    ).split()
+                child_pid, grandchild_pid = self._wait_for_ints(
+                    pid_path,
+                    2,
+                    "child process group did not start",
                 )
                 result = watchdog._graceful_cleanup(
                     audit,
@@ -804,12 +874,9 @@ class TestWatchdogBehavior(unittest.TestCase):
             control_target = os.readlink(
                 f"/proc/self/fd/{guardian.pulse_fd}"
             )
-            deadline = time.monotonic() + 5
-            while not state_path.exists():
-                if time.monotonic() >= deadline:
-                    self.fail("guardian payload did not become ready")
-                time.sleep(0.01)
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = self._wait_for_json(
+                state_path, "guardian payload did not become ready"
+            )
             os.close(guardian.pulse_fd)
             guardian.wait(timeout=5)
 
@@ -849,14 +916,11 @@ class TestWatchdogBehavior(unittest.TestCase):
                 1.0,
                 signal.pthread_sigmask(signal.SIG_BLOCK, ()),
             )
-            deadline = time.monotonic() + 5
-            while not state_path.exists():
-                if time.monotonic() >= deadline:
-                    self.fail("escaped payload did not become ready")
-                time.sleep(0.01)
-            escaped_pid = int(
-                state_path.read_text(encoding="utf-8")
-            )
+            escaped_pid = self._wait_for_ints(
+                state_path,
+                1,
+                "escaped payload did not become ready",
+            )[0]
             os.close(guardian.pulse_fd)
             guardian.wait(timeout=5)
             self.assertTrue(self._process_is_running(escaped_pid))
@@ -917,21 +981,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                         stderr=subprocess.PIPE,
                         text=True,
                     )
-                    deadline = time.monotonic() + 5
-                    while not pid_path.exists():
-                        if wrapper.poll() is not None:
-                            assert wrapper.stderr is not None
-                            self.fail(wrapper.stderr.read())
-                        if time.monotonic() >= deadline:
-                            self.fail(
-                                "guarded payload did not become ready"
-                            )
-                        time.sleep(0.01)
                     child_pid, grandchild_pid = (
-                        int(value)
-                        for value in pid_path.read_text(
-                            encoding="utf-8"
-                        ).split()
+                        self._wait_for_ints(
+                            pid_path,
+                            2,
+                            "guarded payload did not become ready",
+                            wrapper,
+                        )
                     )
                     if mode == "sigkill":
                         wrapper.kill()
@@ -1015,19 +1071,13 @@ class TestWatchdogBehavior(unittest.TestCase):
             child_pid = None
             grandchild_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not pid_path.exists():
-                    if wrapper.poll() is not None:
-                        assert wrapper.stderr is not None
-                        self.fail(wrapper.stderr.read())
-                    if time.monotonic() >= deadline:
-                        self.fail("guarded payload did not become ready")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_path.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_path,
+                        2,
+                        "guarded payload did not become ready",
+                        wrapper,
+                    )
                 )
                 wrapper.wait(timeout=5)
             finally:
@@ -1090,16 +1140,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not ready_path.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("SIGTERM child did not become ready")
-                    time.sleep(0.01)
-                child_pid = int(
-                    ready_path.read_text(encoding="utf-8").strip()
-                )
+                child_pid = self._wait_for_ints(
+                    ready_path,
+                    1,
+                    "SIGTERM child did not become ready",
+                    wrapper,
+                )[0]
                 try:
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -1164,18 +1210,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not pid_file.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("leader process did not write child PIDs")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_file.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_file,
+                        2,
+                        "leader process did not write child PIDs",
+                        wrapper,
+                    )
                 )
                 try:
                     wrapper.wait(timeout=5)
@@ -1264,18 +1305,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not pid_file.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("soft-limit process group did not start")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_file.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_file,
+                        2,
+                        "soft-limit process group did not start",
+                        wrapper,
+                    )
                 )
                 next_meminfo = root / "meminfo.next"
                 next_meminfo.write_text(
@@ -1585,6 +1621,101 @@ class TestWatchdogBehavior(unittest.TestCase):
         self.assertEqual(result, watchdog.EXIT_LEASE_ERROR)
         self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
         self.assertEqual(process.returncode, -signal.SIGKILL)
+
+    def test_cleanup_heartbeat_overrun_still_escalates_and_reaps(
+        self,
+    ) -> None:
+        class ReapingProcess(FakeProcess):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wait_calls = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.wait_calls += 1
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        class DelayedHeartbeatAudit(watchdog.AuditLogger):
+            def __init__(
+                self, clock: FakeClock, fail_heartbeat: bool
+            ) -> None:
+                self.output = io.StringIO()
+                super().__init__(self.output)
+                self.clock = clock
+                self.fail_heartbeat = fail_heartbeat
+
+            def heartbeat(self, sample: dict[str, object]) -> None:
+                self.clock.value += 0.11
+                if self.fail_heartbeat:
+                    raise watchdog.ArtifactError(
+                        "lease", "delayed heartbeat failed"
+                    )
+
+        for fail_heartbeat in (False, True):
+            with self.subTest(fail_heartbeat=fail_heartbeat):
+                clock = FakeClock()
+                process = ReapingProcess()
+                signals = []
+                sleep_calls = []
+                audit = DelayedHeartbeatAudit(
+                    clock, fail_heartbeat
+                )
+
+                def signal_group(
+                    process_group_id: int, signal_number: int
+                ) -> str:
+                    signals.append(signal_number)
+                    return (
+                        f"{signal.Signals(signal_number).name.lower()}_sent"
+                    )
+
+                def strict_sleep(seconds: float) -> None:
+                    self.assertGreaterEqual(seconds, 0)
+                    sleep_calls.append(seconds)
+                    clock.sleep(seconds)
+
+                result = watchdog._graceful_cleanup(
+                    audit,
+                    process,
+                    snapshot(50),
+                    50,
+                    "parent_signal",
+                    128 + signal.SIGTERM,
+                    "wrapper received SIGTERM",
+                    signal.SIGTERM,
+                    0.1,
+                    signal_group,
+                    lambda _process_group_id: (
+                        process.returncode is None
+                    ),
+                    clock.monotonic,
+                    strict_sleep,
+                )
+                records = [
+                    json.loads(line)
+                    for line in audit.output.getvalue().splitlines()
+                ]
+
+                self.assertEqual(
+                    signals, [signal.SIGTERM, signal.SIGKILL]
+                )
+                self.assertEqual(sleep_calls, [])
+                self.assertEqual(process.wait_calls, 1)
+                self.assertEqual(
+                    process.returncode, -signal.SIGKILL
+                )
+                self.assertEqual(
+                    records[-1]["classification"],
+                    "lease_error" if fail_heartbeat else "parent_signal",
+                )
+                self.assertEqual(
+                    result,
+                    (
+                        watchdog.EXIT_LEASE_ERROR
+                        if fail_heartbeat
+                        else 128 + signal.SIGTERM
+                    ),
+                )
 
     def test_invalid_artifact_path_emits_configuration_final(self) -> None:
         result = subprocess.run(
@@ -1937,6 +2068,13 @@ class TestWatchdogBehavior(unittest.TestCase):
             )
 
             try:
+                opened_pidfds: list[int] = []
+
+                def open_pidfd(_pid: int) -> int:
+                    descriptor = os.open(os.devnull, os.O_RDONLY)
+                    opened_pidfds.append(descriptor)
+                    return descriptor
+
                 validation_args = {
                     "expected_script_path": script_path,
                     "expected_executable_path": Path(sys.executable),
@@ -1947,13 +2085,36 @@ class TestWatchdogBehavior(unittest.TestCase):
                     "current_process_id": current_pid,
                     "process_procfs_root": process_root,
                     "monotonic_ns": lambda: 10_000_000_000,
-                    "pidfd_open": lambda _pid: os.open(
-                        os.devnull, os.O_RDONLY
-                    ),
+                    "pidfd_open": open_pidfd,
                 }
-                validated = watchdog.validate_active_lease(
-                    lease_path, **validation_args
-                )
+                baseline_fd_identities = self._open_fd_identities()
+
+                def validate(
+                    arguments: dict[str, Any] = validation_args,
+                ) -> dict[str, object]:
+                    opened_before = len(opened_pidfds)
+                    try:
+                        return watchdog.validate_active_lease(
+                            lease_path, **arguments
+                        )
+                    finally:
+                        new_pidfds = opened_pidfds[opened_before:]
+                        try:
+                            for descriptor in new_pidfds:
+                                with self.assertRaises(OSError):
+                                    os.fstat(descriptor)
+                            self.assertEqual(
+                                self._open_fd_identities(),
+                                baseline_fd_identities,
+                            )
+                        finally:
+                            for descriptor in new_pidfds:
+                                try:
+                                    os.close(descriptor)
+                                except OSError:
+                                    pass
+
+                validated = validate()
                 self.assertEqual(validated["lease_id"], "test-lease")
 
                 def publish_lease(
@@ -2018,9 +2179,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                             watchdog.LeaseValidationError,
                             "executable argv position",
                         ):
-                            watchdog.validate_active_lease(
-                                lease_path, **validation_args
-                            )
+                            validate()
 
                 with self.subTest("wrong command-line policy"):
                     bad_argv = list(argv)
@@ -2031,9 +2190,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "command-line policy",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("wrong lease timing policy"):
                     bad_lease = dict(lease)
@@ -2043,9 +2200,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "lease timing policy",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("wrong monitored command"):
                     bad_argv = [*argv[:-1], "other_matrix.py"]
@@ -2064,9 +2219,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "monitored command",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("tampered script SHA"):
                     tampered = dict(lease)
@@ -2075,9 +2228,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                     with self.assertRaisesRegex(
                         watchdog.LeaseValidationError, "script SHA"
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("stale heartbeat"):
                     publish_lease(dict(lease))
@@ -2089,9 +2240,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "heartbeat is stale",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("arbitrary heartbeat"):
                     heartbeat["updated_monotonic_ns"] = 9_000_000_000
@@ -2103,9 +2252,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "heartbeat identity",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("outside process group"):
                     heartbeat["lease_id"] = "test-lease"
@@ -2125,9 +2272,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "outside the monitored process group",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
                     (
                         process_root / str(current_pid) / "stat"
                     ).write_text(
@@ -2149,9 +2294,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "artifact paths|heartbeat path",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **bad_validation_args
-                        )
+                        validate(bad_validation_args)
 
                 with self.subTest("lease inode mismatch"):
                     publish_lease(dict(lease))
@@ -2166,9 +2309,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "identity does not match",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
 
                 with self.subTest("watchdog start tick mismatch"):
                     publish_lease(dict(lease))
@@ -2185,9 +2326,7 @@ class TestWatchdogBehavior(unittest.TestCase):
                         watchdog.LeaseValidationError,
                         "start time",
                     ):
-                        watchdog.validate_active_lease(
-                            lease_path, **validation_args
-                        )
+                        validate()
             finally:
                 os.close(audit_descriptor)
 

@@ -68,7 +68,7 @@ static constexpr int TRACE_VERSION = 2;
 static constexpr const char * BUILD_REVISION = DSV41_BUILD_REVISION;
 #if defined(__linux__)
 static constexpr const char * WATCHDOG_SCRIPT_SHA256 =
-    "d2781a25f978dd2bc14fc113079aa2dbf513aa157b44da9d0d51d750daa6c94f";
+    "98313ee0edabe42455f103f68bcbc6cba0e8e117afae8db658e17a18b87038f9";
 #endif
 
 static std::string sha256_hex(const unsigned char digest[SHA256_DIGEST_SIZE]) {
@@ -816,7 +816,7 @@ static json validate_watchdog(const json & data) {
     const std::vector<int64_t> namespace_pids = namespace_pid_chain();
     const fs::path script_path = data.value("watchdog_script_path", "");
     if (script_path.empty() || data.value("watchdog_revision", "") !=
-    "778db6f50eae04e6c232c69b9575bdbd0747962b" ||
+    "bbf182a48123f64c65d56ba48c0fc0c2b1d375f7" ||
             data.value("watchdog_script_sha256", "") != WATCHDOG_SCRIPT_SHA256 ||
             sha256_file(script_path) != WATCHDOG_SCRIPT_SHA256) {
         throw std::runtime_error("watchdog script identity changed");

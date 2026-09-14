@@ -21,6 +21,17 @@ struct common_fit_extra_model {
     bool shares_model;
 };
 
+void common_fit_context_params_apply_arch_defaults(
+        const char * architecture,
+        const llama_model_params & mparams,
+        llama_context_params & cparams);
+
+void common_fit_context_bounds_apply_arch_defaults(
+        const char * architecture,
+        const llama_model_params & mparams,
+        uint32_t & n_ctx_max,
+        uint32_t & n_ctx_min);
+
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state

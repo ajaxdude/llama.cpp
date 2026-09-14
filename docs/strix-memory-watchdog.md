@@ -3,8 +3,25 @@
 `scripts/strix_memory_watchdog.py` is an external Linux command wrapper for headless Strix Halo validation. It does not change model loading or cache sizing. It measures host-wide memory from procfs and controls the launched command's process group.
 
 ```sh
-./scripts/strix_memory_watchdog.py -- ./build/bin/llama-server <arguments>
+ROCR_VISIBLE_DEVICES=0 \
+HIP_VISIBLE_DEVICES=0 \
+HIP_LAUNCH_BLOCKING=1 \
+./scripts/strix_memory_watchdog.py -- \
+    ./build/bin/llama-server \
+    -m /mnt/models/deepseek-v41/DeepSeek-V4.1-Flash-Q2.gguf \
+    -c 32768 -b 2048 -ub 32 -np 1 -ngl 99 -dev ROCm0 \
+    --expert-cache-slots 192 --expert-cache-mib 72900
 ```
+
+DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, measure the full-graph state through its no-allocation memory implementation, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The context checks the measured scheduler workspace against the admitted conservative workspace envelope before inference. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
+
+The final Strix validation preflight must confirm that `ROCm0` reports `gfx1151` before running this command. It must also verify the inherited device and launch-blocking environment, the exact ubatch and cache arguments, and the active watchdog lease. The 72900 MiB budget is exactly 192 published expert slots; admission rejects a disagreement between the byte and slot caps.
+
+Use `--dsv41-procfs-root`, `--dsv41-memory-soft-mib`, `--dsv41-memory-watchdog-mib`, `--dsv41-memory-hard-mib`, and `--dsv41-memory-safety-margin-mib` only when reproducing admission tests or applying a more conservative host policy. `--expert-cache-slots` and `--expert-cache-mib` are optional caps; zero auto-fits. If both cache options are set, their capacity must describe the same number of complete published tensor slots.
+
+The current expert runtime remaps the unique routed-expert union for one ubatch. Admission therefore requires `min(384, 6 * ubatch)` resident slots instead of only six top-k slots. For example, a 224-slot cache admits at most ubatch 37. The common CLI and server default to ubatch 32 for DeepSeek V4.1 when `-ub` is not specified; an explicit value is preserved and must fit. Admission includes the resident staging cache, a complete worst-case replacement set, and the largest aligned direct-I/O bounce read. It reports both the required slot count and the admitted ubatch capacity and fails rather than lowering an explicit ubatch. DeepSeek V4.1 embedding extraction is rejected because those optional output buffers are not part of the bounded generation profile.
+
+Admission accepts context checkpoints 32768, 65536, 98304, and 131072. It never lowers an explicit context request. A request that does not fit reports current use, fixed tensor bytes, state bytes, graph workspace, Engram and expert staging, output bytes, selected cache slots and bytes, safety margin, all thresholds, and the rejecting category.
 
 The wrapper performs these checks and actions:
 
@@ -21,7 +38,7 @@ The wrapper performs these checks and actions:
 
 The 118 GiB emergency threshold leaves a 2 GiB sampling margin below the strict 120 GiB ceiling. The default sample interval is one second. This margin cannot guarantee the ceiling for a workload that can allocate more than 2 GiB between samples. Lower `--emergency-gib` or shorten `--sample-interval-seconds` for such a workload.
 
-Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The emergency threshold must remain below 120 GiB. The fail-closed timing bounds are a maximum 30-second grace, maximum one-second sample interval, and maximum five-second heartbeat age.
+Use `--procfs-root` to select a different procfs mount or a test fixture. `--soft-gib`, `--emergency-gib`, `--grace-seconds`, and `--sample-interval-seconds` override the other defaults. The generic watchdog requires the emergency threshold to remain below 120 GiB. Final DeepSeek V4.1 validation must use the exact 116 GiB soft and 118 GiB emergency defaults because the matching preflight rejects any other thresholds. The in-process DeepSeek admission options may only lower these policy limits. The fail-closed timing bounds are a maximum 30-second grace, maximum one-second sample interval, and maximum five-second heartbeat age.
 
 The wrapper writes timestamped JSON Lines records to standard error. Preflight, sample, signal, and final records include total, available, used, and peak-used bytes, swap entry count, child status, process-group status, threshold reason, and final classification where applicable. Signal records are written immediately after each process-group signal. Child standard input, standard output, and standard error are inherited unchanged.
 
@@ -55,14 +72,14 @@ Lease format `strix-memory-watchdog-lease`, version 2, contains:
 
 Heartbeat format `strix-memory-watchdog-heartbeat`, version 2, binds `lease_id`, watchdog PID/start ticks, child PID/process group, sequence, state, and update timestamps. Every memory sample first checks swap and memory thresholds, pulses the guardian through the private nonblocking pipe, then atomically replaces the heartbeat with the complete sample audit record and its persistent-audit record hash. It pulses again after persistence succeeds. A blocked audit or heartbeat write cannot delay the emergency signal; if persistence stalls past the guardian deadline, the guardian fails closed. A final heartbeat and final lease update remain on disk with the persistent JSONL audit; the watchdog does not delete this evidence.
 
-The guardian uses Linux `PR_SET_PDEATHSIG` with a parent-race check. It kills its process group on watchdog death, control-pipe EOF/error, or a missed pulse deadline, including a stopped or wedged watchdog. When the watchdog sends a graceful signal, it also puts the guardian into a bounded grace mode and continues private pulses while it waits. This lets the watchdog own the configured grace deadline and record any `SIGKILL` escalation instead of letting the shorter heartbeat deadline preempt cleanup. If the grace control message or a cleanup pulse fails, the watchdog independently sends `SIGKILL` to the process group and reaps the child before it reports `signal_error`. The payload must call `start_process_group_lease_guard()` before it starts exporter descendants. This validates the lease with bounded startup retries, arms a second parent-death link to the guardian, and starts a thread that kills the process group if any validation or artifact operation fails or the watchdog evidence becomes stale.
+The guardian uses Linux `PR_SET_PDEATHSIG` with a parent-race check. It kills its process group on watchdog death, control-pipe EOF/error, or a missed pulse deadline, including a stopped or wedged watchdog. When the watchdog sends a graceful signal, it also puts the guardian into a bounded grace mode, continues private pulses, and refreshes the active heartbeat while it waits. This lets the watchdog own the configured grace deadline and record any `SIGKILL` escalation instead of letting either the guardian or payload lease guard preempt cleanup. If the grace control message or a cleanup pulse fails, the watchdog independently sends `SIGKILL` to the process group and reaps the child before it reports `signal_error`. The payload must call `start_process_group_lease_guard()` before it starts exporter descendants. This validates the lease with bounded startup retries, arms a second parent-death link to the guardian, and starts a thread that kills the process group if any validation or artifact operation fails or the watchdog evidence becomes stale.
 
 A matching Linux preflight must verify all of the following:
 
 - The inherited lease, heartbeat, and audit paths match the paths inside the lease.
 - `/proc/<watchdog_pid>/exe` is the exact expected Python executable and argv position 1 is the exact repository watchdog script. `-c`, `-m`, helper-script, inert-argument, and interpreter-option substitutions are rejected.
 - The watchdog command line itself supplies the exact 116/118 GiB thresholds, `/proc`, inherited artifact paths, timing policy, and command after `--`; the lease cannot override those expectations.
-- `/proc/<watchdog_pid>/stat` start ticks and `/proc/<watchdog_pid>/cmdline` SHA-256 match the lease and remain stable across validation. A pidfd is held during validation when Linux provides `pidfd_open`.
+- `/proc/<watchdog_pid>/stat` start ticks and `/proc/<watchdog_pid>/cmdline` SHA-256 match the lease and remain stable across validation. A pidfd is held during validation when Linux provides `pidfd_open` and is closed on every success or failure path.
 - The topology is watchdog parent -> guardian process-group leader -> payload child. The current process must be inside `child_process_group_id`.
 - The command identity is expected, the procfs root is `/proc`, and thresholds are exactly 116 GiB soft, 118 GiB emergency, and 120 GiB strict ceiling for the final run.
 - Lease and heartbeat files are regular, mode 0600, owned by the current UID, opened with `O_NOFOLLOW`, and match their recorded device/inode identity.

@@ -489,11 +489,14 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+    bool    n_ctx_auto_sized      = false;
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool    n_ubatch_explicit     = false;
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    bool    n_parallel_explicit   = false;
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
@@ -626,8 +629,13 @@ struct common_params {
     bool    ple_direct_io  = true;  // ... read with O_DIRECT
     int32_t ple_io_threads = 64;    // ... parallel readers (random 4 KiB reads: this NVMe gives 62k IOPS at 16, 130k at 64, ~160k at 128+)
     int32_t ple_cache_mb   = 256;   // ... row cache, 0 disables
-    int32_t expert_cache_slots = 0; // DeepSeek V4.1 routed experts resident per layer
-    int32_t expert_cache_mib   = 0; // aggregate fixed slot-tensor capacity
+    int32_t expert_cache_slots = 0; // DeepSeek V4.1 routed experts resident per layer, 0 auto-fits
+    int32_t expert_cache_mib   = 0; // exact aggregate cache bytes, 0 auto-fits
+    int32_t dsv41_memory_soft_mib = 116*1024;
+    int32_t dsv41_memory_watchdog_mib = 118*1024;
+    int32_t dsv41_memory_hard_mib = 120*1024;
+    int32_t dsv41_memory_safety_margin_mib = 2*1024;
+    std::string dsv41_procfs_root = "/proc";
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -996,6 +1004,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+void common_context_params_apply_arch_defaults(
+        const char * architecture,
+        common_params & params,
+        struct llama_context_params & cparams);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
