@@ -3,6 +3,7 @@
 import array
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -498,6 +499,21 @@ AUDIT_RECORDS = {
             "audit_mode": 0o600,
             "audit_fd": 3,
             "audit_sha256": WATCHDOG_JSONL_SHA256,
+            "namespace_authority": {
+                "format": "dsv41-watchdog-namespace-authority",
+                "version": 1,
+                "mechanism": "inherited-pidfd",
+                "descriptor": 9,
+                "host_procfs_root": "/proc",
+                "watchdog_pid": 123,
+                "watchdog_process_group_id": 122,
+                "watchdog_start_time_ticks": 456,
+                "watchdog_executable_path": "/usr/bin/python3",
+                "watchdog_command_sha256": "7" * 64,
+                "guardian_pid": 455,
+                "child_pid": 456,
+                "child_process_group_id": 455,
+            },
             "audit": {
                 "path": "",
                 "sha256": WATCHDOG_JSONL_SHA256,
@@ -825,12 +841,20 @@ def provenance_bytes(
     )
     trust = fixture_install_trust(policy)
     runtime_build = fixture_runtime_build(policy)
+    source_root_lexical = Path(policy["source_root"])
+    source_root_resolved = source_root_lexical.resolve(strict=False)
+    corpus_lexical = source_root_lexical / "tests" / "corpus" / "correctness-prose.txt"
+    corpus_resolved = source_root_resolved / "tests" / "corpus" / "correctness-prose.txt"
     record = {
         "format": "dsv41-prompt-provenance",
-        "version": 1,
+        "version": 2,
         "corpus_name": "correctness-prose.txt",
         "corpus_sha256": trace.CORPUS_SHA256["correctness-prose.txt"],
-        "corpus_path": "/home/repo/tests/corpus/correctness-prose.txt",
+        "corpus_path": str(corpus_resolved),
+        "corpus_lexical_path": str(corpus_lexical),
+        "corpus_resolved_path": str(corpus_resolved),
+        "source_root_lexical_path": str(source_root_lexical),
+        "source_root_resolved_path": str(source_root_resolved),
         "model_sha256": trace.MODEL_SHA256,
         "prompt_sha256": trace.sha256_bytes(prompt),
         "prompt_byte_count": len(prompt),
@@ -1046,6 +1070,38 @@ def manifest(
                 "detokenize_special": True,
                 "remove_leading_bos_before_detokenize": True,
                 "require_round_trip": True,
+            },
+            "model_file_identity": {
+                "format": "dsv41-model-file-identity",
+                "version": 1,
+                "path": storage["model"]["resolved_path"],
+                "device": 1,
+                "inode": 2,
+                "owner_uid": 1000,
+                "owner_gid": 1000,
+                "mode": 0o444,
+                "link_count": 1,
+                "byte_count": 123,
+                "modified_ns": 1,
+                "changed_ns": 1,
+                "status_flags": 0,
+                "source_descriptor_flags": 1,
+                "target_descriptor_flags": 0,
+                "sha256": trace.MODEL_SHA256,
+            },
+            "watchdog_namespace": {
+                "format": "dsv41-watchdog-namespace-binding",
+                "version": 1,
+                "authority": "inherited-pidfd",
+                "host_watchdog_pid": 123,
+                "host_watchdog_process_group_id": 122,
+                "host_watchdog_start_time_ticks": 456,
+                "local_pid": 2,
+                "local_parent_pid": 1,
+                "local_process_group_id": 2,
+                "local_session_id": 2,
+                "namespace_pids": [1234, 2],
+                "private_procfs": True,
             },
         })
         result["candidate"] = {
@@ -6341,6 +6397,21 @@ class TraceFormatTests(unittest.TestCase):
                 audit_event_count=2,
                 procfs_root=procfs,
             )
+            watchdog_audit["namespace_authority"] = {
+                "format": "dsv41-watchdog-namespace-authority",
+                "version": 1,
+                "mechanism": "inherited-pidfd",
+                "descriptor": 9,
+                "host_procfs_root": "/proc",
+                "watchdog_pid": watchdog_pid,
+                "watchdog_process_group_id": watchdog_pid,
+                "watchdog_start_time_ticks": 1000,
+                "watchdog_executable_path": str(Path(sys.executable).resolve()),
+                "watchdog_command_sha256": watchdog_audit["watchdog_command_sha256"],
+                "guardian_pid": guardian_pid,
+                "child_pid": child_pid,
+                "child_process_group_id": guardian_pid,
+            }
             created_unix = int(now.timestamp())
             audit = {
                 "created_unix": created_unix,
@@ -7186,14 +7257,16 @@ class TraceFormatTests(unittest.TestCase):
                 with self.assertRaisesRegex(trace.TraceError, variable):
                     trace.reject_loader_overrides()
 
+    @unittest.skipUnless(sys.platform.startswith(("darwin", "linux")), "source alias test")
     def test_prompt_builder_result_becomes_strict_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             builder = root / "install" / "bin" / "llama-deepseek-v41-prompt-builder"
             model = root / "model.gguf"
             corpus = root / "corpus.txt"
             source_root = Path(__file__).parents[1]
             source_corpus = source_root / "tests" / "corpus" / "correctness-prose.txt"
+            source_alias = root / "source-alias"
             output = root / "prompt.txt"
             tmpdir = root / "tmp"
             builder.parent.mkdir(parents=True)
@@ -7201,6 +7274,7 @@ class TraceFormatTests(unittest.TestCase):
             builder.chmod(0o755)
             model.write_bytes(b"model")
             shutil.copyfile(source_corpus, corpus)
+            source_alias.symlink_to(source_root, target_is_directory=True)
             tmpdir.mkdir()
             builder = builder.resolve()
             model = model.resolve()
@@ -7211,9 +7285,11 @@ class TraceFormatTests(unittest.TestCase):
                 b"prompt",
                 builder_path=str(builder.resolve()),
                 builder_sha256=trace.sha256_file(builder),
-                source_root=str(source_root.resolve()),
+                source_root=str(source_alias),
             )
             materialize_policy_runtime(builder_policy)
+            self.assertEqual(run_matrix.approved_source_root(builder_policy), source_root.resolve())
+            self.assertEqual(run_llama.approved_source_root(builder_policy), source_root.resolve())
             _validated, builder_policy_sha256 = trace.prompt_builder_approval(
                 TEST_PROMPT_BUILDER_POLICY_ID,
                 policies={TEST_PROMPT_BUILDER_POLICY_ID: builder_policy},
@@ -7277,10 +7353,16 @@ class TraceFormatTests(unittest.TestCase):
                 )
             provenance_path = Path(result["provenance_path"])
             provenance = trace.strict_json_loads(provenance_path.read_text(encoding="ascii"))
+            self.assertEqual(provenance["source_root_lexical_path"], str(source_alias))
+            self.assertEqual(provenance["source_root_resolved_path"], str(source_root.resolve()))
+            self.assertEqual(provenance["corpus_lexical_path"], str(source_corpus))
+            self.assertEqual(provenance["corpus_resolved_path"], str(source_corpus.resolve()))
             self.assertEqual(
                 set(provenance),
                 {
                     "format", "version", "corpus_name", "corpus_sha256", "corpus_path",
+                    "corpus_lexical_path", "corpus_resolved_path",
+                    "source_root_lexical_path", "source_root_resolved_path",
                     "model_sha256", "prompt_sha256", "prompt_byte_count", "context",
                     "decode_steps", "builder_approval_id", "builder_approval_sha256",
                     "builder_path", "builder_sha256", "builder_revision",
@@ -7304,6 +7386,291 @@ class TraceFormatTests(unittest.TestCase):
                 builder_policy_sha256=builder_policy_sha256,
                 path_resolver=lambda path, _label: path.resolve(),
             )
+
+    @unittest.skipUnless(sys.platform.startswith(("darwin", "linux")), "descriptor identity test")
+    def test_model_descriptor_binds_bytes_and_rejects_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            model = root / "model.gguf"
+            replacement = root / "replacement.gguf"
+            model.write_bytes(b"approved model bytes")
+            replacement.write_bytes(b"replacement bytes")
+            descriptor, identity = run_llama.open_model_descriptor(model)
+            try:
+                self.assertEqual(
+                    run_llama.sha256_descriptor(descriptor),
+                    hashlib.sha256(b"approved model bytes").hexdigest(),
+                )
+                os.replace(replacement, model)
+                self.assertEqual(
+                    run_llama.sha256_descriptor(descriptor),
+                    hashlib.sha256(b"approved model bytes").hexdigest(),
+                )
+                if sys.platform == "linux" and os.environ.get("DSV41_NATIVE_TRACE_BINARY"):
+                    environment = dict(os.environ)
+                    environment["DSV41_MODEL_DESCRIPTOR"] = str(descriptor)
+                    environment["DSV41_MODEL_DESCRIPTOR_IDENTITY"] = trace.canonical_json(identity)
+                    native = subprocess.run(
+                        [
+                            str(Path(os.environ["DSV41_NATIVE_TRACE_BINARY"]).resolve(strict=True)),
+                            "--dsv41-test-model-descriptor",
+                            str(model),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                        pass_fds=(descriptor,),
+                    )
+                    self.assertNotEqual(native.returncode, 0)
+                    self.assertIn("held model descriptor policy is invalid", native.stderr)
+                with self.assertRaisesRegex(
+                        run_llama.PreflightError, "linked pathname|pathname identity changed"):
+                    run_llama.verify_model_descriptor(descriptor, identity)
+            finally:
+                os.close(descriptor)
+
+    @unittest.skipUnless(sys.platform.startswith(("darwin", "linux")), "descriptor identity test")
+    def test_model_descriptor_rejects_symlink_and_in_place_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            model = root / "model.gguf"
+            alias = root / "alias.gguf"
+            model.write_bytes(b"approved model bytes")
+            alias.symlink_to(model)
+            with self.assertRaisesRegex(
+                    run_llama.PreflightError, "symbolic-link aliases"):
+                run_llama.open_model_descriptor(alias)
+            descriptor, identity = run_llama.open_model_descriptor(model)
+            try:
+                model.write_bytes(b"mutated model bytes")
+                with self.assertRaisesRegex(
+                        run_llama.PreflightError, "identity or bytes changed"):
+                    run_llama.verify_model_descriptor(descriptor, identity)
+            finally:
+                os.close(descriptor)
+
+    @unittest.skipUnless(sys.platform == "linux", "watchdog pidfd authority test")
+    def test_watchdog_namespace_authority_rejects_reuse_and_executable_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            procfs = root / "proc"
+            watchdog_pid = 123
+            guardian_pid = 456
+            child_pid = 457
+            descriptor = os.open("/dev/null", os.O_RDONLY)
+
+            def proc_stat(pid: int, parent: int, group: int, start: int) -> str:
+                fields = ["S", str(parent), str(group), *(["0"] * 16), str(start)]
+                return f"{pid} (test) " + " ".join(fields) + "\n"
+
+            try:
+                for pid in (watchdog_pid, guardian_pid, child_pid):
+                    (procfs / str(pid)).mkdir(parents=True)
+                (procfs / "self" / "fdinfo").mkdir(parents=True)
+                (procfs / str(watchdog_pid) / "stat").write_text(
+                    proc_stat(watchdog_pid, 1, watchdog_pid, 1000), encoding="ascii")
+                (procfs / str(guardian_pid) / "stat").write_text(
+                    proc_stat(guardian_pid, watchdog_pid, guardian_pid, 2000), encoding="ascii")
+                (procfs / str(child_pid) / "stat").write_text(
+                    proc_stat(child_pid, guardian_pid, guardian_pid, 3000), encoding="ascii")
+                executable = root / "python3"
+                executable.write_bytes(b"python")
+                (procfs / str(watchdog_pid) / "exe").symlink_to(executable)
+                command = b"python3\0watchdog.py\0"
+                (procfs / str(watchdog_pid) / "cmdline").write_bytes(command)
+                def fake_pidfd_open(_pid: int, _flags: int) -> int:
+                    retained = os.dup(descriptor)
+                    (procfs / "self" / "fdinfo" / str(retained)).write_text(
+                        f"Pid:\t{watchdog_pid}\n", encoding="ascii")
+                    return retained
+
+                audit = copy.deepcopy(AUDIT_RECORDS["watchdog"]["data"])
+                audit.update({
+                    "watchdog_pid": watchdog_pid,
+                    "watchdog_start_time_ticks": 1000,
+                    "watchdog_executable_path": str(executable),
+                    "watchdog_command_sha256": preflight.sha256_bytes(command),
+                    "guardian_pid": guardian_pid,
+                    "child_pid": child_pid,
+                    "child_process_group_id": guardian_pid,
+                })
+                retained, authority = preflight.open_watchdog_namespace_authority(
+                    audit,
+                    procfs_root=procfs,
+                    pidfd_open=fake_pidfd_open,
+                )
+                try:
+                    self.assertEqual(authority["watchdog_pid"], watchdog_pid)
+                    preflight.verify_watchdog_namespace_authority(
+                        retained, authority, procfs_root=procfs)
+                finally:
+                    os.close(retained)
+
+                reused = copy.deepcopy(audit)
+                reused["watchdog_start_time_ticks"] = 999
+                with self.assertRaisesRegex(preflight.PreflightError, "start time"):
+                    preflight.open_watchdog_namespace_authority(
+                        reused,
+                        procfs_root=procfs,
+                        pidfd_open=fake_pidfd_open,
+                    )
+                other_executable = root / "other-python"
+                other_executable.write_bytes(b"other")
+                mismatched = copy.deepcopy(audit)
+                mismatched["watchdog_executable_path"] = str(other_executable)
+                with self.assertRaisesRegex(preflight.PreflightError, "executable"):
+                    preflight.open_watchdog_namespace_authority(
+                        mismatched,
+                        procfs_root=procfs,
+                        pidfd_open=fake_pidfd_open,
+                    )
+            finally:
+                os.close(descriptor)
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and
+        os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER") and
+        os.environ.get("DSV41_NATIVE_TRACE_BINARY"),
+        "native Linux watchdog namespace validation was not executed on this host",
+    )
+    def test_native_watchdog_validation_crosses_private_pid_namespace(self) -> None:
+        import fcntl
+
+        helper = Path(os.environ["DSV41_NATIVE_CONTAINMENT_HELPER"]).resolve(strict=True)
+        binary = Path(os.environ["DSV41_NATIVE_TRACE_BINARY"]).resolve(strict=True)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            lease = root / "watchdog.lease"
+            heartbeat = root / "watchdog.heartbeat"
+            audit = root / "watchdog.jsonl"
+            data_path = root / "watchdog-data.json"
+            lease.write_text("{}\n", encoding="ascii")
+            audit_line = '{"event":"preflight","timestamp":"1970-01-01T00:00:01.000Z"}\n'
+            audit.write_text(audit_line, encoding="ascii")
+            audit.chmod(0o600)
+            audit_descriptor = os.open(audit, os.O_RDONLY)
+            pidfd = os.pidfd_open(os.getpid())
+            helper_descriptor = os.open(helper, os.O_RDONLY)
+            try:
+                fcntl.flock(audit_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                audit_status = audit.stat()
+                heartbeat.write_text(
+                    json.dumps({
+                        "format": "strix-memory-watchdog-heartbeat",
+                        "version": 2,
+                        "lease_id": "1" * 32,
+                        "sequence": 1,
+                        "state": "active",
+                        "updated_at": "1970-01-01T00:00:01.000Z",
+                        "updated_monotonic_ns": time.monotonic_ns(),
+                        "watchdog_pid": os.getpid(),
+                        "watchdog_start_time_ticks": 1000,
+                        "child_pid": os.getpid() + 2,
+                        "child_process_group_id": os.getpid() + 1,
+                        "sample": {
+                            "audit_record_sha256": trace.sha256_bytes(
+                                audit_line.encode("ascii")),
+                        },
+                    }, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                command = ["python3", "run_matrix.py"]
+                data = copy.deepcopy(AUDIT_RECORDS["watchdog"]["data"])
+                data.update({
+                    "lease_id": "1" * 32,
+                    "lease_path": str(lease),
+                    "watchdog_pid": os.getpid(),
+                    "watchdog_start_time_ticks": 1000,
+                    "watchdog_command_sha256": "7" * 64,
+                    "watchdog_executable_path": str(Path(sys.executable).resolve()),
+                    "watchdog_script_path": str(
+                        (Path(__file__).parents[1] / "scripts" / "strix_memory_watchdog.py").resolve()),
+                    "guardian_pid": os.getpid() + 1,
+                    "child_pid": os.getpid() + 2,
+                    "child_process_group_id": os.getpid() + 1,
+                    "command": command,
+                    "child_command_sha256": trace.sha256_bytes(
+                        json.dumps(command, ensure_ascii=True, separators=(",", ":")).encode("ascii")),
+                    "heartbeat_path": str(heartbeat),
+                    "max_heartbeat_age_seconds": 5.0,
+                    "audit_live_path": str(audit),
+                    "audit_device": audit_status.st_dev,
+                    "audit_inode": audit_status.st_ino,
+                    "audit_uid": audit_status.st_uid,
+                    "audit_mode": 0o600,
+                    "audit_fd": audit_descriptor,
+                    "namespace_authority": {
+                        "format": "dsv41-watchdog-namespace-authority",
+                        "version": 1,
+                        "mechanism": "inherited-pidfd",
+                        "descriptor": pidfd,
+                        "host_procfs_root": "/proc",
+                        "watchdog_pid": os.getpid(),
+                        "watchdog_process_group_id": os.getpgrp(),
+                        "watchdog_start_time_ticks": 1000,
+                        "watchdog_executable_path": str(Path(sys.executable).resolve()),
+                        "watchdog_command_sha256": "7" * 64,
+                        "guardian_pid": os.getpid() + 1,
+                        "child_pid": os.getpid() + 2,
+                        "child_process_group_id": os.getpid() + 1,
+                    },
+                })
+                data_path.write_text(
+                    json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="ascii",
+                )
+                environment = dict(os.environ)
+                environment.update({
+                    "DSV41_WATCHDOG_PIDFD": str(pidfd),
+                    "STRIX_MEMORY_WATCHDOG_LEASE_PATH": str(lease),
+                    "STRIX_MEMORY_WATCHDOG_HEARTBEAT_PATH": str(heartbeat),
+                    "STRIX_MEMORY_WATCHDOG_AUDIT_PATH": str(audit),
+                    "STRIX_MEMORY_WATCHDOG_HEARTBEAT_MAX_AGE_SECONDS": "5.0",
+                })
+                contained = trace._run_contained_process(
+                    [str(binary), "--dsv41-test-watchdog", str(data_path)],
+                    label="native watchdog namespace test",
+                    timeout=20,
+                    input_data=None,
+                    launch={
+                        "executable": str(binary),
+                        "pass_fds": (pidfd,),
+                        "_containment_helper_path": str(helper),
+                        "_containment_helper_descriptor": helper_descriptor,
+                        "env": environment,
+                        "stdout": subprocess.PIPE,
+                        "stderr": subprocess.PIPE,
+                    },
+                )
+                try:
+                    if contained.primary_error is not None:
+                        raise contained.primary_error
+                    self.assertEqual(contained.integrity_failures, [])
+                    self.assertIsNotNone(contained.result)
+                    assert contained.result is not None
+                    self.assertEqual(
+                        contained.result.returncode,
+                        0,
+                        contained.result.stderr.decode("utf-8", "replace"),
+                    )
+                    binding = trace.strict_json_loads(contained.result.stdout.decode("ascii"))
+                    self.assertTrue(binding["private_procfs"])
+                    self.assertEqual(binding["local_pid"], 2)
+                    self.assertEqual(binding["local_parent_pid"], 1)
+                    self.assertEqual(binding["local_pid"], binding["local_process_group_id"])
+                    self.assertEqual(binding["namespace_pids"][-1], binding["local_pid"])
+                finally:
+                    failures = trace._close_process_containment(
+                        contained.containment,
+                        quiescence_proven=contained.quiescence_proven,
+                    )
+                    self.assertEqual(failures, [])
+            finally:
+                os.close(helper_descriptor)
+                os.close(pidfd)
+                fcntl.flock(audit_descriptor, fcntl.LOCK_UN)
+                os.close(audit_descriptor)
 
     def test_rejects_cross_runtime_and_unknown_audit_envelopes(self) -> None:
         for mutation, message in (

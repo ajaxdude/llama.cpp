@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -15,11 +16,13 @@ from preflight import (
     PreflightError,
     bind_embedded_audits,
     bind_prompt_provenance,
+    open_watchdog_namespace_authority,
     resolved,
     run_strix_preflight,
     safe_trace_path,
     seal_audits,
     validate_prompt_provenance,
+    verify_watchdog_namespace_authority,
     verify_sealed_audits,
     write_audits,
 )
@@ -65,11 +68,161 @@ from trace_format import (
 )
 
 
+def approved_source_root(prompt_policy: dict[str, object]) -> Path:
+    try:
+        return Path(str(prompt_policy["source_root"])).expanduser().resolve(strict=True)
+    except (KeyError, OSError) as error:
+        raise PreflightError(f"prompt builder approved source root is invalid: {error}") from error
+
+
 def git_output(repo: Path, *args: str) -> bytes:
     try:
         return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT)
     except (OSError, subprocess.CalledProcessError) as error:
         raise PreflightError(f"git {' '.join(args)} failed: {error}") from error
+
+
+def sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    try:
+        while True:
+            chunk = os.pread(descriptor, 8 * 1024 * 1024, offset)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+            offset += len(chunk)
+    except AttributeError as error:
+        raise PreflightError("descriptor hashing requires os.pread") from error
+    except OSError as error:
+        raise PreflightError(f"cannot hash held model descriptor: {error}") from error
+
+
+def model_descriptor_identity(
+        descriptor: int,
+        path: Path,
+        *,
+        hash_bytes: bool,
+) -> dict[str, object]:
+    try:
+        import fcntl
+
+        record = os.fstat(descriptor)
+        status_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    except (ImportError, OSError) as error:
+        raise PreflightError(f"cannot inspect held model descriptor: {error}") from error
+    if not stat.S_ISREG(record.st_mode):
+        raise PreflightError("model descriptor is not a regular file")
+    if record.st_nlink < 1:
+        raise PreflightError("model descriptor has no linked pathname")
+    if (status_flags & os.O_ACCMODE) != os.O_RDONLY:
+        raise PreflightError("model descriptor is not read-only")
+    identity = {
+        "format": "dsv41-model-file-identity",
+        "version": 1,
+        "path": str(path),
+        "device": record.st_dev,
+        "inode": record.st_ino,
+        "owner_uid": record.st_uid,
+        "owner_gid": record.st_gid,
+        "mode": stat.S_IMODE(record.st_mode),
+        "link_count": record.st_nlink,
+        "byte_count": record.st_size,
+        "modified_ns": record.st_mtime_ns,
+        "changed_ns": record.st_ctime_ns,
+        "status_flags": status_flags,
+        "source_descriptor_flags": descriptor_flags,
+        "target_descriptor_flags": 0,
+    }
+    if hash_bytes:
+        identity["sha256"] = sha256_descriptor(descriptor)
+    return identity
+
+
+def open_model_descriptor(path: Path) -> tuple[int, dict[str, object]]:
+    lexical_path = path.expanduser()
+    if not lexical_path.is_absolute():
+        lexical_path = Path.cwd() / lexical_path
+    try:
+        canonical_path = lexical_path.resolve(strict=True)
+    except OSError as error:
+        raise PreflightError(f"cannot resolve model path: {error}") from error
+    if canonical_path != lexical_path:
+        raise PreflightError("model path must not contain lexical or symbolic-link aliases")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(canonical_path, flags)
+        before = model_descriptor_identity(descriptor, canonical_path, hash_bytes=False)
+        identity = model_descriptor_identity(descriptor, canonical_path, hash_bytes=True)
+        after = model_descriptor_identity(descriptor, canonical_path, hash_bytes=False)
+        if before != after:
+            raise PreflightError("model descriptor identity changed while hashing")
+        path_record = canonical_path.stat(follow_symlinks=False)
+        if (
+                path_record.st_dev,
+                path_record.st_ino,
+                path_record.st_uid,
+                path_record.st_gid,
+                stat.S_IMODE(path_record.st_mode),
+                path_record.st_nlink,
+                path_record.st_size,
+                path_record.st_mtime_ns,
+                path_record.st_ctime_ns,
+        ) != (
+                identity["device"],
+                identity["inode"],
+                identity["owner_uid"],
+                identity["owner_gid"],
+                identity["mode"],
+                identity["link_count"],
+                identity["byte_count"],
+                identity["modified_ns"],
+                identity["changed_ns"],
+        ):
+            raise PreflightError("model pathname does not identify the held descriptor")
+        return descriptor, identity
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def verify_model_descriptor(
+        descriptor: int,
+        identity: dict[str, object],
+) -> None:
+    path = Path(str(identity["path"]))
+    observed = model_descriptor_identity(descriptor, path, hash_bytes=True)
+    if observed != identity:
+        raise PreflightError("model descriptor identity or bytes changed during execution")
+    try:
+        path_record = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise PreflightError(f"cannot revalidate model pathname: {error}") from error
+    if (
+            path_record.st_dev,
+            path_record.st_ino,
+            path_record.st_uid,
+            path_record.st_gid,
+            stat.S_IMODE(path_record.st_mode),
+            path_record.st_nlink,
+            path_record.st_size,
+            path_record.st_mtime_ns,
+            path_record.st_ctime_ns,
+    ) != (
+            identity["device"],
+            identity["inode"],
+            identity["owner_uid"],
+            identity["owner_gid"],
+            identity["mode"],
+            identity["link_count"],
+            identity["byte_count"],
+            identity["modified_ns"],
+            identity["changed_ns"],
+    ):
+        raise PreflightError("model pathname identity changed during execution")
 
 
 def candidate_attestation(
@@ -509,6 +662,8 @@ def main() -> int:
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
 
+    model_descriptor = -1
+    watchdog_descriptor = -1
     try:
         validate_runtime_config(args)
         reject_loader_overrides()
@@ -559,9 +714,10 @@ def main() -> int:
         if git_output(repo, "rev-parse", "HEAD").decode("ascii").strip() != (
                 approval_policy.verifier_revision):
             raise PreflightError("candidate verifier checkout differs from the external approval policy")
-        if str(repo) != prompt_policy["source_root"] or candidate_policy["revision"] != prompt_policy["revision"]:
+        if repo != approved_source_root(prompt_policy) or candidate_policy["revision"] != prompt_policy["revision"]:
             raise PreflightError("candidate repository or revision differs from prompt builder approval")
-        model_sha256 = sha256_file(resolved(args.model))
+        model_descriptor, model_identity = open_model_descriptor(args.model)
+        model_sha256 = str(model_identity["sha256"])
         if model_sha256 != MODEL_SHA256:
             raise PreflightError(f"published model SHA-256 mismatch: expected {MODEL_SHA256}, found {model_sha256}")
         provenance = validate_prompt_provenance(
@@ -663,6 +819,9 @@ def main() -> int:
             "expert_cache_mib": args.expert_cache_mib,
             "gpu_layers": args.gpu_layers,
         }
+        watchdog_descriptor, watchdog_authority = open_watchdog_namespace_authority(
+            preflight_audit["watchdog"])
+        preflight_audit["watchdog"]["namespace_authority"] = watchdog_authority
         pre_audits = write_audits(Path(str(output) + ".audit") / "pre", preflight_audit)
         pre_audit_digests = seal_audits(pre_audits)
         environment = os.environ.copy()
@@ -670,6 +829,9 @@ def main() -> int:
         environment["DSV41_TRACE_SWAP_AUDIT"] = pre_audits["swap"]
         environment["DSV41_TRACE_WATCHDOG_AUDIT"] = pre_audits["watchdog"]
         environment["DSV41_TOKENIZER_POLICY"] = canonical_json(prompt_policy["tokenizer"])
+        environment["DSV41_MODEL_DESCRIPTOR"] = str(model_descriptor)
+        environment["DSV41_MODEL_DESCRIPTOR_IDENTITY"] = canonical_json(model_identity)
+        environment["DSV41_WATCHDOG_PIDFD"] = str(watchdog_descriptor)
         command = build_command(args, exporter, output)
         print("exec:", shlex.join(command), file=sys.stderr)
         verify_approved_executable_identity(exporter, exporter_identity, label="candidate exporter")
@@ -684,7 +846,10 @@ def main() -> int:
             label="candidate exporter",
             env=environment,
             check=False,
+            retained_fds=(model_descriptor, watchdog_descriptor),
         )
+        verify_model_descriptor(model_descriptor, model_identity)
+        verify_watchdog_namespace_authority(watchdog_descriptor, watchdog_authority)
         if executed_identity != exporter_identity:
             raise PreflightError("candidate exporter execution identity differs from external approval")
         if result.returncode != 0:
@@ -712,6 +877,8 @@ def main() -> int:
             repo=args.repo,
             busy_patterns=args.busy_pattern,
         )
+        verify_watchdog_namespace_authority(watchdog_descriptor, watchdog_authority)
+        postflight_audit["watchdog"]["namespace_authority"] = watchdog_authority
         verify_approved_runtime_file_identities(
             runtime_identities, label="candidate exporter")
         post_accelerator = query_accelerator_attestation(
@@ -774,6 +941,13 @@ def main() -> int:
     except (PreflightError, TraceError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    finally:
+        for descriptor in (watchdog_descriptor, model_descriptor):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    print(f"error: cannot close retained descriptor {descriptor}: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":

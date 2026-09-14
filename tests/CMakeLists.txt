@@ -225,6 +225,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
                 TEST test-deepseek41-trace
                 APPEND PROPERTY ENVIRONMENT
                     "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:llama-deepseek-v41-trace>"
+                    "DSV41_NATIVE_CONTAINMENT_HELPER=$<TARGET_FILE:llama-deepseek-v41-containment-helper>"
                     "DSV41_NATIVE_MANIFEST_BINARY=$<TARGET_FILE:test-deepseek41-trace-manifest>"
                     "DSV41_NATIVE_INJECT_LIBRARY=$<TARGET_FILE:test-deepseek41-trace-injected>")
         endif()

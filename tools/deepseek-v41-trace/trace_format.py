@@ -1852,6 +1852,7 @@ def run_approved_executable(
         expected_path: str,
         expected_sha256: str,
         label: str,
+        retained_fds: tuple[int, ...] = (),
         **kwargs: Any,
 ) -> tuple[subprocess.CompletedProcess[Any], ExecutableFileReceipt]:
     if sys.platform not in {"linux", "darwin", "win32"}:
@@ -1862,6 +1863,16 @@ def run_approved_executable(
         "creationflags", "executable", "pass_fds", "preexec_fn", "process_group", "start_new_session"}
     if protected_controls & kwargs.keys():
         raise TraceError(f"{label} execution parameters may not override immutable launch controls")
+    if sys.platform == "win32" and retained_fds:
+        raise TraceError(f"{label} retained descriptors are unsupported on Windows")
+    if any(type(descriptor) is not int or descriptor <= 2 for descriptor in retained_fds) or (
+            len(set(retained_fds)) != len(retained_fds)):
+        raise TraceError(f"{label} retained descriptors are invalid")
+    try:
+        for retained_descriptor in retained_fds:
+            os.fstat(retained_descriptor)
+    except OSError as error:
+        raise TraceError(f"{label} retained descriptor is invalid: {error}") from error
     timeout = kwargs.pop("timeout", None)
     check = bool(kwargs.pop("check", False))
     capture_output = bool(kwargs.pop("capture_output", False))
@@ -1948,6 +1959,7 @@ def run_approved_executable(
         retained_descriptors = (
             descriptor,
             *(item[1] for item in runtime_files),
+            *retained_fds,
         )
         launch = dict(kwargs)
         if sys.platform != "win32":
@@ -4876,12 +4888,19 @@ class TraceBundle:
             self.verifier.expected_prompt_builder_policy_id,
             policies=self.verifier.prompt_builder_policies,
         )
+        source_root_lexical = Path(prompt_policy["source_root"])
+        source_root_resolved = source_root_lexical.resolve(strict=False)
+        corpus_resolved = (
+            source_root_resolved / "tests" / "corpus" / corpus_name).resolve(strict=False)
         provenance_checks = {
             "format": "dsv41-prompt-provenance",
-            "version": 1,
+            "version": 2,
             "corpus_name": corpus_name,
             "corpus_sha256": self.manifest["prompt"]["corpus_sha256"],
-            "corpus_path": f"{prompt_policy['source_root']}/tests/corpus/{corpus_name}",
+            "corpus_path": str(corpus_resolved),
+            "corpus_resolved_path": str(corpus_resolved),
+            "source_root_lexical_path": str(source_root_lexical),
+            "source_root_resolved_path": str(source_root_resolved),
             "model_sha256": self.manifest["model"]["sha256"],
             "prompt_sha256": self.manifest["prompt"]["sha256"],
             "prompt_byte_count": self.manifest["prompt"]["byte_count"],
@@ -4893,6 +4912,11 @@ class TraceBundle:
         for key, value in provenance_checks.items():
             if provenance_record.get(key) != value:
                 raise TraceError(f"prompt provenance {key} mismatch")
+        try:
+            if Path(str(provenance_record.get("corpus_lexical_path"))).resolve(strict=False) != corpus_resolved:
+                raise TraceError("prompt provenance corpus lexical path resolves outside the approved source")
+        except OSError as error:
+            raise TraceError(f"prompt provenance corpus lexical path is invalid: {error}") from error
         expected_prompt = approved_prompt_record(
             prompt_policy,
             corpus_name=corpus_name,
@@ -4938,6 +4962,7 @@ class TraceBundle:
         _require_exact_keys(
             provenance_record,
             set(provenance_checks) | set(builder_checks) | {
+                "corpus_lexical_path",
                 "builder_runtime_build", "builder_runtime_build_sha256",
                 "builder_install_trust", "builder_install_trust_sha256"},
             "prompt provenance",
@@ -5171,6 +5196,8 @@ class TraceBundle:
                     "expert_cache_slots",
                     "expert_cache_bytes",
                     "tokenizer",
+                    "model_file_identity",
+                    "watchdog_namespace",
                     "deepseek41",
                 },
                 "llama.cpp config",
@@ -5192,6 +5219,87 @@ class TraceBundle:
                 raise TraceError("llama.cpp trace inference configuration is invalid")
             if validate_tokenizer_policy(config.get("tokenizer")) != prompt_policy["tokenizer"]:
                 raise TraceError("llama.cpp tokenizer policy differs from external prompt approval")
+            model_file_identity = config.get("model_file_identity")
+            if not isinstance(model_file_identity, dict):
+                raise TraceError("llama.cpp model file identity is invalid")
+            _require_exact_keys(
+                model_file_identity,
+                {
+                    "format",
+                    "version",
+                    "path",
+                    "device",
+                    "inode",
+                    "owner_uid",
+                    "owner_gid",
+                    "mode",
+                    "link_count",
+                    "byte_count",
+                    "modified_ns",
+                    "changed_ns",
+                    "status_flags",
+                    "source_descriptor_flags",
+                    "target_descriptor_flags",
+                    "sha256",
+                },
+                "llama.cpp model file identity",
+            )
+            if model_file_identity["format"] != "dsv41-model-file-identity" or (
+                    model_file_identity["version"] != 1) or (
+                    model_file_identity["path"] != self.manifest["model"]["path"]) or (
+                    model_file_identity["byte_count"] != self.manifest["model"]["byte_count"]) or (
+                    model_file_identity["sha256"] != self.manifest["model"]["sha256"]):
+                raise TraceError("llama.cpp model file identity does not match the manifest model")
+            for key in (
+                    "device", "inode", "owner_uid", "owner_gid", "mode", "link_count",
+                    "byte_count", "modified_ns", "changed_ns", "status_flags",
+                    "source_descriptor_flags", "target_descriptor_flags"):
+                if type(model_file_identity[key]) is not int or model_file_identity[key] < 0:
+                    raise TraceError(f"llama.cpp model file identity {key} is invalid")
+            if model_file_identity["link_count"] < 1 or model_file_identity["mode"] > 0o7777 or (
+                    model_file_identity["source_descriptor_flags"] != 1) or (
+                    model_file_identity["target_descriptor_flags"] != 0):
+                raise TraceError("llama.cpp model descriptor policy is invalid")
+            watchdog_namespace = config.get("watchdog_namespace")
+            if not isinstance(watchdog_namespace, dict):
+                raise TraceError("llama.cpp watchdog namespace binding is invalid")
+            _require_exact_keys(
+                watchdog_namespace,
+                {
+                    "format",
+                    "version",
+                    "authority",
+                    "host_watchdog_pid",
+                    "host_watchdog_process_group_id",
+                    "host_watchdog_start_time_ticks",
+                    "local_pid",
+                    "local_parent_pid",
+                    "local_process_group_id",
+                    "local_session_id",
+                    "namespace_pids",
+                    "private_procfs",
+                },
+                "llama.cpp watchdog namespace binding",
+            )
+            if watchdog_namespace["format"] != "dsv41-watchdog-namespace-binding" or (
+                    watchdog_namespace["version"] != 1) or (
+                    watchdog_namespace["authority"] != "inherited-pidfd") or (
+                    watchdog_namespace["private_procfs"] is not True):
+                raise TraceError("llama.cpp watchdog namespace binding policy is invalid")
+            for key in (
+                    "host_watchdog_pid", "host_watchdog_process_group_id",
+                    "host_watchdog_start_time_ticks", "local_pid",
+                    "local_process_group_id", "local_session_id"):
+                if type(watchdog_namespace[key]) is not int or watchdog_namespace[key] <= 1:
+                    raise TraceError(f"llama.cpp watchdog namespace {key} is invalid")
+            if watchdog_namespace["local_parent_pid"] != 1 or (
+                    watchdog_namespace["local_pid"] != 2) or (
+                    watchdog_namespace["local_pid"] != watchdog_namespace["local_process_group_id"]) or (
+                    watchdog_namespace["local_pid"] != watchdog_namespace["local_session_id"]) or (
+                    not isinstance(watchdog_namespace["namespace_pids"], list)) or (
+                    not watchdog_namespace["namespace_pids"]) or (
+                    watchdog_namespace["namespace_pids"][-1] != watchdog_namespace["local_pid"]):
+                raise TraceError("llama.cpp watchdog namespace-local identity is invalid")
         if self.manifest["runtime"] == "ds4":
             _require_exact_keys(
                 config,
@@ -5445,6 +5553,7 @@ class TraceBundle:
                 "audit_fd",
                 "audit_sha256",
                 "audit",
+                "namespace_authority",
             )
             _require_exact_keys(record["data"], set(required), f"{phase} watchdog audit evidence")
             data = record["data"]
@@ -5506,6 +5615,48 @@ class TraceBundle:
                 raise TraceError(f"{phase} watchdog audit command SHA-256 is invalid")
             if type(data["heartbeat_unix"]) is not int or data["heartbeat_unix"] <= 0:
                 raise TraceError(f"{phase} watchdog audit heartbeat timestamp is invalid")
+            namespace_authority = data["namespace_authority"]
+            if not isinstance(namespace_authority, dict):
+                raise TraceError(f"{phase} watchdog namespace authority is invalid")
+            _require_exact_keys(
+                namespace_authority,
+                {
+                    "format",
+                    "version",
+                    "mechanism",
+                    "descriptor",
+                    "host_procfs_root",
+                    "watchdog_pid",
+                    "watchdog_process_group_id",
+                    "watchdog_start_time_ticks",
+                    "watchdog_executable_path",
+                    "watchdog_command_sha256",
+                    "guardian_pid",
+                    "child_pid",
+                    "child_process_group_id",
+                },
+                f"{phase} watchdog namespace authority",
+            )
+            if namespace_authority["format"] != "dsv41-watchdog-namespace-authority" or (
+                    namespace_authority["version"] != 1) or (
+                    namespace_authority["mechanism"] != "inherited-pidfd") or (
+                    namespace_authority["host_procfs_root"] != "/proc"):
+                raise TraceError(f"{phase} watchdog namespace authority policy is invalid")
+            authority_checks = {
+                "watchdog_pid": data["watchdog_pid"],
+                "watchdog_start_time_ticks": data["watchdog_start_time_ticks"],
+                "watchdog_executable_path": data["watchdog_executable_path"],
+                "watchdog_command_sha256": data["watchdog_command_sha256"],
+                "guardian_pid": data["guardian_pid"],
+                "child_pid": data["child_pid"],
+                "child_process_group_id": data["child_process_group_id"],
+            }
+            for key, value in authority_checks.items():
+                if namespace_authority.get(key) != value:
+                    raise TraceError(f"{phase} watchdog namespace authority {key} mismatch")
+            for key in ("descriptor", "watchdog_process_group_id"):
+                if type(namespace_authority[key]) is not int or namespace_authority[key] <= 2:
+                    raise TraceError(f"{phase} watchdog namespace authority {key} is invalid")
             max_age = data.get("max_heartbeat_age_seconds")
             if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) or (
                     max_age <= 0 or max_age > 30):

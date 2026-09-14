@@ -49,9 +49,11 @@ extern "C" {
 #if defined(__linux__)
 #include <fcntl.h>
 #include <link.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #endif
 #endif
 
@@ -639,47 +641,138 @@ static std::string required_environment(const char * name) {
 #if defined(__linux__)
 static constexpr uint64_t DSV41_GIB = UINT64_C(1024)*1024*1024;
 
-static std::pair<int64_t, uint64_t> proc_identity(int64_t pid) {
-    const std::vector<uint8_t> bytes = read_file("/proc/" + std::to_string(pid) + "/stat");
-    const std::string stat(bytes.begin(), bytes.end());
-    const size_t command_end = stat.rfind(')');
-    if (command_end == std::string::npos) {
-        throw std::runtime_error("watchdog process stat is invalid");
+static int required_descriptor(const char * name) {
+    const std::string value = required_environment(name);
+    size_t consumed = 0;
+    const long parsed = std::stol(value, &consumed);
+    if (consumed != value.size() || parsed <= STDERR_FILENO ||
+            parsed > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string("invalid descriptor environment: ") + name);
     }
-    std::istringstream fields(stat.substr(command_end + 2));
-    std::string value;
-    int64_t parent = 0;
-    for (int field = 3; field <= 22; ++field) {
-        if (!(fields >> value)) {
-            throw std::runtime_error("watchdog process stat is truncated");
-        }
-        if (field == 4) {
-            parent = std::stoll(value);
-        }
-    }
-    return { parent, std::stoull(value) };
+    return static_cast<int>(parsed);
 }
 
-static bool process_is_descendant(int64_t pid, int64_t ancestor) {
-    std::vector<int64_t> seen;
-    while (pid > 1 && std::find(seen.begin(), seen.end(), pid) == seen.end()) {
-        if (pid == ancestor) {
-            return true;
+static std::string sha256_descriptor(int descriptor) {
+    sha256_t state;
+    sha256_init(&state);
+    std::vector<unsigned char> buffer(8 * 1024 * 1024);
+    off_t offset = 0;
+    while (true) {
+        ssize_t count;
+        do {
+            count = pread(descriptor, buffer.data(), buffer.size(), offset);
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            throw std::runtime_error("failed while hashing held model descriptor");
         }
-        seen.push_back(pid);
-        pid = proc_identity(pid).first;
+        if (count == 0) {
+            break;
+        }
+        sha256_update(&state, buffer.data(), static_cast<size_t>(count));
+        offset += count;
     }
-    return false;
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_final(&state, digest);
+    return sha256_hex(digest);
 }
 
-static void validate_watchdog(const json & data) {
+static json model_descriptor_identity(int descriptor, const fs::path & model_path, bool hash_bytes) {
+    struct stat status {};
+    const int status_flags = fcntl(descriptor, F_GETFL);
+    const int descriptor_flags = fcntl(descriptor, F_GETFD);
+    if (fstat(descriptor, &status) != 0 || status_flags < 0 || descriptor_flags < 0) {
+        throw std::runtime_error("cannot inspect held model descriptor");
+    }
+    if (!S_ISREG(status.st_mode) || status.st_nlink < 1 ||
+            (status_flags & O_ACCMODE) != O_RDONLY || descriptor_flags != 0) {
+        throw std::runtime_error("held model descriptor policy is invalid");
+    }
+    json result = {
+        {"format", "dsv41-model-file-identity"},
+        {"version", 1},
+        {"path", model_path.string()},
+        {"device", static_cast<uint64_t>(status.st_dev)},
+        {"inode", static_cast<uint64_t>(status.st_ino)},
+        {"owner_uid", static_cast<uint64_t>(status.st_uid)},
+        {"owner_gid", static_cast<uint64_t>(status.st_gid)},
+        {"mode", static_cast<uint64_t>(status.st_mode & 07777)},
+        {"link_count", static_cast<uint64_t>(status.st_nlink)},
+        {"byte_count", static_cast<uint64_t>(status.st_size)},
+        {"modified_ns",
+            static_cast<int64_t>(status.st_mtim.tv_sec)*INT64_C(1000000000) + status.st_mtim.tv_nsec},
+        {"changed_ns",
+            static_cast<int64_t>(status.st_ctim.tv_sec)*INT64_C(1000000000) + status.st_ctim.tv_nsec},
+        {"status_flags", status_flags},
+        {"source_descriptor_flags", FD_CLOEXEC},
+        {"target_descriptor_flags", 0},
+    };
+    if (hash_bytes) {
+        result["sha256"] = sha256_descriptor(descriptor);
+    }
+    return result;
+}
+
+static json validate_model_descriptor(const fs::path & model_path, bool hash_bytes) {
+    const int descriptor = required_descriptor("DSV41_MODEL_DESCRIPTOR");
+    json expected;
+    try {
+        expected = json::parse(required_environment("DSV41_MODEL_DESCRIPTOR_IDENTITY"));
+    } catch (const json::exception & error) {
+        throw std::runtime_error(std::string("model descriptor identity JSON is invalid: ") + error.what());
+    }
+    const json observed = model_descriptor_identity(descriptor, model_path, hash_bytes);
+    if (expected != observed) {
+        throw std::runtime_error("held model descriptor differs from the runner identity");
+    }
+    return observed;
+}
+
+static std::vector<int64_t> namespace_pid_chain() {
+    std::ifstream status("/proc/self/status");
+    if (!status) {
+        throw std::runtime_error("cannot read namespace-local process status");
+    }
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("NSpid:", 0) != 0) {
+            continue;
+        }
+        std::istringstream values(line.substr(6));
+        std::vector<int64_t> result;
+        int64_t value = 0;
+        while (values >> value) {
+            result.push_back(value);
+        }
+        if (result.empty() || result.back() != getpid()) {
+            throw std::runtime_error("namespace-local NSpid identity is invalid");
+        }
+        return result;
+    }
+    throw std::runtime_error("namespace-local NSpid identity is missing");
+}
+
+static void require_live_pidfd(int descriptor) {
+    if (fcntl(descriptor, F_GETFD) != 0) {
+        throw std::runtime_error("watchdog pidfd descriptor flags are invalid");
+    }
+    std::array<char, 64> target {};
+    const std::string descriptor_path = "/proc/self/fd/" + std::to_string(descriptor);
+    const ssize_t size = readlink(descriptor_path.c_str(), target.data(), target.size() - 1);
+    if (size <= 0 || std::string(target.data(), static_cast<size_t>(size)) != "anon_inode:[pidfd]") {
+        throw std::runtime_error("watchdog authority descriptor is not a pidfd");
+    }
+    pollfd observed {descriptor, POLLIN, 0};
+    const int result = poll(&observed, 1, 0);
+    if (result < 0 || result != 0 || observed.revents != 0) {
+        throw std::runtime_error("watchdog authority pidfd is not live");
+    }
+}
+
+static json validate_watchdog(const json & data) {
     const int64_t pid = data.value("watchdog_pid", INT64_C(0));
     const int64_t guardian_pid = data.value("guardian_pid", INT64_C(0));
     const int64_t child_pid = data.value("child_pid", INT64_C(0));
     const int64_t child_pgid = data.value("child_process_group_id", INT64_C(0));
-    if (pid <= 1 || !fs::exists("/proc/" + std::to_string(pid))) {
-        throw std::runtime_error("watchdog process is not running");
-    }
     if (data.value("format", "") != "strix-memory-watchdog-lease" || data.value("version", 0) != 2) {
         throw std::runtime_error("watchdog lease format is invalid");
     }
@@ -691,53 +784,42 @@ static void validate_watchdog(const json & data) {
             data.value("procfs_root", "") != "/proc") {
         throw std::runtime_error("watchdog execution policy is invalid");
     }
-    if (guardian_pid <= 1 || child_pid <= 1 || child_pgid <= 1 || getpgrp() != child_pgid ||
-            !process_is_descendant(getpid(), child_pid)) {
-        throw std::runtime_error("trace exporter is outside the watchdog-monitored process group");
+    if (pid <= 1 || guardian_pid <= 1 || child_pid <= 1 || child_pgid <= 1) {
+        throw std::runtime_error("watchdog host identity is invalid");
     }
-    if (proc_identity(guardian_pid).first != pid ||
-            proc_identity(child_pid).first != guardian_pid ||
-            getpgid(guardian_pid) != child_pgid ||
-            getpgid(child_pid) != child_pgid ||
-            child_pgid != guardian_pid) {
-        throw std::runtime_error("watchdog guardian or child process identity is invalid");
+    const json authority = data.value("namespace_authority", json::object());
+    const int authority_descriptor = required_descriptor("DSV41_WATCHDOG_PIDFD");
+    if (authority.value("format", "") != "dsv41-watchdog-namespace-authority" ||
+            authority.value("version", 0) != 1 ||
+            authority.value("mechanism", "") != "inherited-pidfd" ||
+            authority.value("descriptor", -1) != authority_descriptor ||
+            authority.value("host_procfs_root", "") != "/proc" ||
+            authority.value("watchdog_pid", INT64_C(0)) != pid ||
+            authority.value("watchdog_start_time_ticks", UINT64_C(0)) !=
+                data.value("watchdog_start_time_ticks", UINT64_C(0)) ||
+            authority.value("watchdog_executable_path", "") !=
+                data.value("watchdog_executable_path", "") ||
+            authority.value("watchdog_command_sha256", "") !=
+                data.value("watchdog_command_sha256", "") ||
+            authority.value("guardian_pid", INT64_C(0)) != guardian_pid ||
+            authority.value("child_pid", INT64_C(0)) != child_pid ||
+            authority.value("child_process_group_id", INT64_C(0)) != child_pgid) {
+        throw std::runtime_error("watchdog namespace authority does not match the host audit");
     }
-    if (proc_identity(pid).second != data.value("watchdog_start_time_ticks", UINT64_C(0))) {
-        throw std::runtime_error("watchdog process start time changed");
+    require_live_pidfd(authority_descriptor);
+    if (getpid() != 2 || getppid() != 1 || getpgrp() != getpid() || getsid(0) != getpid() ||
+            canonical_path("/proc/self", "namespace-local process") !=
+                canonical_path("/proc/" + std::to_string(getpid()), "namespace-local PID") ||
+            !fs::is_directory("/proc/1")) {
+        throw std::runtime_error("trace exporter namespace-local process identity is invalid");
     }
-    const std::vector<uint8_t> command = read_file("/proc/" + std::to_string(pid) + "/cmdline");
-    if (sha256_data(command.data(), command.size()) != data.value("watchdog_command_sha256", "")) {
-        throw std::runtime_error("watchdog process command changed");
-    }
-    const fs::path executable_path = data.value("watchdog_executable_path", "");
-    if (executable_path.empty() ||
-            fs::canonical("/proc/" + std::to_string(pid) + "/exe") != fs::canonical(executable_path)) {
-        throw std::runtime_error("watchdog executable identity changed");
-    }
+    const std::vector<int64_t> namespace_pids = namespace_pid_chain();
     const fs::path script_path = data.value("watchdog_script_path", "");
     if (script_path.empty() || data.value("watchdog_revision", "") !=
     "778db6f50eae04e6c232c69b9575bdbd0747962b" ||
             data.value("watchdog_script_sha256", "") != WATCHDOG_SCRIPT_SHA256 ||
             sha256_file(script_path) != WATCHDOG_SCRIPT_SHA256) {
         throw std::runtime_error("watchdog script identity changed");
-    }
-    std::vector<std::string> watchdog_arguments;
-    size_t argument_start = 0;
-    while (argument_start < command.size()) {
-        const auto * begin = reinterpret_cast<const char *>(command.data() + argument_start);
-        const size_t argument_size = std::char_traits<char>::length(begin);
-        watchdog_arguments.emplace_back(begin, argument_size);
-        argument_start += argument_size + 1;
-    }
-    fs::path command_script;
-    if (watchdog_arguments.size() >= 2) {
-        command_script = watchdog_arguments[1];
-        if (!command_script.is_absolute()) {
-            command_script = fs::canonical("/proc/" + std::to_string(pid) + "/cwd") / command_script;
-        }
-    }
-    if (watchdog_arguments.size() < 2 || fs::canonical(command_script) != fs::canonical(script_path)) {
-        throw std::runtime_error("watchdog script is not in executable argv position");
     }
     const fs::path heartbeat_path = data.value("heartbeat_path", "");
     const double max_age = data.value("max_heartbeat_age_seconds", 0.0);
@@ -810,19 +892,12 @@ static void validate_watchdog(const json & data) {
         throw std::runtime_error("watchdog audit path is invalid");
     }
     struct stat audit_stat;
-    struct stat descriptor_stat;
     const int audit_fd = data.value("audit_fd", -1);
-    const fs::path descriptor_path =
-        "/proc/" + std::to_string(pid) + "/fd/" + std::to_string(audit_fd);
     if (audit_fd < 0 || lstat(audit_path.c_str(), &audit_stat) != 0 ||
-            stat(descriptor_path.c_str(), &descriptor_stat) != 0 ||
             !S_ISREG(audit_stat.st_mode) ||
             static_cast<uint64_t>(audit_stat.st_dev) != data.value("audit_device", UINT64_C(0)) ||
             static_cast<uint64_t>(audit_stat.st_ino) != data.value("audit_inode", UINT64_C(0)) ||
-            static_cast<uint64_t>(descriptor_stat.st_dev) != data.value("audit_device", UINT64_C(0)) ||
-            static_cast<uint64_t>(descriptor_stat.st_ino) != data.value("audit_inode", UINT64_C(0)) ||
             audit_stat.st_uid != getuid() ||
-            static_cast<uint64_t>(audit_stat.st_uid) != data.value("audit_uid", UINT64_C(0)) ||
             (audit_stat.st_mode & 0777) != 0600 ||
             data.value("audit_mode", UINT64_C(0)) != 0600) {
         throw std::runtime_error("watchdog persistent audit identity changed");
@@ -858,6 +933,23 @@ static void validate_watchdog(const json & data) {
     if (!found_audit_record) {
         throw std::runtime_error("watchdog heartbeat audit record is missing");
     }
+    require_live_pidfd(authority_descriptor);
+    return {
+        {"format", "dsv41-watchdog-namespace-binding"},
+        {"version", 1},
+        {"authority", "inherited-pidfd"},
+        {"host_watchdog_pid", pid},
+        {"host_watchdog_process_group_id",
+            authority.value("watchdog_process_group_id", INT64_C(0))},
+        {"host_watchdog_start_time_ticks",
+            data.value("watchdog_start_time_ticks", UINT64_C(0))},
+        {"local_pid", getpid()},
+        {"local_parent_pid", getppid()},
+        {"local_process_group_id", getpgrp()},
+        {"local_session_id", getsid(0)},
+        {"namespace_pids", namespace_pids},
+        {"private_procfs", true},
+    };
 }
 #endif
 
@@ -891,16 +983,16 @@ static json audit_reference(const char * environment_name, const char * expected
     if (std::string(expected_kind) == "swap" && audit["data"].value("enabled", true)) {
         throw std::runtime_error("swap audit reports enabled swap");
     }
-#if defined(__linux__)
-    if (std::string(expected_kind) == "watchdog") {
-        validate_watchdog(audit["data"]);
-    }
-#endif
     json result = {
         {"path", fs::absolute(path).lexically_normal().string()},
         {"sha256", sha256_data(bytes.data(), bytes.size())},
         {"created_unix", created},
     };
+#if defined(__linux__)
+    if (std::string(expected_kind) == "watchdog") {
+        result["namespace_binding"] = validate_watchdog(audit["data"]);
+    }
+#endif
     if (std::string(expected_kind) == "watchdog") {
         result["data"] = audit["data"];
     } else if (std::string(expected_kind) == "memory") {
@@ -1432,6 +1524,18 @@ int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     try {
         reject_loader_overrides();
+#if defined(__linux__)
+        if (argc == 3 && std::string(argv[1]) == "--dsv41-test-watchdog") {
+            const std::vector<uint8_t> bytes = read_file(argv[2]);
+            std::cout << validate_watchdog(json::parse(bytes.begin(), bytes.end())).dump() << '\n';
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--dsv41-test-model-descriptor") {
+            const fs::path model_path = canonical_path(argv[2], "test model");
+            std::cout << validate_model_descriptor(model_path, true).dump() << '\n';
+            return 0;
+        }
+#endif
         if (argc == 2 && std::string(argv[1]) == "--version") {
             common_init();
             const fs::path executable = current_executable_path();
@@ -1555,6 +1659,13 @@ int main(int argc, char ** argv) {
         const fs::path model_path = model_storage.resolved_path;
         const fs::path prompt_path = prompt_storage.resolved_path;
         const fs::path output_path = output_storage.resolved_path;
+#if !defined(__linux__)
+        throw std::runtime_error("trace model descriptor binding requires Linux");
+#else
+        const int model_descriptor = required_descriptor("DSV41_MODEL_DESCRIPTOR");
+        const json model_file_identity = validate_model_descriptor(model_path, true);
+        params.model.path = "/proc/self/fd/" + std::to_string(model_descriptor);
+#endif
         llama_backend_init();
         llama_numa_init(params.numa);
         common_init_result_ptr init = common_init_from_params(params);
@@ -1626,6 +1737,10 @@ int main(int argc, char ** argv) {
                 {"expert_cache_slots", params.expert_cache_slots},
                 {"expert_cache_bytes", static_cast<uint64_t>(params.expert_cache_mib) << 20},
                 {"tokenizer", tokenizer_policy},
+#if defined(__linux__)
+                {"model_file_identity", model_file_identity},
+                {"watchdog_namespace", watchdog_audit["namespace_binding"]},
+#endif
                 {"deepseek41", {
                     {"layer_count", 40},
                     {"vocab_size", n_vocab},
@@ -1647,8 +1762,13 @@ int main(int argc, char ** argv) {
             {"model", {
                 {"path", model_path.string()},
                 {"architecture", "deepseek41"},
+#if defined(__linux__)
+                {"byte_count", model_file_identity["byte_count"]},
+                {"sha256", model_file_identity["sha256"]},
+#else
                 {"byte_count", fs::file_size(model_path)},
                 {"sha256", sha256_file(model_path)},
+#endif
             }},
             {"prompt", {
                 {"path", prompt_path.string()},
@@ -1725,7 +1845,12 @@ int main(int argc, char ** argv) {
         }
 
 #if defined(__linux__)
-        validate_watchdog(watchdog_audit["data"]);
+        if (validate_watchdog(watchdog_audit["data"]) != watchdog_audit["namespace_binding"]) {
+            throw std::runtime_error("watchdog namespace binding changed during trace execution");
+        }
+        if (validate_model_descriptor(model_path, true) != model_file_identity) {
+            throw std::runtime_error("held model descriptor changed during trace execution");
+        }
 #endif
         end_loader_monitor(executable_path);
         writer.bind_runtime_post(runtime_libraries_json(

@@ -507,6 +507,16 @@ def proc_parent_pid(stat: str) -> int:
     return int(fields[1])
 
 
+def proc_process_group_id(stat: str) -> int:
+    command_end = stat.rfind(")")
+    if command_end < 0:
+        raise PreflightError("process stat is invalid")
+    fields = stat[command_end + 2:].split()
+    if len(fields) < 3:
+        raise PreflightError("process stat is truncated")
+    return int(fields[2])
+
+
 def is_descendant(pid: int, ancestor_pid: int, procfs_root: Path) -> bool:
     seen = set()
     while pid > 1 and pid not in seen:
@@ -518,6 +528,114 @@ def is_descendant(pid: int, ancestor_pid: int, procfs_root: Path) -> bool:
         except (OSError, ValueError):
             return False
     return False
+
+
+def open_watchdog_namespace_authority(
+        watchdog: dict[str, object],
+        *,
+        procfs_root: Path = Path("/proc"),
+        pidfd_open: Callable[[int, int], int] | None = None,
+) -> tuple[int, dict[str, object]]:
+    if sys.platform != "linux":
+        raise PreflightError("watchdog namespace authority requires Linux pidfds")
+    opener = pidfd_open or getattr(os, "pidfd_open", None)
+    if opener is None:
+        raise PreflightError("watchdog namespace authority requires os.pidfd_open")
+    try:
+        watchdog_pid = int(watchdog["watchdog_pid"])
+        watchdog_start = int(watchdog["watchdog_start_time_ticks"])
+        guardian_pid = int(watchdog["guardian_pid"])
+        child_pid = int(watchdog["child_pid"])
+        child_pgid = int(watchdog["child_process_group_id"])
+        executable_path = str(watchdog["watchdog_executable_path"])
+        command_sha256 = str(watchdog["watchdog_command_sha256"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PreflightError(f"watchdog namespace authority identity is invalid: {error}") from error
+    descriptor = -1
+    try:
+        descriptor = int(opener(watchdog_pid, 0))
+        watchdog_stat = (procfs_root / str(watchdog_pid) / "stat").read_text(encoding="ascii")
+        guardian_stat = (procfs_root / str(guardian_pid) / "stat").read_text(encoding="ascii")
+        child_stat = (procfs_root / str(child_pid) / "stat").read_text(encoding="ascii")
+        live_executable = str((procfs_root / str(watchdog_pid) / "exe").resolve(strict=True))
+        live_command = (procfs_root / str(watchdog_pid) / "cmdline").read_bytes()
+        fdinfo = (procfs_root / "self" / "fdinfo" / str(descriptor)).read_text(encoding="ascii")
+        fdinfo_pid = next(
+            int(line.split(":", 1)[1].strip())
+            for line in fdinfo.splitlines()
+            if line.startswith("Pid:")
+        )
+        if proc_start_time_ticks(watchdog_stat) != watchdog_start:
+            raise PreflightError("watchdog namespace authority start time does not match")
+        if live_executable != str(Path(executable_path).resolve(strict=True)):
+            raise PreflightError("watchdog namespace authority executable does not match")
+        if sha256_bytes(live_command) != command_sha256:
+            raise PreflightError("watchdog namespace authority command does not match")
+        if fdinfo_pid != watchdog_pid:
+            raise PreflightError("watchdog namespace authority pidfd does not match")
+        watchdog_pgid = proc_process_group_id(watchdog_stat)
+        if proc_parent_pid(guardian_stat) != watchdog_pid or (
+                proc_process_group_id(guardian_stat) != child_pgid) or (
+                guardian_pid != child_pgid) or (
+                proc_parent_pid(child_stat) != guardian_pid) or (
+                proc_process_group_id(child_stat) != child_pgid):
+            raise PreflightError("watchdog namespace authority process tree does not match")
+        authority = {
+            "format": "dsv41-watchdog-namespace-authority",
+            "version": 1,
+            "mechanism": "inherited-pidfd",
+            "descriptor": descriptor,
+            "host_procfs_root": str(procfs_root.resolve(strict=True)),
+            "watchdog_pid": watchdog_pid,
+            "watchdog_process_group_id": watchdog_pgid,
+            "watchdog_start_time_ticks": watchdog_start,
+            "watchdog_executable_path": live_executable,
+            "watchdog_command_sha256": command_sha256,
+            "guardian_pid": guardian_pid,
+            "child_pid": child_pid,
+            "child_process_group_id": child_pgid,
+        }
+        return descriptor, authority
+    except (OSError, StopIteration, ValueError) as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise PreflightError(f"cannot establish watchdog namespace authority: {error}") from error
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def verify_watchdog_namespace_authority(
+        descriptor: int,
+        authority: dict[str, object],
+        *,
+        procfs_root: Path = Path("/proc"),
+) -> None:
+    try:
+        if authority.get("format") != "dsv41-watchdog-namespace-authority" or (
+                authority.get("version") != 1) or authority.get("mechanism") != "inherited-pidfd" or (
+                authority.get("descriptor") != descriptor):
+            raise PreflightError("watchdog namespace authority receipt is invalid")
+        watchdog_pid = int(authority["watchdog_pid"])
+        watchdog_start = int(authority["watchdog_start_time_ticks"])
+        stat_text = (procfs_root / str(watchdog_pid) / "stat").read_text(encoding="ascii")
+        executable = str((procfs_root / str(watchdog_pid) / "exe").resolve(strict=True))
+        command = (procfs_root / str(watchdog_pid) / "cmdline").read_bytes()
+        fdinfo = (procfs_root / "self" / "fdinfo" / str(descriptor)).read_text(encoding="ascii")
+        fdinfo_pid = next(
+            int(line.split(":", 1)[1].strip())
+            for line in fdinfo.splitlines()
+            if line.startswith("Pid:")
+        )
+        if fdinfo_pid != watchdog_pid or proc_start_time_ticks(stat_text) != watchdog_start or (
+                executable != authority.get("watchdog_executable_path")) or (
+                sha256_bytes(command) != authority.get("watchdog_command_sha256")):
+            raise PreflightError("watchdog namespace authority changed")
+    except PreflightError:
+        raise
+    except (KeyError, OSError, StopIteration, TypeError, ValueError) as error:
+        raise PreflightError(f"cannot verify watchdog namespace authority: {error}") from error
 
 
 def read_heartbeat(
@@ -1365,12 +1483,18 @@ def validate_prompt_provenance(
         raise PreflightError(f"prompt provenance is invalid: {error}") from error
     if not isinstance(record, dict):
         raise PreflightError("prompt provenance must be a JSON object")
+    source_root_lexical = Path(str(builder_policy["source_root"]))
+    source_root_resolved = resolved(source_root_lexical)
+    corpus_resolved = resolved(source_root_resolved / "tests" / "corpus" / corpus_name)
     expected = {
         "format": "dsv41-prompt-provenance",
-        "version": 1,
+        "version": 2,
         "corpus_name": corpus_name,
         "corpus_sha256": corpus_sha256,
-        "corpus_path": f"{builder_policy['source_root']}/tests/corpus/{corpus_name}",
+        "corpus_path": str(corpus_resolved),
+        "corpus_resolved_path": str(corpus_resolved),
+        "source_root_lexical_path": str(source_root_lexical),
+        "source_root_resolved_path": str(source_root_resolved),
         "model_sha256": model_sha256,
         "prompt_sha256": sha256_bytes(prompt_bytes),
         "prompt_byte_count": prompt_size,
@@ -1390,6 +1514,7 @@ def validate_prompt_provenance(
         if record.get(key) != value:
             raise PreflightError(f"prompt provenance {key} mismatch")
     required = set(expected) | {
+        "corpus_lexical_path",
         "builder_runtime_build",
         "builder_runtime_build_sha256",
         "builder_install_trust",
@@ -1397,6 +1522,11 @@ def validate_prompt_provenance(
     }
     if set(record) != required:
         raise PreflightError("prompt provenance fields are invalid")
+    try:
+        if resolved(Path(str(record["corpus_lexical_path"]))) != corpus_resolved:
+            raise PreflightError("prompt provenance corpus lexical path resolves outside the approved source")
+    except OSError as error:
+        raise PreflightError(f"prompt provenance corpus lexical path is invalid: {error}") from error
     try:
         runtime_build = validate_runtime_build_evidence(
             record["builder_runtime_build"], builder_policy, label="prompt builder")

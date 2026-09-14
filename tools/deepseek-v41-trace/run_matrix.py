@@ -53,6 +53,13 @@ CORPORA = (
 )
 
 
+def approved_source_root(builder_policy: dict[str, object]) -> Path:
+    try:
+        return Path(str(builder_policy["source_root"])).expanduser().resolve(strict=True)
+    except (KeyError, OSError) as error:
+        raise PreflightError(f"prompt builder approved source root is invalid: {error}") from error
+
+
 def query_prompt_builder_runtime_build(
         builder: Path,
         builder_policy: dict[str, object]) -> dict[str, object]:
@@ -133,11 +140,16 @@ def prepare_prompt(
         builder_policy, label="prompt builder")
     helper_identity = approved_containment_helper_identity(
         builder_policy, label="prompt builder")
-    expected_source = Path(builder_policy["source_root"]) / "tests" / "corpus" / corpus_name
-    if source_corpus != expected_source or sha256_file(source_corpus) != corpus_sha256 or (
+    source_root_lexical = Path(builder_policy["source_root"])
+    source_root_resolved = approved_source_root(builder_policy)
+    source_corpus_lexical = source_corpus
+    source_corpus_resolved = source_corpus_lexical.resolve(strict=True)
+    expected_source = (
+        source_root_resolved / "tests" / "corpus" / corpus_name).resolve(strict=True)
+    if source_corpus_resolved != expected_source or sha256_file(source_corpus_resolved) != corpus_sha256 or (
             sha256_file(corpus) != corpus_sha256):
         raise RuntimeError("prompt builder corpus path or bytes differ from external approval")
-    source_identity = file_identity(source_corpus)
+    source_identity = file_identity(source_corpus_resolved)
     corpus_identity = file_identity(corpus)
     verify_approved_runtime_file_identities(runtime_identities, label="prompt builder")
     tokenizer = validate_tokenizer_policy(builder_policy["tokenizer"])
@@ -171,8 +183,8 @@ def prepare_prompt(
         raise RuntimeError("prompt builder execution identity differs from external approval")
     verify_approved_executable_identity(builder, builder_identity, label="prompt builder")
     verify_approved_runtime_file_identities(runtime_identities, label="prompt builder")
-    if file_identity(source_corpus) != source_identity or file_identity(corpus) != corpus_identity or (
-            sha256_file(source_corpus) != corpus_sha256) or sha256_file(corpus) != corpus_sha256:
+    if file_identity(source_corpus_resolved) != source_identity or file_identity(corpus) != corpus_identity or (
+            sha256_file(source_corpus_resolved) != corpus_sha256) or sha256_file(corpus) != corpus_sha256:
         raise RuntimeError("prompt builder corpus changed during execution")
     if result.returncode != 0:
         raise RuntimeError(f"prompt builder failed: {result.stderr.strip()}")
@@ -207,10 +219,14 @@ def prepare_prompt(
         builder_identity, runtime_identities, (helper_identity,))
     record = {
         "format": "dsv41-prompt-provenance",
-        "version": 1,
+        "version": 2,
         "corpus_name": corpus_name,
         "corpus_sha256": corpus_sha256,
-        "corpus_path": str(source_corpus),
+        "corpus_path": str(source_corpus_resolved),
+        "corpus_lexical_path": str(source_corpus_lexical),
+        "corpus_resolved_path": str(source_corpus_resolved),
+        "source_root_lexical_path": str(source_root_lexical),
+        "source_root_resolved_path": str(source_root_resolved),
         "model_sha256": MODEL_SHA256,
         "prompt_sha256": prompt_sha256,
         "prompt_byte_count": prompt_byte_count,
@@ -399,7 +415,7 @@ def main() -> int:
             repo=repo,
             busy_patterns=args.busy_pattern,
         )
-        if str(repo) != prompt_policy["source_root"] or args.candidate_revision != prompt_policy["revision"]:
+        if repo != approved_source_root(prompt_policy) or args.candidate_revision != prompt_policy["revision"]:
             raise PreflightError("matrix repository or revision differs from prompt builder approval")
         if output.exists() and any(output.iterdir()):
             raise PreflightError(f"matrix output directory is not empty: {output}")
