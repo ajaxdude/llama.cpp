@@ -131,14 +131,46 @@ jobs:
         id: deepseek_v41_trace_ctest
         run: |
           set -o pipefail
-          ctest --test-dir build --show-only=json-v1 -R '^test-deepseek41-trace$' > build/test-deepseek41-trace-ctest-metadata.json
+          ci_root="$PWD/build/deepseek-v41-trace-ci"
+          rm -rf "$ci_root"
+          install -d -m 0700 \
+            "$ci_root" \
+            "$ci_root/tmp" \
+            "$ci_root/hook" \
+            "$ci_root/marker" \
+            "$ci_root/log" \
+            "$ci_root/evidence"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_cap_bnd="$(awk '/^CapBnd:/ { print $2 }' /proc/self/status)"
+          selected_interpreter="$(python3 -c 'import sys; from pathlib import Path; print(Path(sys.executable).resolve(strict=True))')"
+          ctest_path="$(command -v ctest)"
+          if [[ "$runner_uid" == "0" || "$runner_gid" == "0" || ! "$runner_cap_bnd" =~ ^[0-9A-Fa-f]+$ || "$selected_interpreter" != /* || "$ctest_path" != /* ]]; then
+            echo "hosted runner identity or executable path is invalid" >&2
+            exit 1
+          fi
+          export DSV41_CI_ROOT="$ci_root"
+          export DSV41_CI_RUNNER_UID="$runner_uid"
+          export DSV41_CI_RUNNER_GID="$runner_gid"
+          export DSV41_CI_RUNNER_CAP_BND="$runner_cap_bnd"
+          export DSV41_CI_SELECTED_INTERPRETER="$selected_interpreter"
+          export DSV41_CI_CTEST="$(realpath "$ctest_path")"
+          ctest --test-dir build --show-only=json-v1 -R '^test-deepseek41-trace$' > "$ci_root/evidence/test-deepseek41-trace-ctest-metadata.json"
           python3 - <<'PY'
+          import ast
+          import hashlib
           import json
+          import os
           import subprocess
           import sys
           from pathlib import Path
 
-          metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
+          root = Path(os.environ["DSV41_CI_ROOT"]).resolve(strict=True)
+          evidence = root / "evidence"
+          workspace = Path.cwd().resolve(strict=True)
+          build = (workspace / "build").resolve(strict=True)
+          metadata_path = evidence / "test-deepseek41-trace-ctest-metadata.json"
+          metadata = json.loads(metadata_path.read_text())
           tests = metadata.get("tests", [])
           if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
               raise SystemExit(f"expected exactly one test-deepseek41-trace selector match, got {len(tests)}")
@@ -159,7 +191,7 @@ jobs:
               raise SystemExit(
                   f"test-deepseek41-trace requires Python 3.11: "
                   f"registered={registered_version} selected={sys.version_info.major}.{sys.version_info.minor}")
-          Path("build/test-deepseek41-trace-python.json").write_text(
+          (evidence / "test-deepseek41-trace-python.json").write_text(
               json.dumps({
                   "registered_interpreter": str(registered_interpreter),
                   "registered_version": registered_version,
@@ -188,198 +220,747 @@ jobs:
           ]
           if missing:
               raise SystemExit(f"test-deepseek41-trace environment is incomplete: {missing}")
+          source = workspace / "tools/deepseek-v41-trace/trace_format.py"
+          parsed = ast.parse(source.read_text(encoding="ascii"))
+          forbidden = None
+          for node in parsed.body:
+              if isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id == "FORBIDDEN_LOADER_ENVIRONMENT"
+                      for target in node.targets):
+                  forbidden = ast.literal_eval(node.value)
+                  break
+          expected_forbidden = (
+              "DYLD_FALLBACK_FRAMEWORK_PATH",
+              "DYLD_FALLBACK_LIBRARY_PATH",
+              "DYLD_FRAMEWORK_PATH",
+              "DYLD_IMAGE_SUFFIX",
+              "DYLD_INSERT_LIBRARIES",
+              "DYLD_LIBRARY_PATH",
+              "DYLD_ROOT_PATH",
+              "DYLD_VERSIONED_FRAMEWORK_PATH",
+              "DYLD_VERSIONED_LIBRARY_PATH",
+              "GGML_BACKEND_PATH",
+              "LD_AUDIT",
+              "LD_LIBRARY_PATH",
+              "LD_PRELOAD",
+          )
+          if forbidden != expected_forbidden:
+              raise SystemExit("trace forbidden loader environment changed")
+          forbidden_path = evidence / "forbidden-loader-environment.json"
+          forbidden_path.write_text(
+              json.dumps(list(forbidden), separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          config = {
+              "ctest": str(Path(os.environ["DSV41_CI_CTEST"]).resolve(strict=True)),
+              "forbidden_path": str(forbidden_path),
+              "forbidden_sha256": hashlib.sha256(forbidden_path.read_bytes()).hexdigest(),
+              "environment_allowlist": sorted((
+                  "DSV41_CI_CONFIG",
+                  "DSV41_CI_CONFIG_SHA256",
+                  "DSV41_CI_GATE",
+                  "DSV41_CI_GATE_SHA256",
+                  "DSV41_CI_HOOK_SHA256",
+                  "HOME",
+                  "LANG",
+                  "LC_ALL",
+                  "PATH",
+                  "PYTHONDONTWRITEBYTECODE",
+                  "PYTHONCOERCECLOCALE",
+                  "PYTHONPATH",
+                  "PYTHONUTF8",
+                  "TMPDIR",
+              )),
+              "paths": {
+                  "build": str(build),
+                  "evidence": str(evidence),
+                  "hook": str(root / "hook"),
+                  "log": str(root / "log"),
+                  "marker": str(root / "marker"),
+                  "tmp": str(root / "tmp"),
+                  "workspace": str(workspace),
+              },
+              "registered_interpreter": str(registered_interpreter),
+              "runner_cap_bnd": int(os.environ["DSV41_CI_RUNNER_CAP_BND"], 16),
+              "runner_gid": int(os.environ["DSV41_CI_RUNNER_GID"]),
+              "runner_uid": int(os.environ["DSV41_CI_RUNNER_UID"]),
+              "selected_interpreter": str(selected_interpreter),
+              "source": str((workspace / "tests/test-deepseek41-trace.py").resolve(strict=True)),
+          }
+          (evidence / "fixture-config.json").write_text(
+              json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
           PY
-          rm -rf build/deepseek-v41-trace-hook build/deepseek-v41-trace-marker
-          install -d -m 0700 build/deepseek-v41-trace-hook build/deepseek-v41-trace-marker
-          cat > build/deepseek-v41-trace-hook/sitecustomize.py <<'PY'
+          cat > "$ci_root/evidence/fixture_gate.py" <<'PY'
           import hashlib
           import json
           import os
+          import stat
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
+
+          FORBIDDEN = (
+              "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+              "DYLD_FRAMEWORK_PATH", "DYLD_IMAGE_SUFFIX", "DYLD_INSERT_LIBRARIES",
+              "DYLD_LIBRARY_PATH", "DYLD_ROOT_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH",
+              "DYLD_VERSIONED_LIBRARY_PATH", "GGML_BACKEND_PATH", "LD_AUDIT",
+              "LD_LIBRARY_PATH", "LD_PRELOAD",
+          )
+
+          def bytes_for(value):
+              return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+          def write_exclusive(path, value):
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags, 0o600)
+              data = bytes_for(value)
+              try:
+                  if os.write(descriptor, data) != len(data):
+                      raise RuntimeError(f"short write for {path}")
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+              return hashlib.sha256(data).hexdigest()
+
+          def verify_digest(path, expected):
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"SHA-256 mismatch for {path}")
+              return actual
+
+          def read_status(text=None):
+              text = Path("/proc/self/status").read_text(encoding="ascii") if text is None else text
+              fields = {}
+              for line in text.splitlines():
+                  name, separator, value = line.partition(":")
+                  if separator:
+                      fields[name] = value.strip()
+              required = ("Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs")
+              missing = [name for name in required if name not in fields]
+              if missing:
+                  raise RuntimeError(f"/proc/self/status is incomplete: {missing}")
+              return {
+                  "cap_amb": int(fields["CapAmb"], 16),
+                  "cap_bnd": int(fields["CapBnd"], 16),
+                  "cap_eff": int(fields["CapEff"], 16),
+                  "cap_inh": int(fields["CapInh"], 16),
+                  "cap_prm": int(fields["CapPrm"], 16),
+                  "gid": [int(value) for value in fields["Gid"].split()],
+                  "groups": [int(value) for value in fields["Groups"].split()],
+                  "no_new_privs": int(fields["NoNewPrivs"]),
+                  "uid": [int(value) for value in fields["Uid"].split()],
+              }
+
+          def current_state():
+              state = read_status()
+              state.update({
+                  "os_egid": os.getegid(), "os_euid": os.geteuid(),
+                  "os_gid": os.getgid(), "os_groups": os.getgroups(), "os_uid": os.getuid(),
+              })
+              return state
+
+          def validate_state(state, uid, gid, cap_bnd):
+              if uid <= 0 or gid <= 0:
+                  raise RuntimeError("runner identity is privileged")
+              if state["uid"] != [uid] * 4 or state["gid"] != [gid] * 4:
+                  raise RuntimeError("live UID or GID differs")
+              if (state["os_uid"], state["os_euid"], state["os_gid"], state["os_egid"]) != (uid, uid, gid, gid):
+                  raise RuntimeError("runtime UID or GID differs")
+              if state["groups"] or state["os_groups"]:
+                  raise RuntimeError("supplementary groups are not empty")
+              for name in ("cap_inh", "cap_prm", "cap_eff", "cap_amb"):
+                  if state[name] != 0:
+                      raise RuntimeError(f"{name} is not zero")
+              if state["cap_bnd"] != cap_bnd:
+                  raise RuntimeError("CapBnd changed")
+              if state["no_new_privs"] != 1:
+                  raise RuntimeError("NoNewPrivs is not one")
+
+          def validate_interpreter_values(registered, selected, executable, registered_version, selected_version):
+              if not all(Path(value).is_absolute() for value in (registered, selected, executable)):
+                  raise RuntimeError("Python path is not absolute")
+              if registered != selected or registered != executable:
+                  raise RuntimeError("Python identity differs")
+              if registered_version != "3.11" or selected_version != "3.11":
+                  raise RuntimeError("Python is not version 3.11")
+
+          def validate_interpreter(config):
+              registered = str(Path(config["registered_interpreter"]).resolve(strict=True))
+              selected = str(Path(config["selected_interpreter"]).resolve(strict=True))
+              executable = str(Path(sys.executable).resolve(strict=True))
+              version = f"{sys.version_info.major}.{sys.version_info.minor}"
+              validate_interpreter_values(registered, selected, executable, version, version)
+              return {"executable": executable, "registered": registered, "selected": selected, "version": version}
+
+          def load_forbidden(config):
+              path = Path(config["forbidden_path"]).resolve(strict=True)
+              verify_digest(path, config["forbidden_sha256"])
+              values = tuple(json.loads(path.read_text(encoding="ascii")))
+              if values != FORBIDDEN:
+                  raise RuntimeError("forbidden loader list differs")
+              return values
+
+          def validate_environment(environment, config):
+              names = sorted(environment)
+              if names != config["environment_allowlist"]:
+                  raise RuntimeError(f"environment allowlist differs: {names}")
+              active = sorted(name for name in FORBIDDEN if environment.get(name))
+              if active:
+                  raise RuntimeError(f"forbidden loader environment is active: {active}")
+              return names
+
+          def directory_receipts(workspace, build, direct_paths, uid):
+              workspace, build = Path(workspace), Path(build)
+              direct_paths = [Path(value) for value in direct_paths]
+              for path in (workspace, build, *direct_paths):
+                  if not path.is_absolute() or path.resolve(strict=True) != path:
+                      raise RuntimeError(f"directory is not canonical: {path}")
+              if build != workspace and workspace not in build.parents:
+                  raise RuntimeError("build is outside workspace")
+              receipts = {}
+              for target in (build, *direct_paths):
+                  if target != build and build not in target.parents:
+                      raise RuntimeError(f"staging path is outside build: {target}")
+                  current = workspace
+                  candidates = [current]
+                  for part in target.relative_to(workspace).parts:
+                      current /= part
+                      candidates.append(current)
+                  for candidate in candidates:
+                      if str(candidate) in receipts:
+                          continue
+                      info = candidate.lstat()
+                      mode = stat.S_IMODE(info.st_mode)
+                      if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                          raise RuntimeError(f"staging ancestry is not a direct directory: {candidate}")
+                      if info.st_uid != uid or mode & 0o022:
+                          raise RuntimeError(f"staging ancestry owner or mode is invalid: {candidate}")
+                      receipts[str(candidate)] = {
+                          "device": info.st_dev, "gid": info.st_gid, "inode": info.st_ino,
+                          "mode": mode, "uid": info.st_uid,
+                      }
+              for path in direct_paths:
+                  if receipts[str(path)]["mode"] != 0o700:
+                      raise RuntimeError(f"staging directory mode is not 0700: {path}")
+              return receipts
+
+          def load_config():
+              path = Path(os.environ["DSV41_CI_CONFIG"]).resolve(strict=True)
+              verify_digest(path, os.environ["DSV41_CI_CONFIG_SHA256"])
+              return json.loads(path.read_text(encoding="ascii"))
+
+          def launch():
+              config = load_config()
+              load_forbidden(config)
+              environment_names = validate_environment(os.environ, config)
+              state = current_state()
+              validate_state(state, config["runner_uid"], config["runner_gid"], config["runner_cap_bnd"])
+              interpreter = validate_interpreter(config)
+              paths = config["paths"]
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = directory_receipts(paths["workspace"], paths["build"], direct, config["runner_uid"])
+              ctest = str(Path(config["ctest"]).resolve(strict=True))
+              if not os.access(ctest, os.X_OK):
+                  raise RuntimeError("CTest is not executable")
+              preflight = {
+                  "ctest": ctest, "environment_names": environment_names,
+                  "format": "dsv41-ci-runner-preflight", "interpreter": interpreter,
+                  "pid": os.getpid(), "ppid": os.getppid(), "secure_directories": receipts,
+                  "state": state, "timestamp_monotonic_ns": time.monotonic_ns(), "version": 1,
+              }
+              path = Path(paths["evidence"]) / "runner-preflight.json"
+              digest = write_exclusive(path, preflight)
+              path.chmod(0o444)
+              environment = dict(os.environ)
+              environment["DSV41_CI_PREFLIGHT"] = str(path)
+              environment["DSV41_CI_PREFLIGHT_SHA256"] = digest
+              os.execve(ctest, [
+                  ctest, "--test-dir", paths["build"], "-R", "^test-deepseek41-trace$",
+                  "--output-on-failure", "--verbose", "--no-tests=error",
+                  "--output-junit", str(Path(paths["evidence"]) / "test-deepseek41-trace-ctest.xml"),
+              ], environment)
+
+          def rejected(function):
+              try:
+                  function()
+              except Exception:
+                  return
+              raise RuntimeError("negative fixture was accepted")
+
+          def self_test(output):
+              parsed = read_status(
+                  "Uid:\t1001 1001 1001 1001\n"
+                  "Gid:\t1001 1001 1001 1001\n"
+                  "Groups:\t\n"
+                  "CapInh:\t0000000000000000\n"
+                  "CapPrm:\t0000000000000000\n"
+                  "CapEff:\t0000000000000000\n"
+                  "CapBnd:\t000000000000000f\n"
+                  "CapAmb:\t0000000000000000\n"
+                  "NoNewPrivs:\t1\n")
+              expected_parsed = {
+                  "cap_amb": 0, "cap_bnd": 15, "cap_eff": 0, "cap_inh": 0, "cap_prm": 0,
+                  "gid": [1001] * 4, "groups": [], "no_new_privs": 1, "uid": [1001] * 4,
+              }
+              if parsed != expected_parsed:
+                  raise RuntimeError("accepted /proc/self/status fixture differs")
+              valid = {
+                  "cap_amb": 0, "cap_bnd": 15, "cap_eff": 0, "cap_inh": 0, "cap_prm": 0,
+                  "gid": [1001] * 4, "groups": [], "no_new_privs": 1,
+                  "os_egid": 1001, "os_euid": 1001, "os_gid": 1001,
+                  "os_groups": [], "os_uid": 1001, "uid": [1001] * 4,
+              }
+              validate_state(valid, 1001, 1001, 15)
+              for mutation in (
+                      {"groups": [5]}, {"os_groups": [5]},
+                      {"uid": [1002] * 4}, {"gid": [1002] * 4},
+                      {"cap_inh": 1}, {"cap_prm": 1}, {"cap_eff": 1}, {"cap_amb": 1},
+                      {"cap_bnd": 14}, {"no_new_privs": 0}):
+                  changed = dict(valid)
+                  changed.update(mutation)
+                  rejected(lambda changed=changed: validate_state(changed, 1001, 1001, 15))
+              validate_interpreter_values("/python3.11", "/python3.11", "/python3.11", "3.11", "3.11")
+              rejected(lambda: validate_interpreter_values("python3.11", "/python3.11", "/python3.11", "3.11", "3.11"))
+              rejected(lambda: validate_interpreter_values("/python3.11", "/other", "/python3.11", "3.11", "3.11"))
+              rejected(lambda: validate_interpreter_values("/python3.11", "/python3.11", "/python3.11", "3.12", "3.11"))
+              config = {"environment_allowlist": ["HOME"]}
+              validate_environment({"HOME": "/home/runner"}, config)
+              rejected(lambda: validate_environment({"HOME": "/home/runner", "LD_LIBRARY_PATH": "/lib"}, config))
+              rejected(lambda: validate_environment(
+                  {"HOME": "/home/runner", "LD_LIBRARY_PATH": "/lib"},
+                  {"environment_allowlist": ["HOME", "LD_LIBRARY_PATH"]}))
+              root = Path(output).resolve().parent / "gate-self-test"
+              root.mkdir(mode=0o700)
+              with tempfile.TemporaryDirectory(dir=root) as temp:
+                  workspace = Path(temp) / "workspace"
+                  build = workspace / "build"
+                  direct = build / "direct"
+                  direct.mkdir(parents=True, mode=0o700)
+                  workspace.chmod(0o700)
+                  build.chmod(0o700)
+                  directory_receipts(workspace, build, [direct], os.getuid())
+                  direct.chmod(0o770)
+                  rejected(lambda: directory_receipts(workspace, build, [direct], os.getuid()))
+                  direct.chmod(0o702)
+                  rejected(lambda: directory_receipts(workspace, build, [direct], os.getuid()))
+                  direct.chmod(0o700)
+                  link = build / "link"
+                  link.symlink_to(direct, target_is_directory=True)
+                  rejected(lambda: directory_receipts(workspace, build, [link], os.getuid()))
+                  marker = build / "exclusive.json"
+                  write_exclusive(marker, {"value": 1})
+                  rejected(lambda: write_exclusive(marker, {"value": 2}))
+                  digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+                  marker.chmod(0o600)
+                  marker.write_text('{"value":2}\n', encoding="ascii")
+                  rejected(lambda: verify_digest(marker, digest))
+              Path(output).write_text(json.dumps({
+                  "environment": "PASS", "exclusive_and_tamper": "PASS",
+                  "interpreter": "PASS", "secure_ancestry": "PASS",
+                  "state_matrix": "PASS",
+              }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+
+          if __name__ == "__main__":
+              if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+                  self_test(sys.argv[2])
+              elif sys.argv[1:] == ["--launch"]:
+                  launch()
+              else:
+                  raise SystemExit("invalid fixture gate arguments")
+          PY
+          cat > "$ci_root/hook/sitecustomize.py" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import sys
           import time
           import unittest
           from pathlib import Path
 
-          _TEST_CLASS = "TraceFormatTests"
-          _TEST_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
-          _TEST_ID = f"__main__.{_TEST_CLASS}.{_TEST_METHOD}"
-          _SOURCE = Path(os.environ["DSV41_CI_TEST_SOURCE"]).resolve(strict=True)
-          _MARKER_DIR = Path(os.environ["DSV41_CI_MARKER_DIR"]).resolve(strict=True)
-          _BINDINGS = (
-              "DSV41_NATIVE_TRACE_BINARY",
-              "DSV41_NATIVE_CONTAINMENT_HELPER",
-              "DSV41_NATIVE_MANIFEST_BINARY",
-              "DSV41_NATIVE_INJECT_LIBRARY",
+          def load_gate():
+              path = Path(os.environ["DSV41_CI_GATE"]).resolve(strict=True)
+              if hashlib.sha256(path.read_bytes()).hexdigest() != os.environ["DSV41_CI_GATE_SHA256"]:
+                  raise RuntimeError("fixture gate SHA-256 mismatch")
+              spec = importlib.util.spec_from_file_location("dsv41_ci_fixture_gate", path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot load fixture gate")
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              return module
+
+          GATE = load_gate()
+          CONFIG = GATE.load_config()
+          HOOK_PATH = Path(__file__).resolve(strict=True)
+          HOOK_SHA256 = GATE.verify_digest(HOOK_PATH, os.environ["DSV41_CI_HOOK_SHA256"])
+          SOURCE = Path(CONFIG["source"]).resolve(strict=True)
+          MARKER_DIR = Path(CONFIG["paths"]["marker"]).resolve(strict=True)
+          TEST_CLASS = "TraceFormatTests"
+          TEST_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
+          TEST_ID = f"__main__.{TEST_CLASS}.{TEST_METHOD}"
+          BINDINGS = (
+              "DSV41_NATIVE_TRACE_BINARY", "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY", "DSV41_NATIVE_INJECT_LIBRARY",
           )
-          _ORIGINAL_CALL_TEST_METHOD = unittest.TestCase._callTestMethod
-          _ORIGINAL_ADD_SKIP = unittest.TextTestResult.addSkip
+          ORIGINAL_CALL = unittest.TestCase._callTestMethod
+          ORIGINAL_SKIP = unittest.TextTestResult.addSkip
 
-          def _write_marker(path, payload):
-              descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-              try:
-                  os.write(descriptor, (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
-                  os.fsync(descriptor)
-              finally:
-                  os.close(descriptor)
+          def preflight():
+              path = Path(os.environ["DSV41_CI_PREFLIGHT"]).resolve(strict=True)
+              digest = GATE.verify_digest(path, os.environ["DSV41_CI_PREFLIGHT_SHA256"])
+              return path, digest, json.loads(path.read_text(encoding="ascii"))
 
-          def _call_test_method(self, method):
+          def live_evidence():
+              path, digest, before = preflight()
+              state = GATE.current_state()
+              GATE.validate_state(state, CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              interpreter = GATE.validate_interpreter(CONFIG)
+              if any(os.environ.get(name) for name in GATE.FORBIDDEN):
+                  raise RuntimeError("target process has a forbidden loader environment")
+              paths = CONFIG["paths"]
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = GATE.directory_receipts(paths["workspace"], paths["build"], direct, CONFIG["runner_uid"])
+              if state != before["state"] or interpreter != before["interpreter"] or receipts != before["secure_directories"]:
+                  raise RuntimeError("target process differs from preflight")
+              return {
+                  "active_forbidden_loader_environment": [],
+                  "interpreter": interpreter,
+                  "preflight_path": str(path),
+                  "preflight_sha256": digest,
+                  "secure_directories": receipts,
+                  "state": state,
+              }
+
+          def call_test_method(self, method):
               function = getattr(method, "__func__", method)
               code = getattr(function, "__code__", None)
               source = Path(code.co_filename).resolve(strict=True) if code is not None else None
-              if self.__class__.__name__ == _TEST_CLASS and method.__name__ == _TEST_METHOD and source == _SOURCE:
+              if self.__class__.__name__ == TEST_CLASS and method.__name__ == TEST_METHOD and source == SOURCE:
                   bindings = {}
-                  for name in _BINDINGS:
+                  for name in BINDINGS:
                       value = os.environ.get(name)
                       if not value:
                           raise RuntimeError(f"missing {name} binding")
                       bindings[name] = str(Path(value).resolve(strict=True))
                   payload = {
-                      "bindings": bindings,
-                      "event": "test_method_entry",
-                      "first_line": code.co_firstlineno,
-                      "function": _TEST_METHOD,
-                      "pid": os.getpid(),
-                      "ppid": os.getppid(),
-                      "source": str(source),
+                      **live_evidence(), "bindings": bindings, "event": "test_method_entry",
+                      "first_line": code.co_firstlineno, "function": TEST_METHOD,
+                      "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
+                      "hook_sha256": HOOK_SHA256,
+                      "pid": os.getpid(), "ppid": os.getppid(), "source": str(source),
                       "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                      "test_id": self.id(),
-                      "timestamp_monotonic_ns": time.monotonic_ns(),
+                      "test_id": self.id(), "timestamp_monotonic_ns": time.monotonic_ns(),
                   }
                   try:
-                      _write_marker(_MARKER_DIR / "entry.json", payload)
+                      GATE.write_exclusive(MARKER_DIR / "entry.json", payload)
                   except FileExistsError:
-                      duplicate = _MARKER_DIR / f"duplicate-{os.getpid()}-{time.monotonic_ns()}.json"
-                      _write_marker(duplicate, payload)
-                      raise RuntimeError(f"{_TEST_ID} entered more than once")
-              return _ORIGINAL_CALL_TEST_METHOD(self, method)
+                      GATE.write_exclusive(
+                          MARKER_DIR / f"duplicate-{os.getpid()}-{time.monotonic_ns()}.json", payload)
+                      raise RuntimeError(f"{TEST_ID} entered more than once")
+              return ORIGINAL_CALL(self, method)
 
-          def _add_skip(self, test, reason):
+          def add_skip(self, test, reason):
               method = getattr(test, getattr(test, "_testMethodName", ""), None)
               function = getattr(method, "__func__", method)
               code = getattr(function, "__code__", None)
               source = Path(code.co_filename).resolve(strict=True) if code is not None else None
               test_id = test.id()
+              _path, digest, _before = preflight()
               payload = {
-                  "event": "test_skip",
-                  "reason": reason,
+                  "event": "test_skip", "preflight_sha256": digest, "reason": reason,
                   "source": str(source) if source is not None else None,
                   "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest() if source is not None else None,
                   "test_id": test_id,
               }
-              digest = hashlib.sha256(test_id.encode("ascii")).hexdigest()
-              _write_marker(_MARKER_DIR / f"skip-{digest}.json", payload)
-              return _ORIGINAL_ADD_SKIP(self, test, reason)
+              GATE.write_exclusive(
+                  MARKER_DIR / f"skip-{hashlib.sha256(test_id.encode('ascii')).hexdigest()}.json", payload)
+              return ORIGINAL_SKIP(self, test, reason)
 
-          unittest.TestCase._callTestMethod = _call_test_method
-          unittest.TextTestResult.addSkip = _add_skip
+          unittest.TestCase._callTestMethod = call_test_method
+          unittest.TextTestResult.addSkip = add_skip
           PY
-          chmod 0444 build/deepseek-v41-trace-hook/sitecustomize.py
-          cmake -E sha256sum build/deepseek-v41-trace-hook/sitecustomize.py > build/deepseek-v41-trace-hook/sitecustomize.sha256
-          : > build/test-deepseek41-trace-ctest.log
-          PYTHONPATH="$PWD/build/deepseek-v41-trace-hook${PYTHONPATH:+:$PYTHONPATH}" \
-            DSV41_CI_MARKER_DIR="$PWD/build/deepseek-v41-trace-marker" \
-            DSV41_CI_TEST_SOURCE="$PWD/tests/test-deepseek41-trace.py" \
-            ctest --test-dir build \
-            -R '^test-deepseek41-trace$' \
-            --output-on-failure \
-            --verbose \
-            --no-tests=error \
-            --output-junit test-deepseek41-trace-ctest.xml \
-            2>&1 | tee build/test-deepseek41-trace-ctest.log
-          python3 - <<'PY'
+          cat > "$ci_root/evidence/postgate.py" <<'PY'
+          import ast
           import hashlib
+          import importlib.util
           import json
+          import os
+          import re
           import sys
+          import tempfile
           from pathlib import Path
           from xml.etree import ElementTree
 
-          report = ElementTree.parse("build/test-deepseek41-trace-ctest.xml").getroot()
-          expected = {
-              "tests": 1,
-              "failures": 0,
-              "disabled": 0,
-              "skipped": 0,
-          }
-          actual = {
-              name: int(report.attrib.get(name, -1))
-              for name in expected
-          }
-          if actual != expected:
-              raise SystemExit(f"test-deepseek41-trace JUnit result is invalid: {actual}")
-          log = Path("build/test-deepseek41-trace-ctest.log").read_text(errors="replace")
-          if "***Skipped" in log or "***Not Run" in log:
-              raise SystemExit("test-deepseek41-trace was skipped or not run")
+          def load_gate():
+              path = Path(os.environ["DSV41_CI_GATE"]).resolve(strict=True)
+              if hashlib.sha256(path.read_bytes()).hexdigest() != os.environ["DSV41_CI_GATE_SHA256"]:
+                  raise RuntimeError("fixture gate SHA-256 mismatch")
+              spec = importlib.util.spec_from_file_location("dsv41_ci_fixture_gate_post", path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot load fixture gate")
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              return module
 
-          metadata = json.loads(Path("build/test-deepseek41-trace-ctest-metadata.json").read_text())
-          test = metadata["tests"][0]
-          properties = {
-              item["name"]: item["value"]
-              for item in test.get("properties", [])
+          GATE = load_gate()
+          CONFIG = GATE.load_config()
+          TARGET_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
+          TARGET_ID = f"__main__.TraceFormatTests.{TARGET_METHOD}"
+          APPROVED_SKIP_ID = "__main__.TraceFormatTests.test_unproven_posix_containment_fails_closed_before_setsid_escape"
+          BINDING_NAMES = {
+              "DSV41_NATIVE_TRACE_BINARY", "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY", "DSV41_NATIVE_INJECT_LIBRARY",
           }
-          environment = properties["ENVIRONMENT"]
-          if isinstance(environment, str):
-              environment = environment.split(";")
-          expected_bindings = {}
-          for value in environment:
-              name, setting = value.split("=", 1)
-              if name.startswith("DSV41_NATIVE_"):
-                  expected_bindings[name] = str(Path(setting).resolve(strict=True))
-          if set(expected_bindings) != {
-              "DSV41_NATIVE_TRACE_BINARY",
-              "DSV41_NATIVE_CONTAINMENT_HELPER",
-              "DSV41_NATIVE_MANIFEST_BINARY",
-              "DSV41_NATIVE_INJECT_LIBRARY",
-          }:
-              raise SystemExit("test-deepseek41-trace native bindings are invalid")
-          test_name = "TraceFormatTests.test_native_watchdog_validation_crosses_private_pid_namespace"
-          marker_dir = Path("build/deepseek-v41-trace-marker")
-          entries = list(marker_dir.glob("entry.json"))
-          duplicates = list(marker_dir.glob("duplicate-*.json"))
-          skips = list(marker_dir.glob("skip-*.json"))
-          unexpected = [
-              path
-              for path in marker_dir.iterdir()
-              if path not in entries and path not in duplicates and path not in skips
-          ]
-          if len(entries) != 1 or duplicates or unexpected:
-              raise SystemExit(
-                  f"private PID namespace/pidfd entry count is invalid: "
-                  f"entries={len(entries)} duplicates={len(duplicates)} unexpected={len(unexpected)}")
-          marker = json.loads(entries[0].read_text())
-          expected_source = Path("tests/test-deepseek41-trace.py").resolve(strict=True)
-          expected_marker = {
-              "bindings": expected_bindings,
-              "event": "test_method_entry",
-              "function": test_name.split(".", 1)[1],
-              "source": str(expected_source),
-              "source_sha256": hashlib.sha256(expected_source.read_bytes()).hexdigest(),
-              "test_id": f"__main__.{test_name}",
-          }
-          for name, value in expected_marker.items():
-              if marker.get(name) != value:
-                  raise SystemExit(f"private PID namespace/pidfd marker {name} is invalid")
-          if not isinstance(marker.get("first_line"), int) or marker["first_line"] <= 0:
-              raise SystemExit("private PID namespace/pidfd marker first_line is invalid")
-          if not isinstance(marker.get("pid"), int) or marker["pid"] <= 1:
-              raise SystemExit("private PID namespace/pidfd marker pid is invalid")
-          if not isinstance(marker.get("ppid"), int) or marker["ppid"] <= 0:
-              raise SystemExit("private PID namespace/pidfd marker ppid is invalid")
-          if not isinstance(marker.get("timestamp_monotonic_ns"), int) or marker["timestamp_monotonic_ns"] <= 0:
-              raise SystemExit("private PID namespace/pidfd marker timestamp is invalid")
-          if sys.platform != "linux":
-              raise SystemExit(f"test-deepseek41-trace requires Linux, got {sys.platform}")
-          if len(skips) != 1:
-              raise SystemExit(f"test-deepseek41-trace approved skip count is invalid: {len(skips)}")
-          approved_skip = json.loads(skips[0].read_text())
-          expected_skip = {
-              "event": "test_skip",
-              "reason": "Linux uses subreaper and pidfd containment",
-              "source": str(expected_source),
-              "source_sha256": hashlib.sha256(expected_source.read_bytes()).hexdigest(),
-              "test_id": "__main__.TraceFormatTests.test_unproven_posix_containment_fails_closed_before_setsid_escape",
-          }
-          if approved_skip != expected_skip:
-              raise SystemExit("test-deepseek41-trace skip identity is invalid")
+
+          def junit_values(path):
+              root = ElementTree.parse(path).getroot()
+              return {name: int(root.attrib.get(name, -1)) for name in ("tests", "failures", "disabled", "skipped")}
+
+          def validate_outer(status, junit, log):
+              if status != 0:
+                  raise RuntimeError(f"CTest failed with status {status}")
+              if junit != {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0}:
+                  raise RuntimeError(f"CTest JUnit result is invalid: {junit}")
+              if "***Skipped" in log or "***Not Run" in log:
+                  raise RuntimeError("CTest was skipped or not run")
+              start_pattern = re.compile(r"^\s*Start\s+\d+:\s+test-deepseek41-trace\s*$")
+              starts = sum(start_pattern.fullmatch(line) is not None for line in log.splitlines())
+              if starts != 1:
+                  raise RuntimeError(f"registered CTest execution count is invalid: {starts}")
+
+          def expected_bindings(metadata):
+              tests = metadata.get("tests", [])
+              if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
+                  raise RuntimeError("CTest metadata selector is invalid")
+              properties = {item["name"]: item["value"] for item in tests[0].get("properties", [])}
+              environment = properties.get("ENVIRONMENT", [])
+              if isinstance(environment, str):
+                  environment = environment.split(";")
+              result = {}
+              for value in environment:
+                  name, setting = value.split("=", 1)
+                  if name.startswith("DSV41_NATIVE_"):
+                      result[name] = str(Path(setting).resolve(strict=True))
+              if set(result) != BINDING_NAMES:
+                  raise RuntimeError("native bindings are invalid")
+              return result
+
+          def target_first_line(source):
+              tree = ast.parse(source.read_text(encoding="ascii"))
+              for node in tree.body:
+                  if isinstance(node, ast.ClassDef) and node.name == "TraceFormatTests":
+                      for member in node.body:
+                          if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == TARGET_METHOD:
+                              return member.lineno
+              raise RuntimeError("target method is absent")
+
+          def validate_counts(entries, duplicates, target_skips, total_skips):
+              if entries != 1 or duplicates != 0 or target_skips != 0 or total_skips != 1:
+                  raise RuntimeError(
+                      f"marker counts are invalid: entry={entries} duplicate={duplicates} "
+                      f"target_skip={target_skips} skips={total_skips}")
+
+          def validate_marker(status, paths):
+              evidence = Path(paths["evidence"])
+              marker_dir = Path(paths["marker"])
+              log = (Path(paths["log"]) / "test-deepseek41-trace-ctest.log").read_text(errors="replace")
+              validate_outer(
+                  status,
+                  junit_values(evidence / "test-deepseek41-trace-ctest.xml"),
+                  log,
+              )
+              metadata = json.loads((evidence / "test-deepseek41-trace-ctest-metadata.json").read_text())
+              bindings = expected_bindings(metadata)
+              preflight_path = evidence / "runner-preflight.json"
+              preflight_sha = hashlib.sha256(preflight_path.read_bytes()).hexdigest()
+              preflight = json.loads(preflight_path.read_text(encoding="ascii"))
+              GATE.validate_state(
+                  preflight["state"], CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              if preflight["environment_names"] != CONFIG["environment_allowlist"]:
+                  raise RuntimeError("preflight environment allowlist differs")
+              if preflight["ctest"] != str(Path(CONFIG["ctest"]).resolve(strict=True)):
+                  raise RuntimeError("preflight CTest identity differs")
+              if preflight["interpreter"] != GATE.validate_interpreter(CONFIG):
+                  raise RuntimeError("preflight Python identity differs")
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = GATE.directory_receipts(
+                  paths["workspace"], paths["build"], direct, CONFIG["runner_uid"])
+              if preflight["secure_directories"] != receipts:
+                  raise RuntimeError("preflight secure directory evidence differs")
+              entries = list(marker_dir.glob("entry.json"))
+              duplicates = list(marker_dir.glob("duplicate-*.json"))
+              skips = list(marker_dir.glob("skip-*.json"))
+              unexpected = [
+                  path for path in marker_dir.iterdir()
+                  if path not in entries and path not in duplicates and path not in skips
+              ]
+              skip_payloads = [json.loads(path.read_text(encoding="ascii")) for path in skips]
+              target_skips = sum(payload.get("test_id") == TARGET_ID for payload in skip_payloads)
+              validate_counts(len(entries), len(duplicates), target_skips, len(skips))
+              if unexpected:
+                  raise RuntimeError(f"unexpected marker artifacts: {unexpected}")
+              marker = json.loads(entries[0].read_text(encoding="ascii"))
+              source = Path(CONFIG["source"]).resolve(strict=True)
+              expected = {
+                  "active_forbidden_loader_environment": [],
+                  "bindings": bindings,
+                  "event": "test_method_entry",
+                  "first_line": target_first_line(source),
+                  "function": TARGET_METHOD,
+                  "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
+                  "hook_sha256": os.environ["DSV41_CI_HOOK_SHA256"],
+                  "interpreter": preflight["interpreter"],
+                  "preflight_path": str(preflight_path),
+                  "preflight_sha256": preflight_sha,
+                  "secure_directories": receipts,
+                  "source": str(source),
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                  "state": preflight["state"],
+                  "test_id": TARGET_ID,
+              }
+              for name, value in expected.items():
+                  if marker.get(name) != value:
+                      raise RuntimeError(f"target entry marker {name} differs")
+              if not isinstance(marker.get("pid"), int) or marker["pid"] <= 1:
+                  raise RuntimeError("target entry marker PID is invalid")
+              if not isinstance(marker.get("ppid"), int) or marker["ppid"] <= 0:
+                  raise RuntimeError("target entry marker PPID is invalid")
+              if not isinstance(marker.get("timestamp_monotonic_ns"), int) or marker["timestamp_monotonic_ns"] <= 0:
+                  raise RuntimeError("target entry marker timestamp is invalid")
+              approved = {
+                  "event": "test_skip",
+                  "preflight_sha256": preflight_sha,
+                  "reason": "Linux uses subreaper and pidfd containment",
+                  "source": str(source),
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                  "test_id": APPROVED_SKIP_ID,
+              }
+              if skip_payloads != [approved]:
+                  raise RuntimeError("approved skip identity differs")
+              return {
+                  "ctest_execution_count": 1,
+                  "duplicate_entry_count": 0,
+                  "forbidden_loader_environment": [],
+                  "junit": {"disabled": 0, "failures": 0, "skipped": 0, "tests": 1},
+                  "preflight_sha256": preflight_sha,
+                  "result": "PASS",
+                  "target_entry_count": 1,
+                  "target_skip_count": 0,
+              }
+
+          def rejected(function):
+              try:
+                  function()
+              except Exception:
+                  return
+              raise RuntimeError("negative postgate fixture was accepted")
+
+          def self_test(output):
+              validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n")
+              rejected(lambda: validate_outer(
+                  1, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 1, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 1},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 1, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n***Not Run\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0}, ""))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 35: test-deepseek41-trace\nStart 35: test-deepseek41-trace\n"))
+              validate_counts(1, 0, 0, 1)
+              for counts in ((0, 0, 0, 1), (1, 1, 0, 1), (1, 0, 1, 1), (1, 0, 0, 2)):
+                  rejected(lambda counts=counts: validate_counts(*counts))
+              with tempfile.TemporaryDirectory() as temp:
+                  marker = Path(temp) / "marker.json"
+                  GATE.write_exclusive(marker, {"preflight_sha256": "a"})
+                  rejected(lambda: GATE.write_exclusive(marker, {"preflight_sha256": "b"}))
+                  rejected(lambda: GATE.verify_digest(marker, "0" * 64))
+              Path(output).write_text(json.dumps({
+                  "duplicate_and_race": "PASS", "junit_failure_skip_notrun": "PASS",
+                  "preflight_spoof": "PASS", "target_nonentry_skip_duplicate": "PASS",
+              }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+
+          def validate(status, output):
+              try:
+                  receipt = validate_marker(status, CONFIG["paths"])
+              except Exception as error:
+                  receipt = {"error": str(error), "result": "FAIL"}
+                  GATE.write_exclusive(Path(output), receipt)
+                  raise
+              GATE.write_exclusive(Path(output), receipt)
+
+          if __name__ == "__main__":
+              if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+                  self_test(sys.argv[2])
+              elif len(sys.argv) == 4 and sys.argv[1] == "--validate":
+                  validate(int(sys.argv[2]), sys.argv[3])
+              else:
+                  raise SystemExit("invalid postgate arguments")
           PY
+          chmod 0444 \
+            "$ci_root/evidence/fixture-config.json" \
+            "$ci_root/evidence/fixture_gate.py" \
+            "$ci_root/evidence/forbidden-loader-environment.json" \
+            "$ci_root/evidence/postgate.py" \
+            "$ci_root/hook/sitecustomize.py"
+          export DSV41_CI_CONFIG="$ci_root/evidence/fixture-config.json"
+          export DSV41_CI_CONFIG_SHA256="$(sha256sum "$DSV41_CI_CONFIG" | cut -d' ' -f1)"
+          export DSV41_CI_GATE="$ci_root/evidence/fixture_gate.py"
+          export DSV41_CI_GATE_SHA256="$(sha256sum "$DSV41_CI_GATE" | cut -d' ' -f1)"
+          export DSV41_CI_HOOK_SHA256="$(sha256sum "$ci_root/hook/sitecustomize.py" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$DSV41_CI_GATE_SHA256" "$DSV41_CI_GATE" > "$ci_root/evidence/fixture_gate.sha256"
+          printf '%s  %s\n' "$DSV41_CI_HOOK_SHA256" "$ci_root/hook/sitecustomize.py" > "$ci_root/evidence/sitecustomize.sha256"
+          "$selected_interpreter" "$ci_root/evidence/fixture_gate.py" \
+            --self-test "$ci_root/evidence/fixture-gate-self-test.json"
+          "$selected_interpreter" "$ci_root/evidence/postgate.py" \
+            --self-test "$ci_root/evidence/postgate-self-test.json"
+          : > "$ci_root/log/test-deepseek41-trace-ctest.log"
+          set +e
+          sudo -n -- /usr/bin/setpriv \
+            --reuid="$runner_uid" \
+            --regid="$runner_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --no-new-privs \
+            -- /usr/bin/env -i \
+            "PATH=${selected_interpreter%/*}:/usr/bin:/bin" \
+            "HOME=$HOME" \
+            "LANG=C" \
+            "LC_ALL=C" \
+            "TMPDIR=$ci_root/tmp" \
+            "PYTHONDONTWRITEBYTECODE=1" \
+            "PYTHONCOERCECLOCALE=0" \
+            "PYTHONPATH=$ci_root/hook" \
+            "PYTHONUTF8=1" \
+            "DSV41_CI_CONFIG=$DSV41_CI_CONFIG" \
+            "DSV41_CI_CONFIG_SHA256=$DSV41_CI_CONFIG_SHA256" \
+            "DSV41_CI_GATE=$DSV41_CI_GATE" \
+            "DSV41_CI_GATE_SHA256=$DSV41_CI_GATE_SHA256" \
+            "DSV41_CI_HOOK_SHA256=$DSV41_CI_HOOK_SHA256" \
+            "$selected_interpreter" "$ci_root/evidence/fixture_gate.py" --launch \
+            2>&1 | tee "$ci_root/log/test-deepseek41-trace-ctest.log"
+          ctest_status="${PIPESTATUS[0]}"
+          set -e
+          "$selected_interpreter" "$ci_root/evidence/postgate.py" \
+            --validate "$ctest_status" "$ci_root/evidence/postgate-result.json"
 
       - name: Upload DeepSeek V4.1 trace CTest evidence
         if: ${{ always() }}
@@ -387,13 +968,7 @@ jobs:
         with:
           name: deepseek-v41-trace-ctest-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            build/test-deepseek41-trace-ctest-metadata.json
-            build/test-deepseek41-trace-python.json
-            build/test-deepseek41-trace-ctest.log
-            build/test-deepseek41-trace-ctest.xml
-            build/deepseek-v41-trace-hook/sitecustomize.py
-            build/deepseek-v41-trace-hook/sitecustomize.sha256
-            build/deepseek-v41-trace-marker/
+            build/deepseek-v41-trace-ci/
           if-no-files-found: error
           retention-days: 7
 
