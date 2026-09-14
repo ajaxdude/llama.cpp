@@ -262,7 +262,7 @@ void test_external_mapping_advice_failure() {
         out.put('\0');
     }
 
-    llama_file input(file.path.string(), "rb");
+    llama_file input(file.path.string().c_str(), "rb");
     file_advice_calls = 0;
     bool continued_after_advice = false;
     require_throws([&] {
