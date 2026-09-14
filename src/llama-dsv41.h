@@ -221,6 +221,12 @@ ggml_tensor * llama_dsv41_build_shared_softmax(
         ggml_tensor * raw_scores,
         ggml_tensor * compressed_scores);
 
+ggml_tensor * llama_dsv41_build_candidate_blocks(
+        ggml_context * ctx,
+        ggml_tensor * block_scores,
+        ggml_tensor * final_blocks,
+        uint32_t n_candidate);
+
 ggml_tensor * llama_dsv41_build_output_collapse(
         ggml_context * ctx,
         ggml_tensor * residual,
@@ -228,6 +234,10 @@ ggml_tensor * llama_dsv41_build_output_collapse(
         uint32_t n_embd,
         uint32_t hc_mult,
         uint32_t n_tokens);
+
+ggml_tensor * llama_dsv41_build_output_norm_input(
+        ggml_context * ctx,
+        ggml_tensor * collapsed);
 
 ggml_tensor * llama_dsv41_build_output(
         ggml_context * ctx,

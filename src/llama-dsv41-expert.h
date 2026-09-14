@@ -27,12 +27,14 @@ struct llama_dsv41_expert_runtime_params {
 struct llama_dsv41_expert_runtime {
     using buft_selector = std::function<ggml_backend_buffer_type_t(const llama_expert_store_tensor & tensor)>;
     using upload_fn = std::function<void(ggml_tensor * tensor, size_t offset, const void * data, size_t size)>;
+    using publish_fn = std::function<void()>;
 
     llama_dsv41_expert_runtime(
             std::vector<llama_expert_store_tensor> tensors,
             const llama_dsv41_expert_runtime_params & params,
             buft_selector select_buft,
-            upload_fn upload = {});
+            upload_fn upload = {},
+            publish_fn before_publish = {});
     ~llama_dsv41_expert_runtime();
 
     llama_dsv41_expert_runtime(const llama_dsv41_expert_runtime &) = delete;

@@ -39,6 +39,9 @@ struct llama_model_deepseek41::engram_model {
 
 std::unique_ptr<llama_dsv41_engram_runtime> llama_model_deepseek41::create_memory_engram_runtime(
         size_t max_tokens) const {
+    if (hparams.no_alloc) {
+        return nullptr;
+    }
     return engram ?
         std::make_unique<llama_dsv41_engram_runtime>(engram->layout, engram->extents, max_tokens) :
         nullptr;
@@ -62,6 +65,7 @@ struct dsv41_graph_source_input {
     ggml_tensor * write_pos = nullptr;
     ggml_tensor * candidate_pad_mask = nullptr;
     ggml_tensor * candidate_block_bias = nullptr;
+    ggml_tensor * candidate_final_block = nullptr;
     ggml_tensor * row_blocks = nullptr;
 };
 
@@ -148,9 +152,11 @@ public:
                 const uint32_t padded = n_blocks*block_size;
                 source.candidate_pad_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, padded, n_tokens);
                 source.candidate_block_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_blocks, n_tokens);
+                source.candidate_final_block = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
                 source.row_blocks = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, source.read_width);
                 ggml_set_input(source.candidate_pad_mask);
                 ggml_set_input(source.candidate_block_bias);
+                ggml_set_input(source.candidate_final_block);
                 ggml_set_input(source.row_blocks);
             }
             sources.emplace(source.layer, source);
@@ -278,21 +284,24 @@ public:
                 set_tensor(source.candidate_pad_mask, pad);
 
                 std::vector<float> bias((size_t) n_blocks*n_tokens, 0.0f);
+                std::vector<int32_t> final_blocks(n_tokens);
                 for (uint32_t token = 0; token < n_tokens; ++token) {
                     const uint32_t visible =
                         source_plan.compression.n_visible[token];
                     const uint32_t visible_blocks =
                         (visible + block_size - 1)/block_size;
+                    if (visible_blocks == 0) {
+                        throw std::runtime_error(
+                                "DeepSeek V4.1 candidate source has no visible block");
+                    }
                     for (uint32_t block = visible_blocks; block < n_blocks; ++block) {
                         bias[(size_t) token*n_blocks + block] =
                             -std::numeric_limits<float>::infinity();
                     }
-                    if (visible_blocks > 0) {
-                        bias[(size_t) token*n_blocks + visible_blocks - 1] =
-                            std::numeric_limits<float>::infinity();
-                    }
+                    final_blocks[token] = (int32_t) visible_blocks - 1;
                 }
                 set_tensor(source.candidate_block_bias, bias);
+                set_tensor(source.candidate_final_block, final_blocks);
 
                 std::vector<int32_t> row_blocks(source.read_width);
                 for (uint32_t row = 0; row < source.read_width; ++row) {
@@ -682,7 +691,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                 throw std::runtime_error("DeepSeek V4.1 is missing required Engram tensor " + table_name);
             }
             llama_dsv41_engram_extent & extent = engram->extents[index];
-            extent.fname = ml.fnames.at(table->idx);
+            extent.fname = ml.no_alloc ? "(no_alloc)" : ml.fnames.at(table->idx);
             extent.offset = table->offs;
             extent.rows = engram->layout.rows[index];
             extent.columns = table->tensor->ne[0];
@@ -809,6 +818,22 @@ static ggml_tensor * dsv41_cast_for_store(
         source : ggml_cast(ctx, source, destination->type);
 }
 
+static ggml_tensor * dsv41_concat(
+        ggml_context * ctx,
+        ggml_tensor * a,
+        ggml_tensor * b,
+        int dim,
+        const char * label) {
+    if (a == nullptr || b == nullptr || a->type != b->type) {
+        throw std::runtime_error(format(
+                "DeepSeek V4.1 %s concat type mismatch: %s and %s",
+                label,
+                a == nullptr ? "null" : ggml_type_name(a->type),
+                b == nullptr ? "null" : ggml_type_name(b->type)));
+    }
+    return ggml_concat(ctx, a, b, dim);
+}
+
 static ggml_tensor * dsv41_completion_zero(
         ggml_context * ctx,
         ggml_tensor * dependency,
@@ -861,7 +886,15 @@ static ggml_tensor * dsv41_build_index_selection(
     ggml_tensor * index_cache = dsv41_flatten_memory(
             graph.ctx0, memory->index_keys(source_layer));
     index_cache = dsv41_append_zero_row(graph.ctx0, index_cache);
-    ggml_tensor * index_k = ggml_get_rows(graph.ctx0, index_cache, source->read_idxs);
+    ggml_tensor * index_k = ggml_get_rows(
+            graph.ctx0, index_cache,
+            ggml_reshape_1d(
+                graph.ctx0, source->read_idxs,
+                source->read_width*graph.n_tokens));
+    index_k = ggml_reshape_3d(
+            graph.ctx0, index_k,
+            graph.hparams.indexer_head_size,
+            source->read_width, graph.n_tokens);
     graph.cb(index_k, "dsv41_index_k", il);
 
     ggml_tensor * index_q = graph.build_lora_mm(layer.indexer_attn_q_b, qr);
@@ -923,10 +956,9 @@ static ggml_tensor * dsv41_build_index_selection(
         graph.cb(block_scores, "dsv41_candidate_scores", il);
 
         const uint32_t n_candidate = input.topology.candidate_width;
-        candidate_blocks = ggml_cont(
-                graph.ctx0,
-                ggml_argsort_top_k(
-                    graph.ctx0, block_scores, n_candidate));
+        candidate_blocks = llama_dsv41_build_candidate_blocks(
+                graph.ctx0, block_scores,
+                source->candidate_final_block, n_candidate);
         ggml_set_name(
                 candidate_blocks,
                 llama_dsv41_graph_trace_name(
@@ -1042,11 +1074,14 @@ static ggml_tensor * dsv41_build_attention(
     raw_write = dsv41_cast_for_store(
             graph.ctx0, raw_write, raw_store);
 
-    ggml_tensor * raw_read = ggml_concat(
-            graph.ctx0, raw_store, raw_write, 1);
+    ggml_tensor * raw_read = dsv41_concat(
+            graph.ctx0, raw_store, raw_write, 1, "raw state");
     raw_read = dsv41_append_zero_row(graph.ctx0, raw_read);
     raw_read = ggml_get_rows(
-            graph.ctx0, raw_read, input.raw_read_idxs);
+            graph.ctx0, raw_read,
+            ggml_reshape_1d(
+                graph.ctx0, input.raw_read_idxs,
+                graph.hparams.n_swa*graph.n_tokens));
     raw_read = ggml_reshape_4d(
             graph.ctx0, raw_read, n_embd_head, 1,
             graph.hparams.n_swa, graph.n_tokens);
@@ -1076,10 +1111,14 @@ static ggml_tensor * dsv41_build_attention(
                         graph.ctx0, carry_kv, source->carry_read_idxs);
                 ggml_tensor * carry_gate_first = ggml_get_rows(
                         graph.ctx0, carry_gate, source->carry_read_idxs);
-                ggml_tensor * source_kv = ggml_concat(
-                        graph.ctx0, carry_kv_first, compressed, 1);
-                ggml_tensor * source_gate = ggml_concat(
-                        graph.ctx0, carry_gate_first, gate, 1);
+                carry_kv_first = dsv41_cast_for_store(
+                        graph.ctx0, carry_kv_first, compressed);
+                carry_gate_first = dsv41_cast_for_store(
+                        graph.ctx0, carry_gate_first, gate);
+                ggml_tensor * source_kv = dsv41_concat(
+                        graph.ctx0, carry_kv_first, compressed, 1, "compressor carry KV");
+                ggml_tensor * source_gate = dsv41_concat(
+                        graph.ctx0, carry_gate_first, gate, 1, "compressor carry score");
                 source_kv = ggml_get_rows(
                         graph.ctx0, source_kv, source->state_read_idxs);
                 source_gate = ggml_get_rows(
@@ -1226,11 +1265,15 @@ static ggml_tensor * dsv41_build_attention(
         comp_store = dsv41_append_zero_row(
                 graph.ctx0, comp_store);
         ggml_tensor * compressed = ggml_get_rows(
-                graph.ctx0, comp_store, selected);
+                graph.ctx0, comp_store,
+                ggml_reshape_1d(
+                    graph.ctx0, selected,
+                    selected->ne[0]*graph.n_tokens));
         compressed = ggml_reshape_4d(
                 graph.ctx0, compressed, n_embd_head, 1,
                 selected->ne[0], graph.n_tokens);
-        k_all = ggml_concat(graph.ctx0, raw_read, compressed, 2);
+        k_all = dsv41_concat(
+                graph.ctx0, raw_read, compressed, 2, "raw and compressed attention");
 
         ggml_tensor * source_mask = ggml_reshape_3d(
                 graph.ctx0, source->mask, 1,
@@ -1244,8 +1287,10 @@ static ggml_tensor * dsv41_build_attention(
         compressed_mask = ggml_reshape_4d(
                 graph.ctx0, compressed_mask,
                 selected->ne[0], 1, 1, graph.n_tokens);
-        mask_all = ggml_concat(
-                graph.ctx0, input.raw_mask, compressed_mask, 0);
+        compressed_mask = dsv41_cast_for_store(
+                graph.ctx0, compressed_mask, input.raw_mask);
+        mask_all = dsv41_concat(
+                graph.ctx0, input.raw_mask, compressed_mask, 0, "attention mask");
         n_kv_max += selected->ne[0];
     }
 
@@ -1519,6 +1564,8 @@ llama_model_deepseek41::graph::graph(
             hparams.dsv4_hc_mult,
             inp_out_ids ? n_outputs : n_tokens);
     cb(cur, "dsv41_output_collapse", -1);
+    cur = llama_dsv41_build_output_norm_input(ctx0, cur);
+    cb(cur, "dsv41_output_collapse_f32", -1);
     cur = build_norm(
             cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

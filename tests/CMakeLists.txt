@@ -204,6 +204,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-deepseek41-runtime.cpp)
     llama_build_and_test(test-engram.cpp)
     llama_build(test-llama-archs.cpp)
+    llama_test(
+        test-llama-archs
+        NAME test-deepseek41-no-alloc
+        LABEL main
+        ARGS -a deepseek41 -s 1
+    )
 
     find_package(Python3 COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)

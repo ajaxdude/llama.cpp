@@ -60,6 +60,8 @@ llama_dsv41_memory_config make_model_config(
     config.type_k = type_k;
     config.type_index = type_k;
     config.no_alloc = model.hparams.no_alloc;
+    config.attach_no_alloc_buffers = config.no_alloc;
+    config.engram_enabled = model.hparams.dsv41_engram_layers.any();
     config.expert_enabled = model.requires_synchronous_graph();
     config.ratios.resize(config.n_layer);
     config.kv_sources.clear();
@@ -148,10 +150,11 @@ struct llama_memory_dsv41::impl {
     uint64_t backend_layout = 1469598103934665603ULL;
     uint64_t graph_workspace = 0;
     bool transaction_active = false;
-    std::map<llama_seq_id, std::map<llama_pos, llama_dsv41_engram_sequence_state>> engram_boundaries;
     std::map<llama_seq_id, rollback_state> rollback_states;
 
     explicit impl(llama_dsv41_memory_config config) : config(std::move(config)) {
+        this->config.engram_enabled =
+            this->config.engram_enabled || this->config.engram != nullptr;
         if (this->config.n_ctx == 0 || this->config.n_seq == 0 || this->config.n_ubatch == 0 ||
                 this->config.n_layer == 0 || this->config.raw_window == 0 ||
                 this->config.kv_width == 0 || this->config.index_width == 0 ||
@@ -286,13 +289,25 @@ struct llama_memory_dsv41::impl {
         for (auto & group : groups) {
             const size_t buffer_size =
                 ggml_backend_alloc_ctx_tensors_from_buft_size(group.ctx.get(), group.buft);
-            if (!this->config.no_alloc) {
-                ggml_backend_buffer_t buffer =
-                    ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(), group.buft);
-                if (buffer == nullptr) {
-                    throw std::runtime_error("failed to allocate DeepSeek V4.1 memory buffer");
+            ggml_backend_buffer_t buffer = nullptr;
+            if (this->config.no_alloc && this->config.attach_no_alloc_buffers) {
+                buffer = ggml_backend_buft_alloc_buffer(group.buft, 0);
+                for (ggml_tensor * tensor = ggml_get_first_tensor(group.ctx.get());
+                        tensor != nullptr;
+                        tensor = ggml_get_next_tensor(group.ctx.get(), tensor)) {
+                    tensor->buffer = buffer;
                 }
+            } else if (!this->config.no_alloc) {
+                buffer =
+                    ggml_backend_alloc_ctx_tensors_from_buft(group.ctx.get(), group.buft);
+            }
+            if (buffer == nullptr && (!this->config.no_alloc || this->config.attach_no_alloc_buffers)) {
+                throw std::runtime_error("failed to allocate DeepSeek V4.1 memory buffer");
+            }
+            if (buffer != nullptr) {
                 group.buffer.reset(buffer);
+            }
+            if (buffer != nullptr && !this->config.no_alloc) {
                 ggml_backend_buffer_clear(buffer, 0);
             }
             backend_layout = hash_string(backend_layout, ggml_backend_buft_name(group.buft));
@@ -515,7 +530,6 @@ void llama_memory_dsv41::clear(bool data) {
     for (auto & sequence : pimpl->sequences) {
         sequence = {};
     }
-    pimpl->engram_boundaries.clear();
     pimpl->rollback_states.clear();
     if (pimpl->config.engram) {
         for (uint32_t seq = 0; seq < pimpl->config.n_seq; ++seq) {
@@ -582,7 +596,6 @@ bool llama_memory_dsv41::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
         if (pimpl->config.engram) {
             pimpl->config.engram->seq_remove(seq_id);
         }
-        pimpl->engram_boundaries.erase(seq_id);
         pimpl->rollback_states.erase(seq_id);
     } else {
         for (const auto & snapshot : rollback->second.snapshots) {
@@ -595,8 +608,6 @@ bool llama_memory_dsv41::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
             llama_dsv41_engram_snapshot snapshot = pimpl->config.engram->checkpoint();
             snapshot.sequences[seq_id] = rollback->second.engram;
             pimpl->config.engram->restore(snapshot);
-            auto & boundaries = pimpl->engram_boundaries[seq_id];
-            boundaries.erase(boundaries.lower_bound(begin), boundaries.end());
         }
         pimpl->update_position_state(seq_id);
         pimpl->update_candidate_state(seq_id);
@@ -624,7 +635,6 @@ void llama_memory_dsv41::seq_cp(
     pimpl->rollback_states.erase(seq_id_dst);
     if (pimpl->config.engram) {
         pimpl->config.engram->seq_copy(seq_id_src, seq_id_dst);
-        pimpl->engram_boundaries[seq_id_dst] = pimpl->engram_boundaries[seq_id_src];
     }
     ++pimpl->generation;
 }
@@ -645,7 +655,6 @@ void llama_memory_dsv41::seq_keep(llama_seq_id seq_id) {
         if (pimpl->config.engram) {
             pimpl->config.engram->seq_remove(current);
         }
-        pimpl->engram_boundaries.erase(current);
         pimpl->rollback_states.erase(current);
     }
     ++pimpl->generation;
@@ -774,8 +783,7 @@ void llama_memory_dsv41::state_read(
     const auto sequence_is_empty = [&](llama_seq_id current) {
         if (pimpl->sequences[current].pos >= 0 ||
                 !pimpl->sequences[current].candidates.empty() ||
-                pimpl->rollback_states.count(current) != 0 ||
-                pimpl->engram_boundaries.count(current) != 0) {
+                pimpl->rollback_states.count(current) != 0) {
             return false;
         }
         return !pimpl->config.engram || pimpl->config.engram->sequence(current).pos < 0;
@@ -879,10 +887,8 @@ void llama_memory_dsv41::state_read(
             pimpl->update_candidate_state(sequence.target);
         }
         if (seq_id == -1) {
-            pimpl->engram_boundaries.clear();
             pimpl->rollback_states.clear();
         } else {
-            pimpl->engram_boundaries.erase(seq_id);
             pimpl->rollback_states.erase(seq_id);
         }
         ++pimpl->generation;
@@ -967,8 +973,12 @@ std::vector<int32_t> llama_memory_dsv41::sequence_candidate_ids(llama_seq_id seq
     return pimpl->sequences[seq_id].candidates;
 }
 
+size_t llama_memory_dsv41::retained_rollback_count() const {
+    return pimpl->rollback_states.size();
+}
+
 bool llama_memory_dsv41::engram_enabled() const {
-    return pimpl->config.engram != nullptr;
+    return pimpl->config.engram_enabled;
 }
 
 llama_memory_dsv41_context::llama_memory_dsv41_context(llama_memory_status status) :
@@ -1315,35 +1325,16 @@ void llama_memory_dsv41_context::commit() {
         mem->pimpl->position_state_values(transaction->next_sequences[seq_id]);
     committed_candidates =
         mem->pimpl->candidate_state_values(transaction->next_sequences[seq_id]);
-    std::map<llama_pos, llama_dsv41_engram_sequence_state> next_boundaries;
-    if (transaction->engram) {
-        const auto found = mem->pimpl->engram_boundaries.find(seq_id);
-        if (found != mem->pimpl->engram_boundaries.end()) {
-            next_boundaries = found->second;
-        }
-        next_boundaries[transaction->start_positions.front()] =
-            transaction->engram_before.at(seq_id);
-    }
 
     auto rollback_slot = mem->pimpl->rollback_states.end();
     bool inserted_rollback = false;
-    auto boundary_slot = mem->pimpl->engram_boundaries.end();
-    bool inserted_boundary = false;
     try {
         std::tie(rollback_slot, inserted_rollback) =
             mem->pimpl->rollback_states.emplace(seq_id, llama_memory_dsv41::impl::rollback_state {});
         if (transaction->engram) {
-            std::tie(boundary_slot, inserted_boundary) =
-                mem->pimpl->engram_boundaries.emplace(
-                        seq_id, std::map<llama_pos, llama_dsv41_engram_sequence_state> {});
-        }
-        if (transaction->engram) {
             mem->pimpl->config.engram->commit(*transaction->engram);
         }
     } catch (...) {
-        if (inserted_boundary) {
-            mem->pimpl->engram_boundaries.erase(boundary_slot);
-        }
         if (inserted_rollback) {
             mem->pimpl->rollback_states.erase(rollback_slot);
         }
@@ -1363,9 +1354,6 @@ void llama_memory_dsv41_context::commit() {
                 position_values.size()*sizeof(int32_t));
     }
     mem->pimpl->sequences.swap(transaction->next_sequences);
-    if (transaction->engram) {
-        boundary_slot->second.swap(next_boundaries);
-    }
     rollback.snapshots.swap(transaction->snapshots);
     rollback_slot->second = std::move(rollback);
     mem->pimpl->generation = transaction->plan.generation;
@@ -1492,7 +1480,7 @@ llama_dsv41_graph_topology llama_memory_dsv41_context::topology(
     result.n_seqs = transaction ? transaction->seq_ids.size() : ubatch.n_seqs;
     result.n_outputs = n_outputs;
     result.backend_layout = mem->pimpl->backend_layout;
-    result.engram_enabled = mem->pimpl->config.engram != nullptr;
+    result.engram_enabled = mem->pimpl->config.engram_enabled;
     result.expert_enabled = mem->pimpl->config.expert_enabled;
     result.transaction_generation = transaction ? transaction->plan.generation : mem->pimpl->generation;
     if (transaction) {
