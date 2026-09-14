@@ -33,6 +33,8 @@ set(LLAMA_CORE_SOURCES
     llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
+    llama-bounded-file.cpp
+    llama-engram.cpp
     llama-ple-disk.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
