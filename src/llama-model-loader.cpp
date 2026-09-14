@@ -1592,11 +1592,43 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
-    std::vector<ggml_backend_buffer_t> host_buffers;
-    std::vector<ggml_backend_event_t> events;
-    std::vector<void *> host_ptrs;
+    struct async_upload_resources {
+        std::vector<ggml_backend_buffer_t> host_buffers;
+        std::vector<ggml_backend_event_t> events;
+        std::vector<void *> host_ptrs;
+        ggml_backend_t backend = nullptr;
+
+        void reset() {
+            for (auto * event : events) {
+                if (backend != nullptr) {
+                    ggml_backend_event_synchronize(event);
+                }
+                ggml_backend_event_free(event);
+            }
+            events.clear();
+            for (auto * buffer : host_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            host_buffers.clear();
+            host_ptrs.clear();
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+
+        ~async_upload_resources() {
+            reset();
+        }
+    } async_upload;
+    async_upload.host_buffers.reserve(n_buffers);
+    async_upload.events.reserve(n_buffers);
+    async_upload.host_ptrs.reserve(n_buffers);
+
+    auto & host_buffers = async_upload.host_buffers;
+    auto & events = async_upload.events;
+    auto & host_ptrs = async_upload.host_ptrs;
+    auto & upload_backend = async_upload.backend;
     size_t buffer_idx = 0; // buffer to use for async loads
-    ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
+    upload_backend = [&](const char * func) -> ggml_backend_t {
         if (load_from_mmap || check_tensors) {
             return nullptr;
         }
@@ -1644,6 +1676,7 @@ bool llama_model_loader::load_all_data(
             if (!buf) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
+                async_upload.reset();
                 return nullptr;
             }
 
@@ -1654,6 +1687,7 @@ bool llama_model_loader::load_all_data(
             if (!event) {
                 LLAMA_LOG_DEBUG("%s: failed to create event for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
+                async_upload.reset();
                 return nullptr;
             }
 
@@ -1664,6 +1698,7 @@ bool llama_model_loader::load_all_data(
         if (!backend) {
             LLAMA_LOG_DEBUG("%s: failed to initialize backend for device %s for async uploads\n", func,
                 ggml_backend_dev_name(dev));
+            async_upload.reset();
             return nullptr;
         }
 
@@ -1826,15 +1861,7 @@ bool llama_model_loader::load_all_data(
         size_done += n_size;
     }
 
-    // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
-    }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
+    async_upload.reset();
 
     // check validation results
     bool validation_failed = false;
