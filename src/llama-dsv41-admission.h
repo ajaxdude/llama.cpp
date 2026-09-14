@@ -22,6 +22,7 @@ struct llama_dsv41_host_memory {
     uint64_t used = 0;
     uint64_t swap_entries = 0;
     uint64_t swap_bytes = 0;
+    bool swap_disabled_for_process = false;
 };
 
 struct llama_dsv41_admission_params {
@@ -81,7 +82,9 @@ struct llama_dsv41_admission_result {
     std::string describe() const;
 };
 
-llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_root);
+llama_dsv41_host_memory llama_dsv41_read_host_memory(
+        const std::string & procfs_root,
+        const std::string & cgroupfs_root = "/sys/fs/cgroup");
 
 uint64_t llama_dsv41_estimate_graph_workspace(uint32_t n_ctx, uint32_t n_ubatch);
 uint64_t llama_dsv41_engram_staging_bytes(uint32_t n_ubatch);

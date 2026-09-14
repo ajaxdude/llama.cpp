@@ -128,7 +128,7 @@ Set `HIP_LAUNCH_BLOCKING=1` on the canonical watchdog command that owns the comp
 
 ## Strix candidate execution gate
 
-`run_llama.py` refuses model execution when swap is enabled, the canonical watchdog lease, heartbeat, or JSONL audit is missing or stale, another unrelated matching model workload is active, or any model/prompt/trace path fails the storage gate.
+`run_llama.py` refuses model execution when swap is available to the process tree, the canonical watchdog lease, heartbeat, or JSONL audit is missing or stale, another unrelated matching model workload is active, or any model/prompt/trace path fails the storage gate. A cgroup v2 scope with both `memory.swap.max=0` and `memory.swap.current=0` satisfies the no-swap gate even when the host keeps swap configured for unrelated services.
 
 The approved watchdog revision is exactly `bbf182a48123f64c65d56ba48c0fc0c2b1d375f7`, with `scripts/strix_memory_watchdog.py` SHA-256 `98313ee0edabe42455f103f68bcbc6cba0e8e117afae8db658e17a18b87038f9`. That revision is an ancestor of this stack, so production validates the script in the exact candidate tree instead of copying it from another revision. Both Python validators and the native exporter reject every other revision or script hash.
 

@@ -179,6 +179,38 @@ class TestProcfsParsing(unittest.TestCase):
             ("/swapfile",),
         )
 
+    def test_allows_swap_disabled_by_process_cgroup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            proc = root / "proc"
+            cgroup = root / "cgroup"
+            scope = cgroup / "validation.scope"
+            (proc / "self").mkdir(parents=True)
+            scope.mkdir(parents=True)
+            (proc / "meminfo").write_text(
+                "MemTotal: 131072 kB\nMemAvailable: 32768 kB\n",
+                encoding="utf-8",
+            )
+            (proc / "swaps").write_text(
+                "Filename Type Size Used Priority\n"
+                "/swapfile file 1048572 0 -2\n",
+                encoding="utf-8",
+            )
+            (proc / "self/cgroup").write_text(
+                "0::/validation.scope\n",
+                encoding="utf-8",
+            )
+            (scope / "memory.swap.max").write_text("0\n", encoding="ascii")
+            (scope / "memory.swap.current").write_text(
+                "0\n", encoding="ascii"
+            )
+
+            result = watchdog.ProcfsReader(
+                proc, cgroup
+            ).read_snapshot()
+
+        self.assertEqual(result.active_swaps, ())
+
     def test_rejects_malformed_or_missing_procfs_data(self) -> None:
         with self.assertRaisesRegex(
             watchdog.ProcfsError, "malformed MemAvailable"

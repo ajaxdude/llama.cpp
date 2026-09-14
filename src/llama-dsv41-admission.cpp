@@ -26,6 +26,50 @@ uint64_t checked_mul(uint64_t a, uint64_t b, const char * category) {
     return a*b;
 }
 
+bool read_exact_zero(const std::string & path) {
+    std::ifstream file(path);
+    std::string value;
+    std::string extra;
+    return file && (file >> value) && value == "0" && !(file >> extra);
+}
+
+bool process_swap_is_disabled(
+        const std::string & procfs_root,
+        const std::string & cgroupfs_root) {
+    std::ifstream cgroup(procfs_root + "/self/cgroup");
+    if (!cgroup) {
+        return false;
+    }
+
+    std::string unified_path;
+    std::string line;
+    while (std::getline(cgroup, line)) {
+        if (line.rfind("0::", 0) != 0) {
+            continue;
+        }
+        if (!unified_path.empty()) {
+            return false;
+        }
+        unified_path = line.substr(3);
+    }
+    if (!cgroup.eof() || unified_path.empty() || unified_path.front() != '/') {
+        return false;
+    }
+
+    std::istringstream components(unified_path);
+    std::string component;
+    while (std::getline(components, component, '/')) {
+        if (component == "..") {
+            return false;
+        }
+    }
+
+    const std::string root = cgroupfs_root.empty() ? "/sys/fs/cgroup" : cgroupfs_root;
+    const std::string path = root + unified_path;
+    return read_exact_zero(path + "/memory.swap.max") &&
+           read_exact_zero(path + "/memory.swap.current");
+}
+
 uint64_t checked_align_up(uint64_t value, uint64_t alignment, const char * category) {
     if (alignment == 0) {
         throw std::runtime_error(std::string("DeepSeek V4.1 memory admission invalid alignment: ") + category);
@@ -86,7 +130,9 @@ void validate_context(uint32_t n_ctx) {
 
 }
 
-llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_root) {
+llama_dsv41_host_memory llama_dsv41_read_host_memory(
+        const std::string & procfs_root,
+        const std::string & cgroupfs_root) {
 #ifndef __linux__
     if (procfs_root == "/proc") {
         throw std::runtime_error("DeepSeek V4.1 memory admission requires Linux procfs");
@@ -172,6 +218,8 @@ llama_dsv41_host_memory llama_dsv41_read_host_memory(const std::string & procfs_
     if (!swaps.eof()) {
         throw std::runtime_error("DeepSeek V4.1 procfs swaps read failed");
     }
+    result.swap_disabled_for_process =
+            result.swap_entries == 0 || process_swap_is_disabled(root, cgroupfs_root);
     return result;
 }
 
@@ -263,9 +311,9 @@ llama_dsv41_admission_result llama_dsv41_admit(
     if (host.total == 0 || host.available > host.total || host.used != host.total - host.available) {
         reject("host", result, "host memory snapshot is invalid");
     }
-    if (host.swap_entries != 0 || host.swap_bytes != 0) {
+    if ((host.swap_entries != 0 || host.swap_bytes != 0) && !host.swap_disabled_for_process) {
         reject("swap", result, format(
-                "%llu configured swap entries (%llu bytes)",
+                "%llu configured swap entries (%llu bytes) without a verified process cgroup swap limit",
                 (unsigned long long) host.swap_entries,
                 (unsigned long long) host.swap_bytes));
     }

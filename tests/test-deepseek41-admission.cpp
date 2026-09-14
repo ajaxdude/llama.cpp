@@ -33,6 +33,7 @@ struct temp_procfs {
     }
 
     void write(const char * name, const std::string & value) {
+        std::filesystem::create_directories((path / name).parent_path());
         std::ofstream file(path / name);
         REQUIRE((bool) file);
         file << value;
@@ -108,6 +109,7 @@ void test_procfs() {
     REQUIRE(memory.available == 120000000ULL*1024);
     REQUIRE(memory.used == 11072000ULL*1024);
     REQUIRE(memory.swap_entries == 0);
+    REQUIRE(memory.swap_disabled_for_process);
 
     procfs.write("swaps",
             "Filename Type Size Used Priority\n"
@@ -117,6 +119,41 @@ void test_procfs() {
     REQUIRE(swapped.swap_bytes == 33554428ULL*1024);
     REQUIRE(thrown([&]() {
         llama_dsv41_admit(swapped, 0, published_tensors(), base_params());
+    }).find("category=swap") != std::string::npos);
+
+    procfs.write("self/cgroup", "0::/validation.scope\n");
+    procfs.write("cgroup/validation.scope/memory.swap.max", "0\n");
+    procfs.write("cgroup/validation.scope/memory.swap.current", "0\n");
+    const auto bounded = llama_dsv41_read_host_memory(
+            procfs.path.string(), (procfs.path / "cgroup").string());
+    REQUIRE(bounded.swap_entries == 1);
+    REQUIRE(bounded.swap_bytes == 33554428ULL*1024);
+    REQUIRE(bounded.swap_disabled_for_process);
+    auto bounded_host = host_with_used(0);
+    bounded_host.swap_entries = bounded.swap_entries;
+    bounded_host.swap_bytes = bounded.swap_bytes;
+    bounded_host.swap_disabled_for_process = true;
+    auto bounded_params = base_params();
+    bounded_params.n_batch = 1;
+    bounded_params.n_ubatch = 1;
+    bounded_params.n_outputs_max = 1;
+    bounded_params.n_outputs_max_per_seq = 1;
+    bounded_params.n_expert_used = 1;
+    llama_dsv41_admission_result bounded_result;
+    try {
+        bounded_result = llama_dsv41_admit(
+                bounded_host, 0, published_tensors(), bounded_params);
+    } catch (const std::exception & e) {
+        throw std::runtime_error(std::string("bounded cgroup admission failed: ") + e.what());
+    }
+    REQUIRE(bounded_result.category == "accepted");
+
+    procfs.write("cgroup/validation.scope/memory.swap.current", "4096\n");
+    const auto swapping = llama_dsv41_read_host_memory(
+            procfs.path.string(), (procfs.path / "cgroup").string());
+    REQUIRE(!swapping.swap_disabled_for_process);
+    REQUIRE(thrown([&]() {
+        llama_dsv41_admit(swapping, 0, published_tensors(), base_params());
     }).find("category=swap") != std::string::npos);
 }
 

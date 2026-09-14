@@ -366,6 +366,31 @@ def read_proc_lines(path: Path) -> list[str]:
         raise PreflightError(f"cannot read {path}: {error}") from error
 
 
+def process_swap_is_disabled(
+        proc_root: Path = Path("/proc"),
+        cgroup_root: Path = Path("/sys/fs/cgroup")) -> bool:
+    try:
+        lines = (proc_root / "self/cgroup").read_text(
+            encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    paths = [line[3:] for line in lines if line.startswith("0::")]
+    if len(paths) != 1:
+        return False
+    path = Path(paths[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return False
+    cgroup = cgroup_root.joinpath(*path.parts[1:])
+    try:
+        swap_max = (cgroup / "memory.swap.max").read_text(
+            encoding="ascii").strip()
+        swap_current = (cgroup / "memory.swap.current").read_text(
+            encoding="ascii").strip()
+    except OSError:
+        return False
+    return swap_max == "0" and swap_current == "0"
+
+
 def swap_audit() -> dict[str, object]:
     lines = read_proc_lines(Path("/proc/swaps"))
     entries = []
@@ -379,6 +404,8 @@ def swap_audit() -> dict[str, object]:
                 "used_kib": int(fields[3]),
                 "priority": int(fields[4]),
             })
+    if entries and process_swap_is_disabled():
+        entries = []
     return {"enabled": bool(entries), "entries": entries}
 
 

@@ -13,7 +13,7 @@ HIP_LAUNCH_BLOCKING=1 \
     --expert-cache-slots 192 --expert-cache-mib 72900
 ```
 
-DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject any configured swap entry, measure the full-graph state through its no-allocation memory implementation, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The context checks the measured scheduler workspace against the admitted conservative workspace envelope before inference. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
+DeepSeek V4.1 also runs an in-process admission check before expert-cache or model backend allocation. The default model parameters read `/proc/meminfo` and `/proc/swaps`, reject configured swap unless cgroup v2 proves `memory.swap.max=0` and `memory.swap.current=0` for the complete process tree, measure the full-graph state through its no-allocation memory implementation, account unified host/GPU memory once, and auto-fit complete expert slots under 116 GiB total projected host use. The context checks the measured scheduler workspace against the admitted conservative workspace envelope before inference. Admission fails closed unless every selected accelerator reports `GGML_BACKEND_DEVICE_TYPE_IGPU`; CPU-only, discrete GPU, RPC, and tensor-parallel meta-device configurations are not treated as one procfs-accounted pool. The external watchdog is still required for guarded validation because it monitors host-wide use after startup and controls the complete process group.
 
 The final Strix validation preflight must confirm that `ROCm0` reports `gfx1151` before running this command. It must also verify the inherited device and launch-blocking environment, the exact ubatch and cache arguments, and the active watchdog lease. The 72900 MiB budget is exactly 192 published expert slots; admission rejects a disagreement between the byte and slot caps.
 
@@ -25,7 +25,7 @@ Admission accepts context checkpoints 32768, 65536, 98304, and 131072. It never 
 
 The wrapper performs these checks and actions:
 
-- It refuses to launch if `/proc/swaps` contains any active entry.
+- It refuses to launch if `/proc/swaps` contains an entry unless cgroup v2 continuously proves `memory.swap.max=0` and `memory.swap.current=0` for the process tree.
 - It calculates used memory as `MemTotal - MemAvailable`. Linux reports these fields in KiB, so the wrapper multiplies each value by 1024 and keeps all accounting as integer bytes.
 - It sends `SIGTERM` to the process group at 116 GiB used.
 - It sends `SIGKILL` at 118 GiB used or 30 seconds after `SIGTERM`.

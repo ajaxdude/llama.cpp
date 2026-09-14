@@ -245,8 +245,13 @@ class WatchdogConfig:
 
 
 class ProcfsReader:
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
+    ):
         self.root = root
+        self.cgroup_root = cgroup_root
 
     def _read_text(self, name: str) -> str:
         path = self.root / name
@@ -258,10 +263,39 @@ class ProcfsReader:
 
     def read_snapshot(self) -> HostSnapshot:
         active_swaps = self._parse_swaps(self._read_text("swaps"))
+        if active_swaps and self._process_swap_is_disabled():
+            active_swaps = ()
         total_bytes, available_bytes = self._parse_meminfo(
             self._read_text("meminfo")
         )
         return HostSnapshot(total_bytes, available_bytes, active_swaps)
+
+    def _process_swap_is_disabled(self) -> bool:
+        try:
+            lines = (self.root / "self/cgroup").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        except OSError:
+            return False
+        paths = [
+            line[3:] for line in lines if line.startswith("0::")
+        ]
+        if len(paths) != 1:
+            return False
+        path = Path(paths[0])
+        if not path.is_absolute() or ".." in path.parts:
+            return False
+        cgroup = self.cgroup_root.joinpath(*path.parts[1:])
+        try:
+            swap_max = (cgroup / "memory.swap.max").read_text(
+                encoding="ascii"
+            ).strip()
+            swap_current = (cgroup / "memory.swap.current").read_text(
+                encoding="ascii"
+            ).strip()
+        except OSError:
+            return False
+        return swap_max == "0" and swap_current == "0"
 
     @staticmethod
     def _parse_meminfo(content: str) -> tuple[int, int]:
