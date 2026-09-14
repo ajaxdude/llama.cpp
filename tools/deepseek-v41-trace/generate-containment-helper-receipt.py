@@ -31,7 +31,7 @@ def main() -> int:
         "revision": args.revision,
         "filename": helper.name,
         "sha256": sha256_file(helper),
-        "launcher_policy": "zero-supplementary-groups-v1",
+        "launcher_policy": "namespace-cleared-supplementary-groups-v1",
         "supplementary_groups": [],
     }
     content = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")

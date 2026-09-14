@@ -414,6 +414,10 @@ def _path_is_writable_by_execution_identity(path: Path) -> bool:
         raise TraceError(f"cannot verify effective write access for {path}: {error}") from error
 
 
+def _path_mode_for_trust(_path: Path, mode: int) -> int:
+    return stat.S_IMODE(mode)
+
+
 def _require_distinct_trusted_owner(expected_owner_uid: int) -> None:
     execution_uid = _execution_uid()
     if execution_uid == 0 or expected_owner_uid == execution_uid:
@@ -498,7 +502,8 @@ def _immutable_path_chain(
             raise TraceError(f"{label} path is not trusted-owned")
         if install_seen and current_stat.st_uid != expected_owner_uid:
             raise TraceError(f"{label} install tree owner differs from external approval")
-        if stat.S_IMODE(current_stat.st_mode) & 0o022 or (
+        path_mode = _path_mode_for_trust(current, current_stat.st_mode)
+        if path_mode & 0o022 or (
                 _path_is_writable_by_execution_identity(current)) or _has_access_control_entries(current):
             raise TraceError(f"{label} path is mutable by the execution identity or an untrusted group")
         result.append((
@@ -506,7 +511,7 @@ def _immutable_path_chain(
             current_stat.st_dev,
             current_stat.st_ino,
             current_stat.st_uid,
-            stat.S_IMODE(current_stat.st_mode),
+            path_mode,
         ))
     if not install_seen:
         raise TraceError(f"{label} path does not traverse its approved install root")
@@ -1238,17 +1243,6 @@ def _all_catchable_signals() -> set[int]:
     }
 
 
-def _require_zero_supplementary_groups() -> None:
-    try:
-        groups = os.getgroups()
-    except OSError as error:
-        raise TraceError(
-            f"cannot query Linux containment launcher supplementary groups: {error}") from error
-    if groups:
-        raise TraceError(
-            f"Linux containment launcher requires zero supplementary groups; found {len(groups)}")
-
-
 def _start_linux_native_helper_process(
         command: list[str],
         launch: dict[str, Any],
@@ -1465,7 +1459,6 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
     pidfd = None
     exec_released = False
     try:
-        _require_zero_supplementary_groups()
         _linux_require_pidfd_support()
         if len(_linux_task_ids()) != 1:
             raise TraceError("Linux native containment requires a single-threaded Python supervisor")
@@ -2513,7 +2506,7 @@ def _validate_containment_helper_policy(
             record["revision"] != revision) or (
             record["filename"] != "llama-deepseek-v41-containment-helper") or re.fullmatch(
                 r"[0-9a-f]{64}", record.get("sha256", "")) is None or (
-            record["launcher_policy"] != "zero-supplementary-groups-v1") or (
+            record["launcher_policy"] != "namespace-cleared-supplementary-groups-v1") or (
             record["supplementary_groups"] != []):
         raise TraceError(f"{label} containment helper receipt is invalid")
     result = dict(record)
