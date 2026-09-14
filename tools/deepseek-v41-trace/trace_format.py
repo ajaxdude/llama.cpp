@@ -2668,6 +2668,7 @@ def ds4_exporter_approval(
             "install_owner_uid",
             "executable_path",
             "executable_sha256",
+            "containment_helper",
             "runtime_profile",
             "runtime_receipt",
         },
@@ -2686,6 +2687,12 @@ def ds4_exporter_approval(
     executable = PurePosixPath(executable_path)
     if executable.parent != PurePosixPath(install_root) / "bin":
         raise TraceError("ds4 exporter approval executable path is outside its install policy")
+    _validate_containment_helper_policy(
+        policy["containment_helper"],
+        install_root=install_root,
+        revision=policy["revision"],
+        label="ds4 exporter approval",
+    )
     profile = policy["runtime_profile"]
     if not isinstance(profile, dict):
         raise TraceError("ds4 exporter approval runtime profile is invalid")
