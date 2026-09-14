@@ -908,6 +908,49 @@ def validate_active_lease(
             raise LeaseValidationError(
                 "cannot open watchdog pidfd"
             ) from exc
+    try:
+        return _validate_active_lease_after_pidfd(
+            lease,
+            lease_path=lease_path,
+            watchdog_pid=watchdog_pid,
+            expected_script_path=expected_script_path,
+            expected_executable_path=expected_executable_path,
+            expected_soft_bytes=expected_soft_bytes,
+            expected_emergency_bytes=expected_emergency_bytes,
+            expected_procfs_root=expected_procfs_root,
+            expected_command=expected_command,
+            expected_heartbeat_path=expected_heartbeat_path,
+            expected_audit_path=expected_audit_path,
+            expected_max_heartbeat_age_seconds=(
+                expected_max_heartbeat_age_seconds
+            ),
+            current_process_id=current_process_id,
+            process_procfs_root=process_procfs_root,
+            monotonic_ns=monotonic_ns,
+        )
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+def _validate_active_lease_after_pidfd(
+    lease: dict[str, object],
+    *,
+    lease_path: Path,
+    watchdog_pid: int,
+    expected_script_path: Path,
+    expected_executable_path: Path | None,
+    expected_soft_bytes: int,
+    expected_emergency_bytes: int,
+    expected_procfs_root: Path,
+    expected_command: Sequence[str] | None,
+    expected_heartbeat_path: Path | None,
+    expected_audit_path: Path | None,
+    expected_max_heartbeat_age_seconds: float | None,
+    current_process_id: int | None,
+    process_procfs_root: Path,
+    monotonic_ns: Callable[[], int] | None,
+) -> dict[str, object]:
     watchdog_start_ticks = _require_int(
         lease.get("watchdog_start_time_ticks"),
         "watchdog_start_time_ticks",
@@ -1234,8 +1277,6 @@ def validate_active_lease(
         raise LeaseValidationError(
             "watchdog process changed during validation"
         )
-    if pidfd is not None:
-        os.close(pidfd)
     return lease
 
 
@@ -1731,6 +1772,25 @@ def _graceful_cleanup(
     escalated = False
     artifact_error: ArtifactError | None = None
     guardian_control_error: ProcessGroupError | None = None
+
+    def refresh_heartbeat() -> None:
+        nonlocal artifact_error
+        try:
+            audit.heartbeat(
+                _state_fields(
+                    snapshot,
+                    peak_used_bytes,
+                    child,
+                    child.poll(),
+                    process_group_status,
+                    reason,
+                )
+            )
+        except ArtifactError as exc:
+            if artifact_error is None:
+                artifact_error = exc
+            audit.disable_component(exc.component)
+
     try:
         if graceful_signal is not None:
             process_group_status = signal_group(
@@ -1777,6 +1837,7 @@ def _graceful_cleanup(
                 except ProcessGroupError as exc:
                     guardian_control_error = exc
                     break
+            refresh_heartbeat()
             sleeper(min(0.05, deadline - monotonic()))
         child.poll()
         if (
