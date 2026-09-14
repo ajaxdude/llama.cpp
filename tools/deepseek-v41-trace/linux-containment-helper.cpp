@@ -950,6 +950,14 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "target-mapping-close";
         errno = 0;
         close_checked(mapping_fd, "target mapping descriptor");
+        stage = "target-groups-verify";
+        errno = 0;
+        const int target_group_count = getgroups(0, nullptr);
+        if (target_group_count != 0) {
+            fail_stage(
+                diagnostic_fd, stage,
+                target_group_count < 0 ? errno : 0);
+        }
         stage = "target-privilege-drop";
         errno = 0;
         const int listener = drop_target_privileges();
@@ -1019,6 +1027,11 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "namespace-protocol-close";
         errno = 0;
         close_checked(protocol_fd, "namespace protocol descriptor");
+        stage = "namespace-groups-clear";
+        errno = 0;
+        if (setgroups(0, nullptr) != 0) {
+            fail_stage(diagnostic_fd, stage, errno);
+        }
         stage = "namespace-bound";
         errno = 0;
         write_all(ready_fd, "B", 1);
@@ -1034,6 +1047,14 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "namespace-mapping-close";
         errno = 0;
         close_checked(mapping_fd, "namespace mapping descriptor");
+        stage = "namespace-groups-verify";
+        errno = 0;
+        const int namespace_group_count = getgroups(0, nullptr);
+        if (namespace_group_count != 0) {
+            fail_stage(
+                diagnostic_fd, stage,
+                namespace_group_count < 0 ? errno : 0);
+        }
         stage = "namespace-setresgid";
         errno = 0;
         if (setresgid(0, 0, 0) != 0) {
@@ -1080,11 +1101,6 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "namespace-release-close";
         errno = 0;
         close_checked(release_fd, "namespace release descriptor");
-        stage = "namespace-setgroups";
-        errno = 0;
-        if (setgroups(0, nullptr) != 0) {
-            fail_stage(diagnostic_fd, stage, errno);
-        }
         int target_mapping_pipe[2] {-1, -1};
         int target_ready_pipe[2] {-1, -1};
         int target_security[2] {-1, -1};

@@ -2547,6 +2547,53 @@ class TraceFormatTests(unittest.TestCase):
             helper_source.index('!= \"EXEC\"'),
         )
 
+    def test_linux_native_helper_clears_groups_before_mapping_denial(self) -> None:
+        helper_source = (
+            Path(__file__).parents[1] /
+            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+        ).read_text(encoding="ascii")
+        namespace_start = helper_source.index("[[noreturn]] void run_namespace_init")
+        namespace_source = helper_source[
+            namespace_start:
+            helper_source.index("int run_linux_helper")
+        ]
+        target_source = helper_source[
+            helper_source.index("[[noreturn]] void run_target_bootstrap"):
+            helper_source.index("[[noreturn]] void run_namespace_init")
+        ]
+        self.assertEqual(namespace_source.count("setgroups(0, nullptr)"), 1)
+        self.assertLess(
+            namespace_source.index('stage = "namespace-groups-clear"'),
+            namespace_source.index('write_all(ready_fd, "B", 1)'),
+        )
+        self.assertLess(
+            namespace_start + namespace_source.index('write_all(ready_fd, "B", 1)'),
+            helper_source.index('write_mapping_file(process_directory, "setgroups", "deny\\n")'),
+        )
+        self.assertLess(
+            namespace_source.index('stage = "namespace-mapping-close"'),
+            namespace_source.index('stage = "namespace-groups-verify"'),
+        )
+        self.assertLess(
+            namespace_source.index('stage = "namespace-groups-verify"'),
+            namespace_source.index('stage = "namespace-setresgid"'),
+        )
+        self.assertNotIn(
+            "setgroups(0, nullptr)",
+            namespace_source[namespace_source.index('stage = "namespace-release-read"'):],
+        )
+        self.assertLess(
+            target_source.index('stage = "target-mapping-close"'),
+            target_source.index('stage = "target-groups-verify"'),
+        )
+        self.assertLess(
+            target_source.index('stage = "target-groups-verify"'),
+            target_source.index('stage = "target-privilege-drop"'),
+        )
+        self.assertNotIn("setgroups(0, nullptr)", target_source)
+        self.assertIn("namespace_group_count < 0 ? errno : 0", namespace_source)
+        self.assertIn("target_group_count < 0 ? errno : 0", target_source)
+
     def test_posix_spawn_does_not_run_registered_atfork_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / "atfork-ran"
@@ -3407,7 +3454,9 @@ class TraceFormatTests(unittest.TestCase):
         required_stages = {
             "namespace-parent-death",
             "namespace-parent-identity",
+            "namespace-groups-clear",
             "namespace-mapping-read",
+            "namespace-groups-verify",
             "namespace-setresgid",
             "namespace-setresuid",
             "namespace-mount-private",
@@ -3419,6 +3468,7 @@ class TraceFormatTests(unittest.TestCase):
             "target-parent-death",
             "target-session",
             "target-mapping-read",
+            "target-groups-verify",
             "target-privilege-drop",
             "target-isolation-probes",
             "target-isolation-ready",
