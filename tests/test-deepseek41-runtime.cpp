@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -230,6 +231,22 @@ static void test_candidates() {
     full_scores[0] = 100.0f;
     const auto full = llama_dsv41_select_candidate_blocks(full_scores, 16392, 8, 2048);
     check(std::find(full.begin(), full.end(), 2048) != full.end(), "final full candidate block was not forced");
+
+    const auto inf_tie = llama_dsv41_select_candidate_blocks(
+            std::vector<float>(24, std::numeric_limits<float>::infinity()), 24, 8, 2);
+    check(std::find(inf_tie.begin(), inf_tie.end(), 2) != inf_tie.end(), "final candidate block lost an infinity tie");
+
+    const auto inf_boundary = llama_dsv41_select_candidate_blocks(
+            std::vector<float>(16392, std::numeric_limits<float>::infinity()), 16392, 8, 2048);
+    check(std::find(inf_boundary.begin(), inf_boundary.end(), 2048) != inf_boundary.end(),
+            "final full candidate block lost an infinity tie");
+    std::vector<int32_t> unique_blocks = inf_boundary;
+    std::sort(unique_blocks.begin(), unique_blocks.end());
+    check(std::adjacent_find(unique_blocks.begin(), unique_blocks.end()) == unique_blocks.end(),
+            "candidate selection contains duplicate blocks");
+    check(std::all_of(unique_blocks.begin(), unique_blocks.end(), [](int32_t block) {
+        return block >= 0 && block <= 2048;
+    }), "candidate selection contains an out-of-range block");
 }
 
 static void test_output_collapse() {
@@ -291,6 +308,24 @@ static void test_graph_construction() {
     ggml_tensor * output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 64);
     ggml_tensor * logits = llama_dsv41_build_output(ctx, residual, pre, output_norm, output, 1.0e-20f, 4);
     check(logits->ne[0] == 64 && logits->ne[1] == 2, "final output graph shape mismatch");
+
+    ggml_tensor * exec_residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 4, 1);
+    ggml_tensor * exec_pre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+    ggml_tensor * exec_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
+    ggml_tensor * exec_output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+    std::fill_n(static_cast<float *>(exec_residual->data), ggml_nelements(exec_residual), 1.0f);
+    std::fill_n(static_cast<float *>(exec_pre->data), ggml_nelements(exec_pre), 0.25f);
+    std::fill_n(static_cast<float *>(exec_norm->data), ggml_nelements(exec_norm), 1.0f);
+    std::fill_n(static_cast<float *>(exec_output->data), ggml_nelements(exec_output), 1.0f);
+    ggml_tensor * exec_logits = llama_dsv41_build_output(
+            ctx, exec_residual, exec_pre, exec_norm, exec_output, 1.0e-20f, 4);
+    ggml_cgraph * exec_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(exec_gf, exec_logits);
+    check(ggml_graph_compute_with_ctx(ctx, exec_gf, 1) == GGML_STATUS_SUCCESS, "final output graph execution failed");
+    const float * exec_values = static_cast<const float *>(exec_logits->data);
+    check(std::isfinite(exec_values[0]) && std::isfinite(exec_values[1]), "final output graph produced non-finite logits");
+    check(std::abs(exec_values[0] - 32.0f) < 1.0e-4f && std::abs(exec_values[1] - 32.0f) < 1.0e-4f,
+            "final output graph numeric mismatch");
 
     ggml_free(ctx);
 }
