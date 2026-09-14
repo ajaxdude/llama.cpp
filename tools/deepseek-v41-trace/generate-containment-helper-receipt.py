@@ -27,10 +27,12 @@ def main() -> int:
     helper = args.helper.resolve(strict=True)
     receipt = {
         "format": "dsv41-containment-helper",
-        "version": 1,
+        "version": 2,
         "revision": args.revision,
         "filename": helper.name,
         "sha256": sha256_file(helper),
+        "launcher_policy": "zero-supplementary-groups-v1",
+        "supplementary_groups": [],
     }
     content = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     args.output.parent.mkdir(parents=True, exist_ok=True)

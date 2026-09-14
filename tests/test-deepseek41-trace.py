@@ -591,10 +591,12 @@ def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, objec
 def fixture_containment_helper(revision: str, digest: str = "d" * 64) -> dict[str, object]:
     return {
         "format": "dsv41-containment-helper",
-        "version": 1,
+        "version": 2,
         "revision": revision,
         "filename": "llama-deepseek-v41-containment-helper",
         "sha256": digest,
+        "launcher_policy": "zero-supplementary-groups-v1",
+        "supplementary_groups": [],
     }
 
 
@@ -2547,52 +2549,66 @@ class TraceFormatTests(unittest.TestCase):
             helper_source.index('!= \"EXEC\"'),
         )
 
-    def test_linux_native_helper_clears_groups_before_mapping_denial(self) -> None:
+    def test_linux_native_helper_requires_zero_group_service(self) -> None:
         helper_source = (
             Path(__file__).parents[1] /
             "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
-        namespace_start = helper_source.index("[[noreturn]] void run_namespace_init")
-        namespace_source = helper_source[
-            namespace_start:
+        run_source = helper_source[
+            helper_source.index("int run_linux_helper"):
+            helper_source.index("#endif\n\n}")
+        ]
+        init_source = helper_source[
+            helper_source.index("[[noreturn]] void run_namespace_init"):
             helper_source.index("int run_linux_helper")
         ]
         target_source = helper_source[
             helper_source.index("[[noreturn]] void run_target_bootstrap"):
             helper_source.index("[[noreturn]] void run_namespace_init")
         ]
-        self.assertEqual(namespace_source.count("setgroups(0, nullptr)"), 1)
-        self.assertLess(
-            namespace_source.index('stage = "namespace-groups-clear"'),
-            namespace_source.index('write_all(ready_fd, "B", 1)'),
+        self.assertIn("--check-launcher-groups", helper_source)
+        self.assertIn("supplementary-groups=0", helper_source)
+        self.assertIn(
+            'require_zero_supplementary_groups("containment launcher");',
+            run_source,
         )
         self.assertLess(
-            namespace_start + namespace_source.index('write_all(ready_fd, "B", 1)'),
-            helper_source.index('write_mapping_file(process_directory, "setgroups", "deny\\n")'),
+            run_source.index('require_zero_supplementary_groups("containment launcher");'),
+            run_source.index("require_initial_signal_state();"),
         )
         self.assertLess(
-            namespace_source.index('stage = "namespace-mapping-close"'),
-            namespace_source.index('stage = "namespace-groups-verify"'),
+            run_source.index("require_initial_signal_state();"),
+            run_source.index("CLONE_NEWUSER"),
         )
+        self.assertNotIn("setgroups(", helper_source)
         self.assertLess(
-            namespace_source.index('stage = "namespace-groups-verify"'),
-            namespace_source.index('stage = "namespace-setresgid"'),
-        )
-        self.assertNotIn(
-            "setgroups(0, nullptr)",
-            namespace_source[namespace_source.index('stage = "namespace-release-read"'):],
-        )
-        self.assertLess(
-            target_source.index('stage = "target-mapping-close"'),
-            target_source.index('stage = "target-groups-verify"'),
+            init_source.index('stage = "namespace-groups-verify"'),
+            init_source.index('stage = "namespace-setresgid"'),
         )
         self.assertLess(
             target_source.index('stage = "target-groups-verify"'),
             target_source.index('stage = "target-privilege-drop"'),
         )
-        self.assertNotIn("setgroups(0, nullptr)", target_source)
-        self.assertIn("namespace_group_count < 0 ? errno : 0", namespace_source)
-        self.assertIn("target_group_count < 0 ? errno : 0", target_source)
+        parent_source = inspect.getsource(trace._start_linux_native_helper)
+        self.assertLess(
+            parent_source.index("_require_zero_supplementary_groups()"),
+            parent_source.index("_start_linux_native_helper_process"),
+        )
+
+    def test_linux_parent_requires_zero_group_service_before_spawn(self) -> None:
+        with mock.patch.object(trace.os, "getgroups", return_value=[]):
+            trace._require_zero_supplementary_groups()
+        with mock.patch.object(trace.os, "getgroups", return_value=[10, 39, 105]), (
+                self.assertRaisesRegex(
+                    trace.TraceError,
+                    "requires zero supplementary groups; found 3")):
+            trace._require_zero_supplementary_groups()
+        query_error = PermissionError(1, "Operation not permitted")
+        with mock.patch.object(trace.os, "getgroups", side_effect=query_error), (
+                self.assertRaisesRegex(
+                    trace.TraceError,
+                    "cannot query Linux containment launcher supplementary groups")):
+            trace._require_zero_supplementary_groups()
 
     def test_posix_spawn_does_not_run_registered_atfork_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2724,6 +2740,7 @@ class TraceFormatTests(unittest.TestCase):
         lock = mock.Mock()
         lock.acquire.return_value = True
         with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support",
                 side_effect=trace.TraceError("pidfd unavailable")), mock.patch.object(
                 trace, "_start_linux_native_helper_process") as start, self.assertRaisesRegex(
@@ -2743,6 +2760,7 @@ class TraceFormatTests(unittest.TestCase):
             quiescence_proven=False,
         )
         with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace, "_start_linux_native_helper_process", side_effect=launch_error), self.assertRaises(
@@ -2763,6 +2781,7 @@ class TraceFormatTests(unittest.TestCase):
         with mock.patch.object(
                 trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
                 trace, "_LINUX_HELPER_POISONED", False), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace.socket, "socketpair", return_value=(parent_socket, child_socket)), mock.patch.object(
@@ -2799,6 +2818,7 @@ class TraceFormatTests(unittest.TestCase):
         with mock.patch.object(
                 trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
                 trace, "_LINUX_HELPER_POISONED", False), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace.socket, "socketpair", return_value=(parent_socket, child_socket)), mock.patch.object(
@@ -2844,6 +2864,7 @@ class TraceFormatTests(unittest.TestCase):
         with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
                 trace, "_LINUX_HELPER_POISONED", False), mock.patch.object(
                 trace, "_LINUX_POISONED_CONTAINMENT", None), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace, "_start_linux_native_helper_process", return_value=process), mock.patch.object(
@@ -3280,6 +3301,7 @@ class TraceFormatTests(unittest.TestCase):
         primary = trace.TraceError("protocol startup failed")
         cleanup = trace._ContainmentCleanup([], True)
         with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace, "_start_linux_native_helper_process", return_value=process), mock.patch.object(
@@ -3385,6 +3407,7 @@ class TraceFormatTests(unittest.TestCase):
         )
         process.release_exec.side_effect = lambda: events.append("protocol")
         with mock.patch.object(trace, "_LINUX_HELPER_LOCK", lock), mock.patch.object(
+                trace.os, "getgroups", return_value=[]), mock.patch.object(
                 trace, "_linux_require_pidfd_support"), mock.patch.object(
                 trace, "_linux_task_ids", return_value={1}), mock.patch.object(
                 trace, "_start_linux_native_helper_process",
@@ -3454,7 +3477,6 @@ class TraceFormatTests(unittest.TestCase):
         required_stages = {
             "namespace-parent-death",
             "namespace-parent-identity",
-            "namespace-groups-clear",
             "namespace-mapping-read",
             "namespace-groups-verify",
             "namespace-setresgid",
@@ -4079,7 +4101,9 @@ class TraceFormatTests(unittest.TestCase):
                 ("revision", "b" * 40),
                 ("filename", "other-helper"),
                 ("sha256", "not-a-digest"),
-                ("version", 2)):
+                ("version", 1),
+                ("launcher_policy", "unbound"),
+                ("supplementary_groups", [44])):
             with self.subTest(field=field):
                 policy = fixture_prompt_builder_policy(b"prompt")
                 policy["containment_helper"][field] = value

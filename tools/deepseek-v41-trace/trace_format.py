@@ -1238,6 +1238,17 @@ def _all_catchable_signals() -> set[int]:
     }
 
 
+def _require_zero_supplementary_groups() -> None:
+    try:
+        groups = os.getgroups()
+    except OSError as error:
+        raise TraceError(
+            f"cannot query Linux containment launcher supplementary groups: {error}") from error
+    if groups:
+        raise TraceError(
+            f"Linux containment launcher requires zero supplementary groups; found {len(groups)}")
+
+
 def _start_linux_native_helper_process(
         command: list[str],
         launch: dict[str, Any],
@@ -1454,6 +1465,7 @@ def _start_linux_native_helper(command: list[str], launch: dict[str, Any]) -> _P
     pidfd = None
     exec_released = False
     try:
+        _require_zero_supplementary_groups()
         _linux_require_pidfd_support()
         if len(_linux_task_ids()) != 1:
             raise TraceError("Linux native containment requires a single-threaded Python supervisor")
@@ -2474,13 +2486,23 @@ def _validate_containment_helper_policy(
         raise TraceError(f"{label} containment helper receipt is missing")
     _require_exact_keys(
         record,
-        {"format", "version", "revision", "filename", "sha256"},
+        {
+            "format",
+            "version",
+            "revision",
+            "filename",
+            "sha256",
+            "launcher_policy",
+            "supplementary_groups",
+        },
         f"{label} containment helper receipt",
     )
-    if record["format"] != "dsv41-containment-helper" or record["version"] != 1 or (
+    if record["format"] != "dsv41-containment-helper" or record["version"] != 2 or (
             record["revision"] != revision) or (
             record["filename"] != "llama-deepseek-v41-containment-helper") or re.fullmatch(
-                r"[0-9a-f]{64}", record.get("sha256", "")) is None:
+                r"[0-9a-f]{64}", record.get("sha256", "")) is None or (
+            record["launcher_policy"] != "zero-supplementary-groups-v1") or (
+            record["supplementary_groups"] != []):
         raise TraceError(f"{label} containment helper receipt is invalid")
     result = dict(record)
     result["path"] = f"{install_root}/bin/{record['filename']}"
