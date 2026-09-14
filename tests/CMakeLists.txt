@@ -211,6 +211,26 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -a deepseek41 -s 1
     )
 
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-deepseek41-trace
+            LABEL main
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek41-trace.py
+        )
+        if(BUILD_SHARED_LIBS AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+            set_property(
+                TEST test-deepseek41-trace
+                APPEND PROPERTY ENVIRONMENT
+                    "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:llama-deepseek-v41-trace>"
+                    "DSV41_NATIVE_CONTAINMENT_HELPER=$<TARGET_FILE:llama-deepseek-v41-containment-helper>"
+                    "DSV41_NATIVE_MANIFEST_BINARY=$<TARGET_FILE:test-deepseek41-trace-manifest>"
+                    "DSV41_NATIVE_INJECT_LIBRARY=$<TARGET_FILE:test-deepseek41-trace-injected>")
+        endif()
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
@@ -280,6 +300,17 @@ llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
+
+find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND)
+    llama_test_cmd(
+        ${Python3_EXECUTABLE}
+        NAME test-strix-memory-watchdog
+        LABEL python
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test_strix_memory_watchdog.py
+    )
+endif()
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

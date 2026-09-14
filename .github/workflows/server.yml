@@ -94,12 +94,26 @@ jobs:
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
+      - name: Python setup
+        id: setup_python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          pip-install: -r tools/server/tests/requirements.txt
+
       - name: Build
         id: cmake_build
         run: |
           cmake -B build \
-            -DGGML_SCHED_NO_REALLOC=ON
-          cmake --build build --config Release -j $(nproc) --target llama-server
+            -DGGML_SCHED_NO_REALLOC=ON \
+            -DLLAMA_OPENSSL=OFF \
+            -DPython3_EXECUTABLE="$(command -v python3)"
+          cmake --build build --config Release -j $(nproc) --target \
+            llama-server \
+            llama-deepseek-v41-trace \
+            llama-deepseek-v41-containment-helper \
+            test-deepseek41-trace-manifest \
+            test-deepseek41-trace-injected
 
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -113,12 +127,1429 @@ jobs:
           hf_bucket: ggml-org/cache
           save: true
 
-      - name: Python setup
-        id: setup_python
-        uses: actions/setup-python@v6
+      - name: DeepSeek V4.1 trace CTest
+        id: deepseek_v41_trace_ctest
+        run: |
+          set -o pipefail
+          ci_root="$PWD/build/deepseek-v41-trace-ci"
+          rm -rf "$ci_root"
+          install -d -m 0700 \
+            "$ci_root" \
+            "$ci_root/tmp" \
+            "$ci_root/hook" \
+            "$ci_root/marker" \
+            "$ci_root/log" \
+            "$ci_root/evidence"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_cap_bnd="$(awk '/^CapBnd:/ { print $2 }' /proc/self/status)"
+          selected_interpreter="$(python3 -c 'import sys; from pathlib import Path; print(Path(sys.executable).resolve(strict=True))')"
+          ctest_path="$(command -v ctest)"
+          if [[ "$runner_uid" == "0" || "$runner_gid" == "0" || ! "$runner_cap_bnd" =~ ^[0-9A-Fa-f]+$ || "$selected_interpreter" != /* || "$ctest_path" != /* ]]; then
+            echo "hosted runner identity or executable path is invalid" >&2
+            exit 1
+          fi
+          export DSV41_CI_ROOT="$ci_root"
+          export DSV41_CI_RUNNER_UID="$runner_uid"
+          export DSV41_CI_RUNNER_GID="$runner_gid"
+          export DSV41_CI_RUNNER_CAP_BND="$runner_cap_bnd"
+          export DSV41_CI_SELECTED_INTERPRETER="$selected_interpreter"
+          export DSV41_CI_CTEST="$(realpath "$ctest_path")"
+          ctest --test-dir build --show-only=json-v1 -R '^test-deepseek41-trace$' > "$ci_root/evidence/test-deepseek41-trace-ctest-metadata.json"
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ["DSV41_CI_ROOT"]).resolve(strict=True)
+          evidence = root / "evidence"
+          workspace = Path.cwd().resolve(strict=True)
+          build = (workspace / "build").resolve(strict=True)
+          metadata_path = evidence / "test-deepseek41-trace-ctest-metadata.json"
+          metadata = json.loads(metadata_path.read_text())
+          tests = metadata.get("tests", [])
+          if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
+              raise SystemExit(f"expected exactly one test-deepseek41-trace selector match, got {len(tests)}")
+          command = tests[0].get("command", [])
+          if not command or not isinstance(command[0], str) or not Path(command[0]).is_absolute():
+              raise SystemExit("test-deepseek41-trace interpreter is absent or relative")
+          registered_interpreter = Path(command[0]).resolve(strict=True)
+          selected_interpreter = Path(sys.executable).resolve(strict=True)
+          if registered_interpreter != selected_interpreter:
+              raise SystemExit(
+                  f"test-deepseek41-trace interpreter mismatch: "
+                  f"registered={registered_interpreter} selected={selected_interpreter}")
+          registered_version = subprocess.check_output(
+              [str(registered_interpreter), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+              text=True,
+          ).strip()
+          if registered_version != "3.11" or sys.version_info[:2] != (3, 11):
+              raise SystemExit(
+                  f"test-deepseek41-trace requires Python 3.11: "
+                  f"registered={registered_version} selected={sys.version_info.major}.{sys.version_info.minor}")
+          (evidence / "test-deepseek41-trace-python.json").write_text(
+              json.dumps({
+                  "registered_interpreter": str(registered_interpreter),
+                  "registered_version": registered_version,
+                  "selected_interpreter": str(selected_interpreter),
+                  "selected_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+              }, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          properties = {
+              item["name"]: item["value"]
+              for item in tests[0].get("properties", [])
+          }
+          environment = properties.get("ENVIRONMENT", [])
+          if isinstance(environment, str):
+              environment = environment.split(";")
+          required = (
+              "DSV41_NATIVE_TRACE_BINARY=",
+              "DSV41_NATIVE_CONTAINMENT_HELPER=",
+              "DSV41_NATIVE_MANIFEST_BINARY=",
+              "DSV41_NATIVE_INJECT_LIBRARY=",
+          )
+          missing = [
+              name
+              for name in required
+              if not any(value.startswith(name) for value in environment)
+          ]
+          if missing:
+              raise SystemExit(f"test-deepseek41-trace environment is incomplete: {missing}")
+          source = workspace / "tools/deepseek-v41-trace/trace_format.py"
+          parsed = ast.parse(source.read_text(encoding="ascii"))
+          forbidden = None
+          for node in parsed.body:
+              if isinstance(node, ast.Assign) and any(
+                      isinstance(target, ast.Name) and target.id == "FORBIDDEN_LOADER_ENVIRONMENT"
+                      for target in node.targets):
+                  forbidden = ast.literal_eval(node.value)
+                  break
+          expected_forbidden = (
+              "DYLD_FALLBACK_FRAMEWORK_PATH",
+              "DYLD_FALLBACK_LIBRARY_PATH",
+              "DYLD_FRAMEWORK_PATH",
+              "DYLD_IMAGE_SUFFIX",
+              "DYLD_INSERT_LIBRARIES",
+              "DYLD_LIBRARY_PATH",
+              "DYLD_ROOT_PATH",
+              "DYLD_VERSIONED_FRAMEWORK_PATH",
+              "DYLD_VERSIONED_LIBRARY_PATH",
+              "GGML_BACKEND_PATH",
+              "LD_AUDIT",
+              "LD_LIBRARY_PATH",
+              "LD_PRELOAD",
+          )
+          if forbidden != expected_forbidden:
+              raise SystemExit("trace forbidden loader environment changed")
+          forbidden_path = evidence / "forbidden-loader-environment.json"
+          forbidden_path.write_text(
+              json.dumps(list(forbidden), separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          config = {
+              "ctest": str(Path(os.environ["DSV41_CI_CTEST"]).resolve(strict=True)),
+              "forbidden_path": str(forbidden_path),
+              "forbidden_sha256": hashlib.sha256(forbidden_path.read_bytes()).hexdigest(),
+              "environment_allowlist": sorted((
+                  "DSV41_CI_CONFIG",
+                  "DSV41_CI_CONFIG_SHA256",
+                  "DSV41_CI_GATE",
+                  "DSV41_CI_GATE_SHA256",
+                  "DSV41_CI_HOOK_SHA256",
+                  "HOME",
+                  "LANG",
+                  "LC_ALL",
+                  "PATH",
+                  "PYTHONDONTWRITEBYTECODE",
+                  "PYTHONCOERCECLOCALE",
+                  "PYTHONPATH",
+                  "PYTHONUTF8",
+                  "TMPDIR",
+              )),
+              "paths": {
+                  "build": str(build),
+                  "evidence": str(evidence),
+                  "hook": str(root / "hook"),
+                  "log": str(root / "log"),
+                  "marker": str(root / "marker"),
+                  "tmp": str(root / "tmp"),
+                  "workspace": str(workspace),
+              },
+              "registered_interpreter": str(registered_interpreter),
+              "runner_cap_bnd": int(os.environ["DSV41_CI_RUNNER_CAP_BND"], 16),
+              "runner_gid": int(os.environ["DSV41_CI_RUNNER_GID"]),
+              "runner_uid": int(os.environ["DSV41_CI_RUNNER_UID"]),
+              "selected_interpreter": str(selected_interpreter),
+              "source": str((workspace / "tests/test-deepseek41-trace.py").resolve(strict=True)),
+          }
+          (evidence / "fixture-config.json").write_text(
+              json.dumps(config, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="ascii",
+          )
+          PY
+          cat > "$ci_root/evidence/fixture_gate.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
+
+          FORBIDDEN = (
+              "DYLD_FALLBACK_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+              "DYLD_FRAMEWORK_PATH", "DYLD_IMAGE_SUFFIX", "DYLD_INSERT_LIBRARIES",
+              "DYLD_LIBRARY_PATH", "DYLD_ROOT_PATH", "DYLD_VERSIONED_FRAMEWORK_PATH",
+              "DYLD_VERSIONED_LIBRARY_PATH", "GGML_BACKEND_PATH", "LD_AUDIT",
+              "LD_LIBRARY_PATH", "LD_PRELOAD",
+          )
+          HOST_POLICY_STATUS_FIELDS = (
+              "Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb",
+              "NoNewPrivs", "Seccomp", "Seccomp_filters",
+          )
+          HOST_POLICY_CONTROL_PATHS = (
+              "/proc/self/attr/current",
+              "/sys/module/apparmor/parameters/enabled",
+              "/proc/sys/kernel/unprivileged_userns_clone",
+              "/proc/sys/user/max_user_namespaces",
+              "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+              "/sys/kernel/security/lsm",
+              "/sys/kernel/security/apparmor/profiles",
+              "/sys/kernel/security",
+              "/sys/kernel/security/apparmor",
+              "/sys/kernel/security/apparmor/features",
+          )
+
+          def bytes_for(value):
+              return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+          def write_exclusive(path, value):
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags, 0o600)
+              data = bytes_for(value)
+              try:
+                  if os.write(descriptor, data) != len(data):
+                      raise RuntimeError(f"short write for {path}")
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+              return hashlib.sha256(data).hexdigest()
+
+          def verify_digest(path, expected):
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"SHA-256 mismatch for {path}")
+              return actual
+
+          def read_status(text=None):
+              text = Path("/proc/self/status").read_text(encoding="ascii") if text is None else text
+              fields = {}
+              for line in text.splitlines():
+                  name, separator, value = line.partition(":")
+                  if separator:
+                      fields[name] = value.strip()
+              required = ("Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb", "NoNewPrivs")
+              missing = [name for name in required if name not in fields]
+              if missing:
+                  raise RuntimeError(f"/proc/self/status is incomplete: {missing}")
+              return {
+                  "cap_amb": int(fields["CapAmb"], 16),
+                  "cap_bnd": int(fields["CapBnd"], 16),
+                  "cap_eff": int(fields["CapEff"], 16),
+                  "cap_inh": int(fields["CapInh"], 16),
+                  "cap_prm": int(fields["CapPrm"], 16),
+                  "gid": [int(value) for value in fields["Gid"].split()],
+                  "groups": [int(value) for value in fields["Groups"].split()],
+                  "no_new_privs": int(fields["NoNewPrivs"]),
+                  "uid": [int(value) for value in fields["Uid"].split()],
+              }
+
+          def current_state():
+              state = read_status()
+              state.update({
+                  "os_egid": os.getegid(), "os_euid": os.geteuid(),
+                  "os_gid": os.getgid(), "os_groups": os.getgroups(), "os_uid": os.getuid(),
+              })
+              return state
+
+          def error_snapshot(path, operation, error, metadata=None):
+              result = {
+                  "error": str(error),
+                  "error_type": type(error).__name__,
+                  "errno": getattr(error, "errno", None),
+                  "operation": operation,
+                  "path": str(path),
+                  "status": "unreadable",
+              }
+              if metadata is not None:
+                  result.update(metadata)
+              return result
+
+          def path_metadata(path, info):
+              kind = "directory" if stat.S_ISDIR(info.st_mode) else "file" if stat.S_ISREG(info.st_mode) else "other"
+              return {
+                  "gid": info.st_gid,
+                  "kind": kind,
+                  "mode": stat.S_IMODE(info.st_mode),
+                  "uid": info.st_uid,
+              }
+
+          def snapshot_path(value):
+              path = Path(value)
+              try:
+                  info = path.lstat()
+              except FileNotFoundError:
+                  return {"path": str(path), "status": "absent"}
+              except OSError as error:
+                  return error_snapshot(path, "lstat", error)
+              metadata = path_metadata(path, info)
+              if metadata["kind"] == "directory":
+                  try:
+                      entries = sorted(os.listdir(path))
+                  except OSError as error:
+                      return error_snapshot(path, "listdir", error, metadata)
+                  encoded = bytes_for(entries)
+                  return {
+                      **metadata,
+                      "entries": entries,
+                      "entries_sha256": hashlib.sha256(encoded).hexdigest(),
+                      "path": str(path),
+                      "status": "present_readable",
+                  }
+              if metadata["kind"] != "file":
+                  return {
+                      **metadata,
+                      "path": str(path),
+                      "status": "present_readable",
+                  }
+              try:
+                  data = path.read_bytes()
+              except OSError as error:
+                  return error_snapshot(path, "read", error, metadata)
+              try:
+                  content = data.decode("ascii")
+                  encoding = "ascii"
+              except UnicodeDecodeError:
+                  content = data.hex()
+                  encoding = "hex"
+              return {
+                  **metadata,
+                  "bytes": len(data),
+                  "content": content,
+                  "content_encoding": encoding,
+                  "content_sha256": hashlib.sha256(data).hexdigest(),
+                  "path": str(path),
+                  "status": "present_readable",
+              }
+
+          def validate_snapshot(snapshot, expected_path):
+              if snapshot.get("path") != expected_path:
+                  raise RuntimeError(f"host policy path differs: {snapshot.get('path')} != {expected_path}")
+              status = snapshot.get("status")
+              if status == "absent":
+                  if set(snapshot) != {"path", "status"}:
+                      raise RuntimeError(f"absent host policy control has extra fields: {expected_path}")
+                  return
+              if status == "unreadable":
+                  allowed = {
+                      "error", "error_type", "errno", "operation", "path", "status",
+                      "gid", "kind", "mode", "uid",
+                  }
+                  if not set(snapshot) <= allowed:
+                      raise RuntimeError(f"unreadable host policy control has extra fields: {expected_path}")
+                  if not isinstance(snapshot.get("operation"), str) or not snapshot["operation"]:
+                      raise RuntimeError(f"unreadable host policy control has no operation: {expected_path}")
+                  if not isinstance(snapshot.get("error_type"), str) or not snapshot["error_type"]:
+                      raise RuntimeError(f"unreadable host policy control has no error type: {expected_path}")
+                  if not isinstance(snapshot.get("error"), str) or not snapshot["error"]:
+                      raise RuntimeError(f"unreadable host policy control has no error: {expected_path}")
+                  if snapshot.get("errno") is not None and not isinstance(snapshot["errno"], int):
+                      raise RuntimeError(f"unreadable host policy control errno is invalid: {expected_path}")
+                  metadata = [name in snapshot for name in ("mode", "uid", "gid", "kind")]
+                  if any(metadata) and not all(metadata):
+                      raise RuntimeError(f"unreadable host policy control metadata is incomplete: {expected_path}")
+                  if all(metadata):
+                      if snapshot["kind"] not in ("directory", "file", "other"):
+                          raise RuntimeError(f"unreadable host policy control kind is invalid: {expected_path}")
+                      for name in ("mode", "uid", "gid"):
+                          if not isinstance(snapshot[name], int) or snapshot[name] < 0:
+                              raise RuntimeError(f"unreadable host policy control {name} is invalid: {expected_path}")
+                  return
+              if status != "present_readable":
+                  raise RuntimeError(f"host policy control status is invalid: {expected_path}")
+              for name in ("mode", "uid", "gid"):
+                  if not isinstance(snapshot.get(name), int) or snapshot[name] < 0:
+                      raise RuntimeError(f"host policy control {name} is invalid: {expected_path}")
+              kind = snapshot.get("kind")
+              if kind == "directory":
+                  expected = {
+                      "entries", "entries_sha256", "gid", "kind", "mode", "path", "status", "uid",
+                  }
+                  if set(snapshot) != expected:
+                      raise RuntimeError(f"host policy directory fields differ: {expected_path}")
+                  entries = snapshot.get("entries")
+                  if not isinstance(entries, list) or entries != sorted(entries) or not all(
+                          isinstance(item, str) for item in entries):
+                      raise RuntimeError(f"host policy directory entries are invalid: {expected_path}")
+                  if snapshot.get("entries_sha256") != hashlib.sha256(bytes_for(entries)).hexdigest():
+                      raise RuntimeError(f"host policy directory entry hash differs: {expected_path}")
+                  return
+              if kind == "other":
+                  if set(snapshot) != {"gid", "kind", "mode", "path", "status", "uid"}:
+                      raise RuntimeError(f"host policy other fields differ: {expected_path}")
+                  return
+              if kind != "file":
+                  raise RuntimeError(f"host policy control kind is invalid: {expected_path}")
+              expected = {
+                  "bytes", "content", "content_encoding", "content_sha256",
+                  "gid", "kind", "mode", "path", "status", "uid",
+              }
+              if set(snapshot) != expected:
+                  raise RuntimeError(f"host policy file fields differ: {expected_path}")
+              encoding = snapshot.get("content_encoding")
+              content = snapshot.get("content")
+              if not isinstance(content, str) or encoding not in ("ascii", "hex"):
+                  raise RuntimeError(f"host policy control content is invalid: {expected_path}")
+              try:
+                  data = content.encode("ascii") if encoding == "ascii" else bytes.fromhex(content)
+              except (UnicodeEncodeError, ValueError) as error:
+                  raise RuntimeError(f"host policy control encoding is invalid: {expected_path}") from error
+              if snapshot.get("bytes") != len(data):
+                  raise RuntimeError(f"host policy control byte count differs: {expected_path}")
+              if snapshot.get("content_sha256") != hashlib.sha256(data).hexdigest():
+                  raise RuntimeError(f"host policy control hash differs: {expected_path}")
+
+          def snapshot_ascii(snapshot):
+              validate_snapshot(snapshot, snapshot.get("path"))
+              if snapshot.get("status") != "present_readable" or snapshot.get("kind") != "file":
+                  return None
+              if snapshot.get("content_encoding") != "ascii":
+                  raise RuntimeError(f"host policy control is not ASCII: {snapshot['path']}")
+              return snapshot["content"]
+
+          def status_field_evidence(status_snapshot):
+              text = snapshot_ascii(status_snapshot)
+              if text is None:
+                  return {
+                      name: {"status": "unavailable"}
+                      for name in HOST_POLICY_STATUS_FIELDS
+                  }
+              fields = {}
+              for line in text.splitlines():
+                  name, separator, value = line.partition(":")
+                  if separator:
+                      fields[name] = value.strip()
+              return {
+                  name: {"raw": fields[name], "status": "present"} if name in fields else {"status": "absent"}
+                  for name in HOST_POLICY_STATUS_FIELDS
+              }
+
+          def root_mount_evidence(mountinfo_snapshot):
+              text = snapshot_ascii(mountinfo_snapshot)
+              if text is None:
+                  return []
+              result = []
+              for line in text.splitlines():
+                  before, separator, after = line.partition(" - ")
+                  fields = before.split()
+                  suffix = after.split()
+                  if not separator or len(fields) < 6 or len(suffix) < 3 or fields[4] != "/":
+                      continue
+                  result.append({
+                      "filesystem_type": suffix[0],
+                      "major_minor": fields[2],
+                      "mount_id": int(fields[0]),
+                      "mount_options": fields[5],
+                      "mount_point": fields[4],
+                      "mount_source": suffix[1],
+                      "optional_fields": fields[6:],
+                      "parent_id": int(fields[1]),
+                      "raw_line": line,
+                      "root": fields[3],
+                      "super_options": suffix[2:],
+                  })
+              return result
+
+          def capture_host_policy_diagnostic(state):
+              try:
+                  uname = os.uname()
+                  uname_evidence = {
+                      "machine": uname.machine,
+                      "nodename": uname.nodename,
+                      "release": uname.release,
+                      "status": "available",
+                      "sysname": uname.sysname,
+                      "version": uname.version,
+                  }
+              except OSError as error:
+                  uname_evidence = {
+                      "error": str(error),
+                      "error_type": type(error).__name__,
+                      "errno": error.errno,
+                      "status": "unavailable",
+                  }
+              status_snapshot = snapshot_path("/proc/self/status")
+              mountinfo_snapshot = snapshot_path("/proc/self/mountinfo")
+              diagnostic = {
+                  "captured_state": state,
+                  "controls": {
+                      path: snapshot_path(path)
+                      for path in HOST_POLICY_CONTROL_PATHS
+                  },
+                  "format": "dsv41-host-policy-diagnostic",
+                  "proc_self_status": {
+                      "fields": status_field_evidence(status_snapshot),
+                      "snapshot": status_snapshot,
+                  },
+                  "root_mount_propagation": {
+                      "root_mounts": root_mount_evidence(mountinfo_snapshot),
+                      "snapshot": mountinfo_snapshot,
+                  },
+                  "uname": uname_evidence,
+                  "version": 1,
+              }
+              validate_host_policy_diagnostic(diagnostic, state)
+              return diagnostic
+
+          def parse_decimal_field(fields, name):
+              item = fields[name]
+              if item.get("status") == "absent":
+                  return None
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return int(item["raw"], 10)
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status field is not decimal: {name}") from error
+
+          def parse_vector_field(fields, name):
+              item = fields[name]
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return [int(value, 10) for value in item["raw"].split()]
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status vector is invalid: {name}") from error
+
+          def parse_hex_field(fields, name):
+              item = fields[name]
+              if item.get("status") != "present" or not isinstance(item.get("raw"), str):
+                  raise RuntimeError(f"host policy status field is invalid: {name}")
+              try:
+                  return int(item["raw"], 16)
+              except ValueError as error:
+                  raise RuntimeError(f"host policy status field is not hexadecimal: {name}") from error
+
+          def validate_host_policy_diagnostic(diagnostic, state):
+              if diagnostic.get("format") != "dsv41-host-policy-diagnostic" or diagnostic.get("version") != 1:
+                  raise RuntimeError("host policy diagnostic schema differs")
+              if diagnostic.get("captured_state") != state:
+                  raise RuntimeError("host policy diagnostic state differs")
+              uname = diagnostic.get("uname", {})
+              if uname.get("status") == "available":
+                  if not all(isinstance(uname.get(name), str) for name in (
+                          "sysname", "nodename", "release", "version", "machine")):
+                      raise RuntimeError("host policy uname evidence is invalid")
+              elif uname.get("status") == "unavailable":
+                  if not isinstance(uname.get("error_type"), str) or not isinstance(uname.get("error"), str):
+                      raise RuntimeError("host policy uname error is invalid")
+              else:
+                  raise RuntimeError("host policy uname status is invalid")
+              status = diagnostic.get("proc_self_status", {})
+              snapshot = status.get("snapshot", {})
+              validate_snapshot(snapshot, "/proc/self/status")
+              fields = status.get("fields")
+              if not isinstance(fields, dict) or set(fields) != set(HOST_POLICY_STATUS_FIELDS):
+                  raise RuntimeError("host policy status fields differ")
+              if snapshot.get("status") != "present_readable":
+                  if any(value != {"status": "unavailable"} for value in fields.values()):
+                      raise RuntimeError("unavailable host policy status has values")
+              else:
+                  if parse_vector_field(fields, "Uid") != state["uid"]:
+                      raise RuntimeError("host policy Uid differs")
+                  if parse_vector_field(fields, "Gid") != state["gid"]:
+                      raise RuntimeError("host policy Gid differs")
+                  if parse_vector_field(fields, "Groups") != state["groups"]:
+                      raise RuntimeError("host policy Groups differs")
+                  for field, name in (
+                          ("CapInh", "cap_inh"), ("CapPrm", "cap_prm"), ("CapEff", "cap_eff"),
+                          ("CapBnd", "cap_bnd"), ("CapAmb", "cap_amb")):
+                      if parse_hex_field(fields, field) != state[name]:
+                          raise RuntimeError(f"host policy {field} differs")
+                  if parse_decimal_field(fields, "NoNewPrivs") != state["no_new_privs"]:
+                      raise RuntimeError("host policy NoNewPrivs differs")
+                  for name in ("Seccomp", "Seccomp_filters"):
+                      parse_decimal_field(fields, name)
+              controls = diagnostic.get("controls")
+              if not isinstance(controls, dict) or set(controls) != set(HOST_POLICY_CONTROL_PATHS):
+                  raise RuntimeError("host policy control paths differ")
+              for path in HOST_POLICY_CONTROL_PATHS:
+                  validate_snapshot(controls[path], path)
+              mount = diagnostic.get("root_mount_propagation", {})
+              validate_snapshot(mount.get("snapshot", {}), "/proc/self/mountinfo")
+              roots = mount.get("root_mounts")
+              if not isinstance(roots, list):
+                  raise RuntimeError("host policy root mounts are invalid")
+              if mount["snapshot"].get("status") == "present_readable" and not roots:
+                  raise RuntimeError("host policy root mount is absent")
+              if mount["snapshot"].get("status") != "present_readable" and roots:
+                  raise RuntimeError("unavailable host policy mount has root entries")
+              for item in roots:
+                  if item.get("mount_point") != "/" or not isinstance(item.get("raw_line"), str):
+                      raise RuntimeError("host policy root mount entry is invalid")
+
+          def validate_host_policy_file(binding, state, expected_path):
+              path = Path(binding.get("path", ""))
+              if not path.is_absolute() or path.resolve(strict=True) != path or path != Path(expected_path):
+                  raise RuntimeError("host policy diagnostic path is invalid")
+              info = path.lstat()
+              if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                  raise RuntimeError("host policy diagnostic is not a direct file")
+              if stat.S_IMODE(info.st_mode) != 0o444 or binding.get("mode") != 0o444:
+                  raise RuntimeError("host policy diagnostic mode differs")
+              digest = verify_digest(path, binding.get("sha256"))
+              diagnostic = json.loads(path.read_text(encoding="ascii"))
+              validate_host_policy_diagnostic(diagnostic, state)
+              if binding.get("format") != diagnostic["format"] or binding.get("version") != diagnostic["version"]:
+                  raise RuntimeError("host policy diagnostic binding schema differs")
+              return {
+                  "format": diagnostic["format"],
+                  "mode": 0o444,
+                  "path": str(path),
+                  "sha256": digest,
+                  "version": diagnostic["version"],
+              }
+
+          def validate_state(state, uid, gid, cap_bnd):
+              if uid <= 0 or gid <= 0:
+                  raise RuntimeError("runner identity is privileged")
+              if state["uid"] != [uid] * 4 or state["gid"] != [gid] * 4:
+                  raise RuntimeError("live UID or GID differs")
+              if (state["os_uid"], state["os_euid"], state["os_gid"], state["os_egid"]) != (uid, uid, gid, gid):
+                  raise RuntimeError("runtime UID or GID differs")
+              if state["groups"] or state["os_groups"]:
+                  raise RuntimeError("supplementary groups are not empty")
+              for name in ("cap_inh", "cap_prm", "cap_eff", "cap_amb"):
+                  if state[name] != 0:
+                      raise RuntimeError(f"{name} is not zero")
+              if state["cap_bnd"] != cap_bnd:
+                  raise RuntimeError("CapBnd changed")
+              if state["no_new_privs"] != 1:
+                  raise RuntimeError("NoNewPrivs is not one")
+
+          def validate_interpreter_values(registered, selected, executable, registered_version, selected_version):
+              if not all(Path(value).is_absolute() for value in (registered, selected, executable)):
+                  raise RuntimeError("Python path is not absolute")
+              if registered != selected or registered != executable:
+                  raise RuntimeError("Python identity differs")
+              if registered_version != "3.11" or selected_version != "3.11":
+                  raise RuntimeError("Python is not version 3.11")
+
+          def validate_interpreter(config):
+              registered = str(Path(config["registered_interpreter"]).resolve(strict=True))
+              selected = str(Path(config["selected_interpreter"]).resolve(strict=True))
+              executable = str(Path(sys.executable).resolve(strict=True))
+              version = f"{sys.version_info.major}.{sys.version_info.minor}"
+              validate_interpreter_values(registered, selected, executable, version, version)
+              return {"executable": executable, "registered": registered, "selected": selected, "version": version}
+
+          def load_forbidden(config):
+              path = Path(config["forbidden_path"]).resolve(strict=True)
+              verify_digest(path, config["forbidden_sha256"])
+              values = tuple(json.loads(path.read_text(encoding="ascii")))
+              if values != FORBIDDEN:
+                  raise RuntimeError("forbidden loader list differs")
+              return values
+
+          def validate_environment(environment, config):
+              names = sorted(environment)
+              if names != config["environment_allowlist"]:
+                  raise RuntimeError(f"environment allowlist differs: {names}")
+              active = sorted(name for name in FORBIDDEN if environment.get(name))
+              if active:
+                  raise RuntimeError(f"forbidden loader environment is active: {active}")
+              return names
+
+          def directory_receipts(workspace, build, direct_paths, uid):
+              workspace, build = Path(workspace), Path(build)
+              direct_paths = [Path(value) for value in direct_paths]
+              for path in (workspace, build, *direct_paths):
+                  if not path.is_absolute() or path.resolve(strict=True) != path:
+                      raise RuntimeError(f"directory is not canonical: {path}")
+              if build != workspace and workspace not in build.parents:
+                  raise RuntimeError("build is outside workspace")
+              receipts = {}
+              for target in (build, *direct_paths):
+                  if target != build and build not in target.parents:
+                      raise RuntimeError(f"staging path is outside build: {target}")
+                  current = workspace
+                  candidates = [current]
+                  for part in target.relative_to(workspace).parts:
+                      current /= part
+                      candidates.append(current)
+                  for candidate in candidates:
+                      if str(candidate) in receipts:
+                          continue
+                      info = candidate.lstat()
+                      mode = stat.S_IMODE(info.st_mode)
+                      if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                          raise RuntimeError(f"staging ancestry is not a direct directory: {candidate}")
+                      if info.st_uid != uid or mode & 0o022:
+                          raise RuntimeError(f"staging ancestry owner or mode is invalid: {candidate}")
+                      receipts[str(candidate)] = {
+                          "device": info.st_dev, "gid": info.st_gid, "inode": info.st_ino,
+                          "mode": mode, "uid": info.st_uid,
+                      }
+              for path in direct_paths:
+                  if receipts[str(path)]["mode"] != 0o700:
+                      raise RuntimeError(f"staging directory mode is not 0700: {path}")
+              return receipts
+
+          def load_config():
+              path = Path(os.environ["DSV41_CI_CONFIG"]).resolve(strict=True)
+              verify_digest(path, os.environ["DSV41_CI_CONFIG_SHA256"])
+              return json.loads(path.read_text(encoding="ascii"))
+
+          def launch():
+              config = load_config()
+              load_forbidden(config)
+              environment_names = validate_environment(os.environ, config)
+              state = current_state()
+              validate_state(state, config["runner_uid"], config["runner_gid"], config["runner_cap_bnd"])
+              interpreter = validate_interpreter(config)
+              paths = config["paths"]
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = directory_receipts(paths["workspace"], paths["build"], direct, config["runner_uid"])
+              ctest = str(Path(config["ctest"]).resolve(strict=True))
+              if not os.access(ctest, os.X_OK):
+                  raise RuntimeError("CTest is not executable")
+              diagnostic_path = Path(paths["evidence"]) / "host-policy-diagnostic.json"
+              diagnostic = capture_host_policy_diagnostic(state)
+              diagnostic_sha256 = write_exclusive(diagnostic_path, diagnostic)
+              diagnostic_path.chmod(0o444)
+              diagnostic_binding = validate_host_policy_file({
+                  "format": diagnostic["format"],
+                  "mode": 0o444,
+                  "path": str(diagnostic_path),
+                  "sha256": diagnostic_sha256,
+                  "version": diagnostic["version"],
+              }, state, diagnostic_path)
+              preflight = {
+                  "ctest": ctest, "environment_names": environment_names,
+                  "format": "dsv41-ci-runner-preflight", "interpreter": interpreter,
+                  "host_policy_diagnostic": diagnostic_binding,
+                  "pid": os.getpid(), "ppid": os.getppid(), "secure_directories": receipts,
+                  "state": state, "timestamp_monotonic_ns": time.monotonic_ns(), "version": 1,
+              }
+              path = Path(paths["evidence"]) / "runner-preflight.json"
+              digest = write_exclusive(path, preflight)
+              path.chmod(0o444)
+              environment = dict(os.environ)
+              environment["DSV41_CI_PREFLIGHT"] = str(path)
+              environment["DSV41_CI_PREFLIGHT_SHA256"] = digest
+              os.execve(ctest, [
+                  ctest, "--test-dir", paths["build"], "-R", "^test-deepseek41-trace$",
+                  "--output-on-failure", "--verbose", "--no-tests=error",
+                  "--output-junit", str(Path(paths["evidence"]) / "test-deepseek41-trace-ctest.xml"),
+              ], environment)
+
+          def rejected(function):
+              try:
+                  function()
+              except Exception:
+                  return
+              raise RuntimeError("negative fixture was accepted")
+
+          def self_test(output):
+              parsed = read_status(
+                  "Uid:\t1001 1001 1001 1001\n"
+                  "Gid:\t1001 1001 1001 1001\n"
+                  "Groups:\t\n"
+                  "CapInh:\t0000000000000000\n"
+                  "CapPrm:\t0000000000000000\n"
+                  "CapEff:\t0000000000000000\n"
+                  "CapBnd:\t000000000000000f\n"
+                  "CapAmb:\t0000000000000000\n"
+                  "NoNewPrivs:\t1\n")
+              expected_parsed = {
+                  "cap_amb": 0, "cap_bnd": 15, "cap_eff": 0, "cap_inh": 0, "cap_prm": 0,
+                  "gid": [1001] * 4, "groups": [], "no_new_privs": 1, "uid": [1001] * 4,
+              }
+              if parsed != expected_parsed:
+                  raise RuntimeError("accepted /proc/self/status fixture differs")
+              valid = {
+                  "cap_amb": 0, "cap_bnd": 15, "cap_eff": 0, "cap_inh": 0, "cap_prm": 0,
+                  "gid": [1001] * 4, "groups": [], "no_new_privs": 1,
+                  "os_egid": 1001, "os_euid": 1001, "os_gid": 1001,
+                  "os_groups": [], "os_uid": 1001, "uid": [1001] * 4,
+              }
+              validate_state(valid, 1001, 1001, 15)
+              for mutation in (
+                      {"groups": [5]}, {"os_groups": [5]},
+                      {"uid": [1002] * 4}, {"gid": [1002] * 4},
+                      {"cap_inh": 1}, {"cap_prm": 1}, {"cap_eff": 1}, {"cap_amb": 1},
+                      {"cap_bnd": 14}, {"no_new_privs": 0}):
+                  changed = dict(valid)
+                  changed.update(mutation)
+                  rejected(lambda changed=changed: validate_state(changed, 1001, 1001, 15))
+              validate_interpreter_values("/python3.11", "/python3.11", "/python3.11", "3.11", "3.11")
+              rejected(lambda: validate_interpreter_values("python3.11", "/python3.11", "/python3.11", "3.11", "3.11"))
+              rejected(lambda: validate_interpreter_values("/python3.11", "/other", "/python3.11", "3.11", "3.11"))
+              rejected(lambda: validate_interpreter_values("/python3.11", "/python3.11", "/python3.11", "3.12", "3.11"))
+              config = {"environment_allowlist": ["HOME"]}
+              validate_environment({"HOME": "/home/runner"}, config)
+              rejected(lambda: validate_environment({"HOME": "/home/runner", "LD_LIBRARY_PATH": "/lib"}, config))
+              rejected(lambda: validate_environment(
+                  {"HOME": "/home/runner", "LD_LIBRARY_PATH": "/lib"},
+                  {"environment_allowlist": ["HOME", "LD_LIBRARY_PATH"]}))
+              state_fields = {
+                  "CapAmb": {"raw": "0000000000000000", "status": "present"},
+                  "CapBnd": {"raw": "000000000000000f", "status": "present"},
+                  "CapEff": {"raw": "0000000000000000", "status": "present"},
+                  "CapInh": {"raw": "0000000000000000", "status": "present"},
+                  "CapPrm": {"raw": "0000000000000000", "status": "present"},
+                  "Gid": {"raw": "1001 1001 1001 1001", "status": "present"},
+                  "Groups": {"raw": "", "status": "present"},
+                  "NoNewPrivs": {"raw": "1", "status": "present"},
+                  "Seccomp": {"raw": "2", "status": "present"},
+                  "Seccomp_filters": {"raw": "1", "status": "present"},
+                  "Uid": {"raw": "1001 1001 1001 1001", "status": "present"},
+              }
+              status_text = "".join(f"{name}:\t{value['raw']}\n" for name, value in state_fields.items())
+              status_snapshot = {
+                  "bytes": len(status_text.encode("ascii")),
+                  "content": status_text,
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(status_text.encode("ascii")).hexdigest(),
+                  "gid": 1001,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": "/proc/self/status",
+                  "status": "present_readable",
+                  "uid": 1001,
+              }
+              mount_text = "1 0 0:1 / / rw,relatime shared:1 - rootfs rootfs rw\n"
+              mount_snapshot = {
+                  "bytes": len(mount_text.encode("ascii")),
+                  "content": mount_text,
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(mount_text.encode("ascii")).hexdigest(),
+                  "gid": 1001,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": "/proc/self/mountinfo",
+                  "status": "present_readable",
+                  "uid": 1001,
+              }
+              present_zero = {
+                  "bytes": 2,
+                  "content": "0\n",
+                  "content_encoding": "ascii",
+                  "content_sha256": hashlib.sha256(b"0\n").hexdigest(),
+                  "gid": 0,
+                  "kind": "file",
+                  "mode": 0o444,
+                  "path": HOST_POLICY_CONTROL_PATHS[0],
+                  "status": "present_readable",
+                  "uid": 0,
+              }
+              present_false = {
+                  **present_zero,
+                  "bytes": 2,
+                  "content": "N\n",
+                  "content_sha256": hashlib.sha256(b"N\n").hexdigest(),
+                  "path": HOST_POLICY_CONTROL_PATHS[4],
+              }
+              absent = {"path": HOST_POLICY_CONTROL_PATHS[1], "status": "absent"}
+              unreadable = {
+                  "error": "Permission denied",
+                  "error_type": "PermissionError",
+                  "errno": 13,
+                  "operation": "read",
+                  "path": HOST_POLICY_CONTROL_PATHS[2],
+                  "status": "unreadable",
+              }
+              directory_entries = ["apparmor", "lsm"]
+              directory = {
+                  "entries": directory_entries,
+                  "entries_sha256": hashlib.sha256(bytes_for(directory_entries)).hexdigest(),
+                  "gid": 0,
+                  "kind": "directory",
+                  "mode": 0o555,
+                  "path": HOST_POLICY_CONTROL_PATHS[3],
+                  "status": "present_readable",
+                  "uid": 0,
+              }
+              controls = {}
+              for path in HOST_POLICY_CONTROL_PATHS:
+                  controls[path] = {"path": path, "status": "absent"}
+              controls[HOST_POLICY_CONTROL_PATHS[0]] = present_zero
+              controls[HOST_POLICY_CONTROL_PATHS[1]] = absent
+              controls[HOST_POLICY_CONTROL_PATHS[2]] = unreadable
+              controls[HOST_POLICY_CONTROL_PATHS[3]] = directory
+              controls[HOST_POLICY_CONTROL_PATHS[4]] = present_false
+              synthetic = {
+                  "captured_state": valid,
+                  "controls": controls,
+                  "format": "dsv41-host-policy-diagnostic",
+                  "proc_self_status": {
+                      "fields": state_fields,
+                      "snapshot": status_snapshot,
+                  },
+                  "root_mount_propagation": {
+                      "root_mounts": root_mount_evidence(mount_snapshot),
+                      "snapshot": mount_snapshot,
+                  },
+                  "uname": {
+                      "machine": "aarch64", "nodename": "runner", "release": "6.11",
+                      "status": "available", "sysname": "Linux", "version": "#1",
+                  },
+                  "version": 1,
+              }
+              validate_host_policy_diagnostic(synthetic, valid)
+              unavailable_status = {
+                  **synthetic,
+                  "proc_self_status": {
+                      "fields": {
+                          name: {"status": "unavailable"}
+                          for name in HOST_POLICY_STATUS_FIELDS
+                      },
+                      "snapshot": {"path": "/proc/self/status", "status": "absent"},
+                  },
+                  "uname": {
+                      "error": "unavailable", "error_type": "OSError",
+                      "errno": None, "status": "unavailable",
+                  },
+              }
+              validate_host_policy_diagnostic(unavailable_status, valid)
+              partial_status = {
+                  **synthetic,
+                  "proc_self_status": {
+                      "fields": {
+                          **state_fields,
+                          "Seccomp_filters": {"status": "absent"},
+                      },
+                      "snapshot": status_snapshot,
+                  },
+              }
+              validate_host_policy_diagnostic(partial_status, valid)
+              unavailable_mount = {
+                  **synthetic,
+                  "root_mount_propagation": {
+                      "root_mounts": [],
+                      "snapshot": {"path": "/proc/self/mountinfo", "status": "absent"},
+                  },
+              }
+              validate_host_policy_diagnostic(unavailable_mount, valid)
+              for mutation in (
+                      {"format": "wrong"},
+                      {"version": 2},
+                      {"captured_state": {**valid, "no_new_privs": 0}},
+                      {"controls": {**controls, "/wrong": {"path": "/wrong", "status": "absent"}}},
+                      {"proc_self_status": {
+                          "fields": {**state_fields, "NoNewPrivs": {"raw": "0", "status": "present"}},
+                          "snapshot": status_snapshot,
+                      }},
+                      {"root_mount_propagation": {"root_mounts": [], "snapshot": mount_snapshot}}):
+                  changed = dict(synthetic)
+                  changed.update(mutation)
+                  rejected(lambda changed=changed: validate_host_policy_diagnostic(changed, valid))
+              for invalid, expected_path in (
+                      ({**present_zero, "content": "1\n"}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "bytes": 1}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "content_sha256": "0" * 64}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**absent, "content": ""}, HOST_POLICY_CONTROL_PATHS[1]),
+                      ({**unreadable, "error": ""}, HOST_POLICY_CONTROL_PATHS[2]),
+                      ({**unreadable, "content": ""}, HOST_POLICY_CONTROL_PATHS[2]),
+                      ({**directory, "entries_sha256": "0" * 64}, HOST_POLICY_CONTROL_PATHS[3]),
+                      ({"path": HOST_POLICY_CONTROL_PATHS[0], "status": "invalid"}, HOST_POLICY_CONTROL_PATHS[0]),
+                      ({**present_zero, "path": "/wrong"}, HOST_POLICY_CONTROL_PATHS[0])):
+                  rejected(lambda invalid=invalid, expected_path=expected_path: validate_snapshot(invalid, expected_path))
+              root = Path(output).resolve().parent / "gate-self-test"
+              root.mkdir(mode=0o700)
+              with tempfile.TemporaryDirectory(dir=root) as temp:
+                  workspace = Path(temp) / "workspace"
+                  build = workspace / "build"
+                  direct = build / "direct"
+                  direct.mkdir(parents=True, mode=0o700)
+                  workspace.chmod(0o700)
+                  build.chmod(0o700)
+                  directory_receipts(workspace, build, [direct], os.getuid())
+                  direct.chmod(0o770)
+                  rejected(lambda: directory_receipts(workspace, build, [direct], os.getuid()))
+                  direct.chmod(0o702)
+                  rejected(lambda: directory_receipts(workspace, build, [direct], os.getuid()))
+                  direct.chmod(0o700)
+                  link = build / "link"
+                  link.symlink_to(direct, target_is_directory=True)
+                  rejected(lambda: directory_receipts(workspace, build, [link], os.getuid()))
+                  marker = build / "exclusive.json"
+                  write_exclusive(marker, {"value": 1})
+                  rejected(lambda: write_exclusive(marker, {"value": 2}))
+                  digest = hashlib.sha256(marker.read_bytes()).hexdigest()
+                  marker.chmod(0o600)
+                  marker.write_text('{"value":2}\n', encoding="ascii")
+                  rejected(lambda: verify_digest(marker, digest))
+              Path(output).write_text(json.dumps({
+                  "environment": "PASS", "exclusive_and_tamper": "PASS",
+                  "host_policy_diagnostic": "PASS",
+                  "interpreter": "PASS", "secure_ancestry": "PASS",
+                  "state_matrix": "PASS",
+              }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+
+          if __name__ == "__main__":
+              if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+                  self_test(sys.argv[2])
+              elif sys.argv[1:] == ["--launch"]:
+                  launch()
+              else:
+                  raise SystemExit("invalid fixture gate arguments")
+          PY
+          cat > "$ci_root/hook/sitecustomize.py" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import sys
+          import time
+          import unittest
+          from pathlib import Path
+
+          def load_gate():
+              path = Path(os.environ["DSV41_CI_GATE"]).resolve(strict=True)
+              if hashlib.sha256(path.read_bytes()).hexdigest() != os.environ["DSV41_CI_GATE_SHA256"]:
+                  raise RuntimeError("fixture gate SHA-256 mismatch")
+              spec = importlib.util.spec_from_file_location("dsv41_ci_fixture_gate", path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot load fixture gate")
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              return module
+
+          GATE = load_gate()
+          CONFIG = GATE.load_config()
+          HOOK_PATH = Path(__file__).resolve(strict=True)
+          HOOK_SHA256 = GATE.verify_digest(HOOK_PATH, os.environ["DSV41_CI_HOOK_SHA256"])
+          SOURCE = Path(CONFIG["source"]).resolve(strict=True)
+          MARKER_DIR = Path(CONFIG["paths"]["marker"]).resolve(strict=True)
+          TEST_CLASS = "TraceFormatTests"
+          TEST_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
+          TEST_ID = f"__main__.{TEST_CLASS}.{TEST_METHOD}"
+          BINDINGS = (
+              "DSV41_NATIVE_TRACE_BINARY", "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY", "DSV41_NATIVE_INJECT_LIBRARY",
+          )
+          ORIGINAL_CALL = unittest.TestCase._callTestMethod
+          ORIGINAL_SKIP = unittest.TextTestResult.addSkip
+
+          def preflight():
+              path = Path(os.environ["DSV41_CI_PREFLIGHT"]).resolve(strict=True)
+              digest = GATE.verify_digest(path, os.environ["DSV41_CI_PREFLIGHT_SHA256"])
+              return path, digest, json.loads(path.read_text(encoding="ascii"))
+
+          def live_evidence():
+              path, digest, before = preflight()
+              state = GATE.current_state()
+              GATE.validate_state(state, CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              diagnostic = GATE.validate_host_policy_file(
+                  before["host_policy_diagnostic"], state,
+                  Path(CONFIG["paths"]["evidence"]) / "host-policy-diagnostic.json")
+              interpreter = GATE.validate_interpreter(CONFIG)
+              if any(os.environ.get(name) for name in GATE.FORBIDDEN):
+                  raise RuntimeError("target process has a forbidden loader environment")
+              paths = CONFIG["paths"]
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = GATE.directory_receipts(paths["workspace"], paths["build"], direct, CONFIG["runner_uid"])
+              if state != before["state"] or interpreter != before["interpreter"] or receipts != before["secure_directories"]:
+                  raise RuntimeError("target process differs from preflight")
+              return {
+                  "active_forbidden_loader_environment": [],
+                  "host_policy_diagnostic": diagnostic,
+                  "interpreter": interpreter,
+                  "preflight_path": str(path),
+                  "preflight_sha256": digest,
+                  "secure_directories": receipts,
+                  "state": state,
+              }
+
+          def call_test_method(self, method):
+              function = getattr(method, "__func__", method)
+              code = getattr(function, "__code__", None)
+              source = Path(code.co_filename).resolve(strict=True) if code is not None else None
+              if self.__class__.__name__ == TEST_CLASS and method.__name__ == TEST_METHOD and source == SOURCE:
+                  bindings = {}
+                  for name in BINDINGS:
+                      value = os.environ.get(name)
+                      if not value:
+                          raise RuntimeError(f"missing {name} binding")
+                      bindings[name] = str(Path(value).resolve(strict=True))
+                  payload = {
+                      **live_evidence(), "bindings": bindings, "event": "test_method_entry",
+                      "first_line": code.co_firstlineno, "function": TEST_METHOD,
+                      "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
+                      "hook_sha256": HOOK_SHA256,
+                      "pid": os.getpid(), "ppid": os.getppid(), "source": str(source),
+                      "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                      "test_id": self.id(), "timestamp_monotonic_ns": time.monotonic_ns(),
+                  }
+                  try:
+                      GATE.write_exclusive(MARKER_DIR / "entry.json", payload)
+                  except FileExistsError:
+                      GATE.write_exclusive(
+                          MARKER_DIR / f"duplicate-{os.getpid()}-{time.monotonic_ns()}.json", payload)
+                      raise RuntimeError(f"{TEST_ID} entered more than once")
+              return ORIGINAL_CALL(self, method)
+
+          def add_skip(self, test, reason):
+              method = getattr(test, getattr(test, "_testMethodName", ""), None)
+              function = getattr(method, "__func__", method)
+              code = getattr(function, "__code__", None)
+              source = Path(code.co_filename).resolve(strict=True) if code is not None else None
+              test_id = test.id()
+              _path, digest, _before = preflight()
+              payload = {
+                  "event": "test_skip", "preflight_sha256": digest, "reason": reason,
+                  "source": str(source) if source is not None else None,
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest() if source is not None else None,
+                  "test_id": test_id,
+              }
+              GATE.write_exclusive(
+                  MARKER_DIR / f"skip-{hashlib.sha256(test_id.encode('ascii')).hexdigest()}.json", payload)
+              return ORIGINAL_SKIP(self, test, reason)
+
+          unittest.TestCase._callTestMethod = call_test_method
+          unittest.TextTestResult.addSkip = add_skip
+          PY
+          cat > "$ci_root/evidence/postgate.py" <<'PY'
+          import ast
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          import re
+          import sys
+          import tempfile
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          def load_gate():
+              path = Path(os.environ["DSV41_CI_GATE"]).resolve(strict=True)
+              if hashlib.sha256(path.read_bytes()).hexdigest() != os.environ["DSV41_CI_GATE_SHA256"]:
+                  raise RuntimeError("fixture gate SHA-256 mismatch")
+              spec = importlib.util.spec_from_file_location("dsv41_ci_fixture_gate_post", path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot load fixture gate")
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = module
+              spec.loader.exec_module(module)
+              return module
+
+          GATE = load_gate()
+          CONFIG = GATE.load_config()
+          TARGET_METHOD = "test_native_watchdog_validation_crosses_private_pid_namespace"
+          TARGET_ID = f"__main__.TraceFormatTests.{TARGET_METHOD}"
+          APPROVED_SKIP_ID = "__main__.TraceFormatTests.test_unproven_posix_containment_fails_closed_before_setsid_escape"
+          BINDING_NAMES = {
+              "DSV41_NATIVE_TRACE_BINARY", "DSV41_NATIVE_CONTAINMENT_HELPER",
+              "DSV41_NATIVE_MANIFEST_BINARY", "DSV41_NATIVE_INJECT_LIBRARY",
+          }
+
+          def junit_values(path):
+              root = ElementTree.parse(path).getroot()
+              return {name: int(root.attrib.get(name, -1)) for name in ("tests", "failures", "disabled", "skipped")}
+
+          def validate_outer(status, junit, log):
+              if status != 0:
+                  raise RuntimeError(f"CTest failed with status {status}")
+              if junit != {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0}:
+                  raise RuntimeError(f"CTest JUnit result is invalid: {junit}")
+              if "***Skipped" in log or "***Not Run" in log:
+                  raise RuntimeError("CTest was skipped or not run")
+              start_pattern = re.compile(r"^\s*Start\s+[1-9]\d*:\s+test-deepseek41-trace\s*$")
+              starts = sum(start_pattern.fullmatch(line) is not None for line in log.splitlines())
+              if starts != 1:
+                  raise RuntimeError(f"registered CTest execution count is invalid: {starts}")
+
+          def expected_bindings(metadata):
+              tests = metadata.get("tests", [])
+              if len(tests) != 1 or tests[0].get("name") != "test-deepseek41-trace":
+                  raise RuntimeError("CTest metadata selector is invalid")
+              properties = {item["name"]: item["value"] for item in tests[0].get("properties", [])}
+              environment = properties.get("ENVIRONMENT", [])
+              if isinstance(environment, str):
+                  environment = environment.split(";")
+              result = {}
+              for value in environment:
+                  name, setting = value.split("=", 1)
+                  if name.startswith("DSV41_NATIVE_"):
+                      result[name] = str(Path(setting).resolve(strict=True))
+              if set(result) != BINDING_NAMES:
+                  raise RuntimeError("native bindings are invalid")
+              return result
+
+          def target_first_line(source):
+              tree = ast.parse(source.read_text(encoding="ascii"))
+              for node in tree.body:
+                  if isinstance(node, ast.ClassDef) and node.name == "TraceFormatTests":
+                      for member in node.body:
+                          if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == TARGET_METHOD:
+                              return min([member.lineno, *(decorator.lineno for decorator in member.decorator_list)])
+              raise RuntimeError("target method is absent")
+
+          def validate_first_line(actual, expected):
+              if actual != expected:
+                  raise RuntimeError(f"target first line differs: actual={actual} expected={expected}")
+
+          def validate_counts(entries, duplicates, target_skips, total_skips):
+              if entries != 1 or duplicates != 0 or target_skips != 0 or total_skips != 1:
+                  raise RuntimeError(
+                      f"marker counts are invalid: entry={entries} duplicate={duplicates} "
+                      f"target_skip={target_skips} skips={total_skips}")
+
+          def validate_preflight_diagnostic(paths):
+              evidence = Path(paths["evidence"])
+              preflight_path = evidence / "runner-preflight.json"
+              preflight_sha = hashlib.sha256(preflight_path.read_bytes()).hexdigest()
+              preflight = json.loads(preflight_path.read_text(encoding="ascii"))
+              GATE.validate_state(
+                  preflight["state"], CONFIG["runner_uid"], CONFIG["runner_gid"], CONFIG["runner_cap_bnd"])
+              diagnostic = GATE.validate_host_policy_file(
+                  preflight["host_policy_diagnostic"], preflight["state"],
+                  evidence / "host-policy-diagnostic.json")
+              return diagnostic, preflight_path, preflight_sha, preflight
+
+          def validate_marker(status, paths, preflight_evidence=None):
+              evidence = Path(paths["evidence"])
+              marker_dir = Path(paths["marker"])
+              log = (Path(paths["log"]) / "test-deepseek41-trace-ctest.log").read_text(errors="replace")
+              diagnostic, preflight_path, preflight_sha, preflight = (
+                  validate_preflight_diagnostic(paths)
+                  if preflight_evidence is None else preflight_evidence)
+              validate_outer(
+                  status,
+                  junit_values(evidence / "test-deepseek41-trace-ctest.xml"),
+                  log,
+              )
+              metadata = json.loads((evidence / "test-deepseek41-trace-ctest-metadata.json").read_text())
+              bindings = expected_bindings(metadata)
+              if preflight["environment_names"] != CONFIG["environment_allowlist"]:
+                  raise RuntimeError("preflight environment allowlist differs")
+              if preflight["ctest"] != str(Path(CONFIG["ctest"]).resolve(strict=True)):
+                  raise RuntimeError("preflight CTest identity differs")
+              if preflight["interpreter"] != GATE.validate_interpreter(CONFIG):
+                  raise RuntimeError("preflight Python identity differs")
+              direct = [paths[name] for name in ("evidence", "hook", "log", "marker", "tmp")]
+              receipts = GATE.directory_receipts(
+                  paths["workspace"], paths["build"], direct, CONFIG["runner_uid"])
+              if preflight["secure_directories"] != receipts:
+                  raise RuntimeError("preflight secure directory evidence differs")
+              entries = list(marker_dir.glob("entry.json"))
+              duplicates = list(marker_dir.glob("duplicate-*.json"))
+              skips = list(marker_dir.glob("skip-*.json"))
+              unexpected = [
+                  path for path in marker_dir.iterdir()
+                  if path not in entries and path not in duplicates and path not in skips
+              ]
+              skip_payloads = [json.loads(path.read_text(encoding="ascii")) for path in skips]
+              target_skips = sum(payload.get("test_id") == TARGET_ID for payload in skip_payloads)
+              validate_counts(len(entries), len(duplicates), target_skips, len(skips))
+              if unexpected:
+                  raise RuntimeError(f"unexpected marker artifacts: {unexpected}")
+              marker = json.loads(entries[0].read_text(encoding="ascii"))
+              source = Path(CONFIG["source"]).resolve(strict=True)
+              expected = {
+                  "active_forbidden_loader_environment": [],
+                  "bindings": bindings,
+                  "event": "test_method_entry",
+                  "function": TARGET_METHOD,
+                  "gate_sha256": os.environ["DSV41_CI_GATE_SHA256"],
+                  "host_policy_diagnostic": diagnostic,
+                  "hook_sha256": os.environ["DSV41_CI_HOOK_SHA256"],
+                  "interpreter": preflight["interpreter"],
+                  "preflight_path": str(preflight_path),
+                  "preflight_sha256": preflight_sha,
+                  "secure_directories": receipts,
+                  "source": str(source),
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                  "state": preflight["state"],
+                  "test_id": TARGET_ID,
+              }
+              for name, value in expected.items():
+                  if marker.get(name) != value:
+                      raise RuntimeError(f"target entry marker {name} differs")
+              validate_first_line(marker.get("first_line"), target_first_line(source))
+              if not isinstance(marker.get("pid"), int) or marker["pid"] <= 1:
+                  raise RuntimeError("target entry marker PID is invalid")
+              if not isinstance(marker.get("ppid"), int) or marker["ppid"] <= 0:
+                  raise RuntimeError("target entry marker PPID is invalid")
+              if not isinstance(marker.get("timestamp_monotonic_ns"), int) or marker["timestamp_monotonic_ns"] <= 0:
+                  raise RuntimeError("target entry marker timestamp is invalid")
+              approved = {
+                  "event": "test_skip",
+                  "preflight_sha256": preflight_sha,
+                  "reason": "Linux uses subreaper and pidfd containment",
+                  "source": str(source),
+                  "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                  "test_id": APPROVED_SKIP_ID,
+              }
+              if skip_payloads != [approved]:
+                  raise RuntimeError("approved skip identity differs")
+              return {
+                  "ctest_execution_count": 1,
+                  "duplicate_entry_count": 0,
+                  "forbidden_loader_environment": [],
+                  "host_policy_diagnostic": diagnostic,
+                  "junit": {"disabled": 0, "failures": 0, "skipped": 0, "tests": 1},
+                  "preflight_sha256": preflight_sha,
+                  "result": "PASS",
+                  "target_entry_count": 1,
+                  "target_skip_count": 0,
+              }
+
+          def rejected(function):
+              try:
+                  function()
+              except Exception:
+                  return
+              raise RuntimeError("negative postgate fixture was accepted")
+
+          def self_test(output):
+              validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n")
+              rejected(lambda: validate_outer(
+                  1, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 1, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 1},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 1, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "    Start 35: test-deepseek41-trace\n***Not Run\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0}, ""))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 35: test-deepseek41-trace\nStart 35: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 0: test-deepseek41-trace\n"))
+              rejected(lambda: validate_outer(
+                  0, {"tests": 1, "failures": 0, "disabled": 0, "skipped": 0},
+                  "Start 35: wrong-test\n"))
+              decorated = ast.parse(
+                  "class TraceFormatTests:\n"
+                  "    @staticmethod\n"
+                  "    def test_native_watchdog_validation_crosses_private_pid_namespace():\n"
+                  "        pass\n")
+              member = decorated.body[0].body[0]
+              first_line = min([member.lineno, *(item.lineno for item in member.decorator_list)])
+              validate_first_line(first_line, 2)
+              rejected(lambda: validate_first_line(member.lineno, 2))
+              validate_counts(1, 0, 0, 1)
+              for counts in ((0, 0, 0, 1), (1, 1, 0, 1), (1, 0, 1, 1), (1, 0, 0, 2)):
+                  rejected(lambda counts=counts: validate_counts(*counts))
+              with tempfile.TemporaryDirectory() as temp:
+                  marker = Path(temp) / "marker.json"
+                  GATE.write_exclusive(marker, {"preflight_sha256": "a"})
+                  rejected(lambda: GATE.write_exclusive(marker, {"preflight_sha256": "b"}))
+                  rejected(lambda: GATE.verify_digest(marker, "0" * 64))
+              Path(output).write_text(json.dumps({
+                  "duplicate_and_race": "PASS", "junit_failure_skip_notrun": "PASS",
+                  "preflight_spoof": "PASS", "target_nonentry_skip_duplicate": "PASS",
+              }, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
+
+          def validate(status, output):
+              preflight_evidence = None
+              try:
+                  preflight_evidence = validate_preflight_diagnostic(CONFIG["paths"])
+                  receipt = validate_marker(status, CONFIG["paths"], preflight_evidence)
+              except Exception as error:
+                  receipt = {"error": str(error), "result": "FAIL"}
+                  if preflight_evidence is not None:
+                      receipt["host_policy_diagnostic"] = preflight_evidence[0]
+                  GATE.write_exclusive(Path(output), receipt)
+                  raise
+              GATE.write_exclusive(Path(output), receipt)
+
+          if __name__ == "__main__":
+              if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+                  self_test(sys.argv[2])
+              elif len(sys.argv) == 4 and sys.argv[1] == "--validate":
+                  validate(int(sys.argv[2]), sys.argv[3])
+              else:
+                  raise SystemExit("invalid postgate arguments")
+          PY
+          chmod 0444 \
+            "$ci_root/evidence/fixture-config.json" \
+            "$ci_root/evidence/fixture_gate.py" \
+            "$ci_root/evidence/forbidden-loader-environment.json" \
+            "$ci_root/evidence/postgate.py" \
+            "$ci_root/hook/sitecustomize.py"
+          export DSV41_CI_CONFIG="$ci_root/evidence/fixture-config.json"
+          export DSV41_CI_CONFIG_SHA256="$(sha256sum "$DSV41_CI_CONFIG" | cut -d' ' -f1)"
+          export DSV41_CI_GATE="$ci_root/evidence/fixture_gate.py"
+          export DSV41_CI_GATE_SHA256="$(sha256sum "$DSV41_CI_GATE" | cut -d' ' -f1)"
+          export DSV41_CI_HOOK_SHA256="$(sha256sum "$ci_root/hook/sitecustomize.py" | cut -d' ' -f1)"
+          printf '%s  %s\n' "$DSV41_CI_GATE_SHA256" "$DSV41_CI_GATE" > "$ci_root/evidence/fixture_gate.sha256"
+          printf '%s  %s\n' "$DSV41_CI_HOOK_SHA256" "$ci_root/hook/sitecustomize.py" > "$ci_root/evidence/sitecustomize.sha256"
+          "$selected_interpreter" "$ci_root/evidence/fixture_gate.py" \
+            --self-test "$ci_root/evidence/fixture-gate-self-test.json"
+          "$selected_interpreter" "$ci_root/evidence/postgate.py" \
+            --self-test "$ci_root/evidence/postgate-self-test.json"
+          : > "$ci_root/log/test-deepseek41-trace-ctest.log"
+          set +e
+          sudo -n -- /usr/bin/setpriv \
+            --reuid="$runner_uid" \
+            --regid="$runner_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --no-new-privs \
+            -- /usr/bin/env -i \
+            "PATH=${selected_interpreter%/*}:/usr/bin:/bin" \
+            "HOME=$HOME" \
+            "LANG=C" \
+            "LC_ALL=C" \
+            "TMPDIR=$ci_root/tmp" \
+            "PYTHONDONTWRITEBYTECODE=1" \
+            "PYTHONCOERCECLOCALE=0" \
+            "PYTHONPATH=$ci_root/hook" \
+            "PYTHONUTF8=1" \
+            "DSV41_CI_CONFIG=$DSV41_CI_CONFIG" \
+            "DSV41_CI_CONFIG_SHA256=$DSV41_CI_CONFIG_SHA256" \
+            "DSV41_CI_GATE=$DSV41_CI_GATE" \
+            "DSV41_CI_GATE_SHA256=$DSV41_CI_GATE_SHA256" \
+            "DSV41_CI_HOOK_SHA256=$DSV41_CI_HOOK_SHA256" \
+            "$selected_interpreter" "$ci_root/evidence/fixture_gate.py" --launch \
+            2>&1 | tee "$ci_root/log/test-deepseek41-trace-ctest.log"
+          ctest_status="${PIPESTATUS[0]}"
+          set -e
+          "$selected_interpreter" "$ci_root/evidence/postgate.py" \
+            --validate "$ctest_status" "$ci_root/evidence/postgate-result.json"
+
+      - name: Upload DeepSeek V4.1 trace CTest evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
         with:
-          python-version: '3.11'
-          pip-install: -r tools/server/tests/requirements.txt
+          name: deepseek-v41-trace-ctest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/deepseek-v41-trace-ci/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Tests
         id: server_integration_tests
