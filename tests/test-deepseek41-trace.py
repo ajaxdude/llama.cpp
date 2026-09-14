@@ -6243,6 +6243,33 @@ class TraceFormatTests(unittest.TestCase):
         self.assertEqual(preflight.WATCHDOG_VERSION, 2)
         self.assertEqual(trace.WATCHDOG_VERSION, 2)
 
+    def test_process_swap_is_disabled_by_cgroup_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            proc = root / "proc"
+            cgroup = root / "cgroup"
+            scope = cgroup / "validation.scope"
+            (proc / "self").mkdir(parents=True)
+            scope.mkdir(parents=True)
+            (proc / "self/cgroup").write_text(
+                "0::/validation.scope\n",
+                encoding="utf-8",
+            )
+            (scope / "memory.swap.max").write_text("0\n", encoding="ascii")
+            (scope / "memory.swap.current").write_text(
+                "0\n", encoding="ascii"
+            )
+
+            self.assertTrue(
+                preflight.process_swap_is_disabled(proc, cgroup)
+            )
+            (scope / "memory.swap.current").write_text(
+                "4096\n", encoding="ascii"
+            )
+            self.assertFalse(
+                preflight.process_swap_is_disabled(proc, cgroup)
+            )
+
     def test_canonical_watchdog_artifacts_embed_and_validate(self) -> None:
         revision = preflight.WATCHDOG_REVISION
         repository = Path(__file__).parents[1]
