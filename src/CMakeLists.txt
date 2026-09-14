@@ -17,6 +17,7 @@ set(LLAMA_CORE_SOURCES
     llama-context.cpp
     llama-cparams.cpp
     llama-dsv41.cpp
+    llama-dsv41-engram.cpp
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp
@@ -34,6 +35,8 @@ set(LLAMA_CORE_SOURCES
     llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
+    llama-bounded-file.cpp
+    llama-engram.cpp
     llama-ple-disk.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp

@@ -112,7 +112,6 @@ static void test_hparams() {
     expect_throw([&]() { llama_dsv41_validate_config(config); }, "truncated Engram prime table was accepted");
 
     const std::string dependency_error = llama_dsv41_runtime_dependency_error();
-    check(dependency_error.find("disk-backed Engram") != std::string::npos, "dependency error omits Engram");
     check(dependency_error.find("routed-expert streaming") != std::string::npos, "dependency error omits expert streaming");
 }
 

@@ -1315,6 +1315,10 @@ struct llama_model_deepseek4 : public llama_model_base {
 
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+
+    struct engram_model;
+    std::shared_ptr<engram_model> engram;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     [[noreturn]] void load_arch_tensors(llama_model_loader & ml) override;
 
