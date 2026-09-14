@@ -227,6 +227,44 @@ class TestWatchdogBehavior(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _wait_for_ints(
+        self,
+        path: Path,
+        count: int,
+        message: str,
+        process: subprocess.Popen[str] | None = None,
+    ) -> tuple[int, ...]:
+        deadline = time.monotonic() + 5
+        while True:
+            values = (
+                path.read_text(encoding="utf-8").split()
+                if path.exists()
+                else []
+            )
+            if len(values) == count:
+                try:
+                    return tuple(int(value) for value in values)
+                except ValueError:
+                    pass
+            if process is not None and process.poll() is not None:
+                detail = process.stderr.read() if process.stderr else ""
+                self.fail(f"{message}: {detail}")
+            if time.monotonic() >= deadline:
+                self.fail(message)
+            time.sleep(0.01)
+
+    def _wait_for_json(self, path: Path, message: str) -> Any:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                if path.exists():
+                    return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+            if time.monotonic() >= deadline:
+                self.fail(message)
+            time.sleep(0.01)
+
     @staticmethod
     def _lease_arguments(root: Path) -> list[str]:
         return [
@@ -303,18 +341,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                         child_pid = None
                         grandchild_pid = None
                         try:
-                            deadline = time.monotonic() + 5
-                            while not pid_file.exists():
-                                if time.monotonic() >= deadline:
-                                    self.fail(
-                                        "child process group did not start"
-                                    )
-                                time.sleep(0.01)
                             child_pid, grandchild_pid = (
-                                int(value)
-                                for value in pid_file.read_text(
-                                    encoding="utf-8"
-                                ).split()
+                                self._wait_for_ints(
+                                    pid_file,
+                                    2,
+                                    "child process group did not start",
+                                )
                             )
                             time.sleep(0.05)
                             wrapper.send_signal(signal_number)
@@ -444,14 +476,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                 )
                 child_pid = None
                 try:
-                    deadline = time.monotonic() + 5
-                    while not pid_file.exists():
-                        if time.monotonic() >= deadline:
-                            self.fail("child process did not become ready")
-                        time.sleep(0.01)
-                    child_pid = int(
-                        pid_file.read_text(encoding="utf-8")
-                    )
+                    child_pid = self._wait_for_ints(
+                        pid_file,
+                        1,
+                        "child process did not become ready",
+                        wrapper,
+                    )[0]
                     started = time.monotonic()
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -532,11 +562,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                     text=True,
                 )
                 try:
-                    deadline = time.monotonic() + 5
-                    while not pid_file.exists():
-                        if time.monotonic() >= deadline:
-                            self.fail("child process did not become ready")
-                        time.sleep(0.01)
+                    self._wait_for_ints(
+                        pid_file,
+                        1,
+                        "child process did not become ready",
+                        wrapper,
+                    )
                     started = time.monotonic()
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -682,16 +713,10 @@ class TestWatchdogBehavior(unittest.TestCase):
             child_pid = None
             grandchild_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not pid_path.exists():
-                    if time.monotonic() >= deadline:
-                        self.fail("child process group did not start")
-                    time.sleep(0.01)
-                child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_path.read_text(
-                        encoding="utf-8"
-                    ).split()
+                child_pid, grandchild_pid = self._wait_for_ints(
+                    pid_path,
+                    2,
+                    "child process group did not start",
                 )
                 result = watchdog._graceful_cleanup(
                     audit,
@@ -804,12 +829,9 @@ class TestWatchdogBehavior(unittest.TestCase):
             control_target = os.readlink(
                 f"/proc/self/fd/{guardian.pulse_fd}"
             )
-            deadline = time.monotonic() + 5
-            while not state_path.exists():
-                if time.monotonic() >= deadline:
-                    self.fail("guardian payload did not become ready")
-                time.sleep(0.01)
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = self._wait_for_json(
+                state_path, "guardian payload did not become ready"
+            )
             os.close(guardian.pulse_fd)
             guardian.wait(timeout=5)
 
@@ -849,14 +871,11 @@ class TestWatchdogBehavior(unittest.TestCase):
                 1.0,
                 signal.pthread_sigmask(signal.SIG_BLOCK, ()),
             )
-            deadline = time.monotonic() + 5
-            while not state_path.exists():
-                if time.monotonic() >= deadline:
-                    self.fail("escaped payload did not become ready")
-                time.sleep(0.01)
-            escaped_pid = int(
-                state_path.read_text(encoding="utf-8")
-            )
+            escaped_pid = self._wait_for_ints(
+                state_path,
+                1,
+                "escaped payload did not become ready",
+            )[0]
             os.close(guardian.pulse_fd)
             guardian.wait(timeout=5)
             self.assertTrue(self._process_is_running(escaped_pid))
@@ -917,21 +936,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                         stderr=subprocess.PIPE,
                         text=True,
                     )
-                    deadline = time.monotonic() + 5
-                    while not pid_path.exists():
-                        if wrapper.poll() is not None:
-                            assert wrapper.stderr is not None
-                            self.fail(wrapper.stderr.read())
-                        if time.monotonic() >= deadline:
-                            self.fail(
-                                "guarded payload did not become ready"
-                            )
-                        time.sleep(0.01)
                     child_pid, grandchild_pid = (
-                        int(value)
-                        for value in pid_path.read_text(
-                            encoding="utf-8"
-                        ).split()
+                        self._wait_for_ints(
+                            pid_path,
+                            2,
+                            "guarded payload did not become ready",
+                            wrapper,
+                        )
                     )
                     if mode == "sigkill":
                         wrapper.kill()
@@ -1015,19 +1026,13 @@ class TestWatchdogBehavior(unittest.TestCase):
             child_pid = None
             grandchild_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not pid_path.exists():
-                    if wrapper.poll() is not None:
-                        assert wrapper.stderr is not None
-                        self.fail(wrapper.stderr.read())
-                    if time.monotonic() >= deadline:
-                        self.fail("guarded payload did not become ready")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_path.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_path,
+                        2,
+                        "guarded payload did not become ready",
+                        wrapper,
+                    )
                 )
                 wrapper.wait(timeout=5)
             finally:
@@ -1090,16 +1095,12 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not ready_path.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("SIGTERM child did not become ready")
-                    time.sleep(0.01)
-                child_pid = int(
-                    ready_path.read_text(encoding="utf-8").strip()
-                )
+                child_pid = self._wait_for_ints(
+                    ready_path,
+                    1,
+                    "SIGTERM child did not become ready",
+                    wrapper,
+                )[0]
                 try:
                     wrapper.send_signal(signal.SIGTERM)
                     wrapper.wait(timeout=5)
@@ -1164,18 +1165,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not pid_file.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("leader process did not write child PIDs")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_file.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_file,
+                        2,
+                        "leader process did not write child PIDs",
+                        wrapper,
+                    )
                 )
                 try:
                     wrapper.wait(timeout=5)
@@ -1264,18 +1260,13 @@ class TestWatchdogBehavior(unittest.TestCase):
                     stderr=audit,
                     text=True,
                 )
-                deadline = time.monotonic() + 5
-                while not pid_file.exists():
-                    if time.monotonic() >= deadline:
-                        wrapper.kill()
-                        wrapper.wait(timeout=5)
-                        self.fail("soft-limit process group did not start")
-                    time.sleep(0.01)
                 child_pid, grandchild_pid = (
-                    int(value)
-                    for value in pid_file.read_text(
-                        encoding="utf-8"
-                    ).split()
+                    self._wait_for_ints(
+                        pid_file,
+                        2,
+                        "soft-limit process group did not start",
+                        wrapper,
+                    )
                 )
                 next_meminfo = root / "meminfo.next"
                 next_meminfo.write_text(
