@@ -18,7 +18,6 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
-#include <grp.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
@@ -127,6 +126,28 @@ options parse_options(int argc, char ** argv) {
 constexpr uint32_t DIAGNOSTIC_MAGIC = 0x44535634U;
 constexpr uint16_t DIAGNOSTIC_VERSION = 1;
 constexpr size_t DIAGNOSTIC_STAGE_CAPACITY = 48;
+
+int query_supplementary_group_count(int * error_number) noexcept {
+    errno = 0;
+    const int count = getgroups(0, nullptr);
+    *error_number = count < 0 ? errno : 0;
+    return count;
+}
+
+void require_zero_supplementary_groups(const char * context) {
+    int error_number = 0;
+    const int count = query_supplementary_group_count(&error_number);
+    if (count < 0) {
+        throw std::runtime_error(
+            std::string("cannot query ") + context + " supplementary groups: " +
+            std::strerror(error_number));
+    }
+    if (count != 0) {
+        throw std::runtime_error(
+            std::string(context) + " requires zero supplementary groups; found " +
+            std::to_string(count));
+    }
+}
 
 struct failure_diagnostic {
     uint32_t magic;
@@ -950,6 +971,11 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "target-mapping-close";
         errno = 0;
         close_checked(mapping_fd, "target mapping descriptor");
+        stage = "target-groups-verify";
+        int groups_error = 0;
+        if (query_supplementary_group_count(&groups_error) != 0) {
+            fail_stage(diagnostic_fd, stage, groups_error);
+        }
         stage = "target-privilege-drop";
         errno = 0;
         const int listener = drop_target_privileges();
@@ -1034,6 +1060,11 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "namespace-mapping-close";
         errno = 0;
         close_checked(mapping_fd, "namespace mapping descriptor");
+        stage = "namespace-groups-verify";
+        int groups_error = 0;
+        if (query_supplementary_group_count(&groups_error) != 0) {
+            fail_stage(diagnostic_fd, stage, groups_error);
+        }
         stage = "namespace-setresgid";
         errno = 0;
         if (setresgid(0, 0, 0) != 0) {
@@ -1080,11 +1111,6 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
         stage = "namespace-release-close";
         errno = 0;
         close_checked(release_fd, "namespace release descriptor");
-        stage = "namespace-setgroups";
-        errno = 0;
-        if (setgroups(0, nullptr) != 0) {
-            fail_stage(diagnostic_fd, stage, errno);
-        }
         int target_mapping_pipe[2] {-1, -1};
         int target_ready_pipe[2] {-1, -1};
         int target_security[2] {-1, -1};
@@ -1253,6 +1279,7 @@ int wait_for_isolated_target(namespace_owner & target, int listener) {
 }
 
 int run_linux_helper(options config) {
+    require_zero_supplementary_groups("containment launcher");
     require_initial_signal_state();
     set_parent_death(config.expected_parent);
     close_unneeded_fds(config.keep_fds, config.protocol_fd);
@@ -1435,6 +1462,11 @@ int main(int argc, char ** argv) {
             return 0;
         }
 #if defined(__linux__)
+        if (argc == 2 && std::strcmp(argv[1], "--check-launcher-groups") == 0) {
+            require_zero_supplementary_groups("containment launcher");
+            std::cout << "supplementary-groups=0\n";
+            return 0;
+        }
         return run_linux_helper(parse_options(argc, argv));
 #else
         (void) argc;
