@@ -1337,6 +1337,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    char architecture[128] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0) {
+        common_context_params_apply_arch_defaults(architecture, params, cparams);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1699,6 +1704,32 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.ple_cache_mb    = params.ple_cache_mb;
     mparams.expert_cache_slots = params.expert_cache_slots;
     mparams.expert_cache_bytes = params.expert_cache_mib > 0 ? (size_t) params.expert_cache_mib << 20 : 0;
+    mparams.dsv41_memory_soft_bytes = (uint64_t) params.dsv41_memory_soft_mib << 20;
+    mparams.dsv41_memory_watchdog_bytes = (uint64_t) params.dsv41_memory_watchdog_mib << 20;
+    mparams.dsv41_memory_hard_bytes = (uint64_t) params.dsv41_memory_hard_mib << 20;
+    mparams.dsv41_memory_safety_margin_bytes = (uint64_t) params.dsv41_memory_safety_margin_mib << 20;
+    const uint32_t dsv41_admission_sequences = params.n_parallel_explicit ?
+            std::max(params.n_parallel, 1) : 1;
+    mparams.dsv41_admission_context =
+            params.n_ctx_auto_sized && !params.n_parallel_explicit ?
+                std::max(params.kv_unified_per_slot, 1) :
+                (params.n_ctx == 0 ? 32768 : params.n_ctx);
+    mparams.dsv41_admission_batch = std::max(params.n_batch, 1);
+    mparams.dsv41_admission_sequences = dsv41_admission_sequences;
+    mparams.dsv41_admission_ubatch = std::min(
+            mparams.dsv41_admission_batch,
+            static_cast<uint32_t>(params.n_ubatch_explicit ? std::max(params.n_ubatch, 1) : 32));
+    mparams.dsv41_admission_outputs = params.n_outputs_max <= 0 ?
+            mparams.dsv41_admission_batch :
+            std::min<uint32_t>(params.n_outputs_max, mparams.dsv41_admission_batch);
+    mparams.dsv41_admission_outputs = std::max<uint32_t>(
+            mparams.dsv41_admission_outputs, dsv41_admission_sequences);
+    mparams.dsv41_admission_outputs_per_seq = params.n_outputs_max_per_seq == 0 ?
+            mparams.dsv41_admission_outputs :
+            std::min<uint32_t>(std::max(params.n_outputs_max_per_seq, 1), mparams.dsv41_admission_outputs);
+    mparams.dsv41_admission_type_k = params.cache_type_k;
+    mparams.dsv41_procfs_root = params.dsv41_procfs_root.c_str();
+    mparams.dsv41_admission_offload_kqv = !params.no_kv_offload;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1720,6 +1751,26 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
+}
+
+void common_context_params_apply_arch_defaults(
+        const char * architecture,
+        common_params & params,
+        llama_context_params & cparams) {
+    if (architecture == nullptr || strcmp(architecture, "deepseek41") != 0) {
+        return;
+    }
+    if (!params.n_parallel_explicit) {
+        params.n_parallel = 1;
+        cparams.n_seq_max = 1;
+        if (params.n_ctx_auto_sized) {
+            params.n_ctx = params.kv_unified_per_slot;
+            cparams.n_ctx = params.n_ctx;
+        }
+    }
+    if (!params.n_ubatch_explicit) {
+        cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 32);
+    }
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {

@@ -196,6 +196,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
+    llama_build_and_test(test-deepseek41-admission.cpp)
     llama_build_and_test(test-deepseek41-schema.cpp)
     llama_build_and_test(test-deepseek41-engram.cpp)
     llama_build_and_test(test-deepseek41-expert.cpp)
@@ -274,6 +275,17 @@ llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
+
+find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND)
+    llama_test_cmd(
+        ${Python3_EXECUTABLE}
+        NAME test-strix-memory-watchdog
+        LABEL python
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test_strix_memory_watchdog.py
+    )
+endif()
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

@@ -348,9 +348,23 @@ extern "C" {
         int32_t ple_io_threads; // parallel pread workers
         int32_t ple_cache_mb;   // in-memory cache of recently read rows, 0 disables
 
-        // DeepSeek V4.1 routed-expert cache. Both values must be non-zero.
+        // DeepSeek V4.1 routed-expert cache. Zero values auto-fit within admission.
         size_t  expert_cache_bytes;
         int32_t expert_cache_slots;
+
+        // DeepSeek V4.1 unified host-memory admission. Zero values use safe Strix defaults.
+        uint64_t dsv41_memory_soft_bytes;
+        uint64_t dsv41_memory_watchdog_bytes;
+        uint64_t dsv41_memory_hard_bytes;
+        uint64_t dsv41_memory_safety_margin_bytes;
+        uint32_t dsv41_admission_context;
+        uint32_t dsv41_admission_batch;
+        uint32_t dsv41_admission_sequences;
+        uint32_t dsv41_admission_ubatch;
+        uint32_t dsv41_admission_outputs;
+        uint32_t dsv41_admission_outputs_per_seq;
+        enum ggml_type dsv41_admission_type_k;
+        const char * dsv41_procfs_root;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
@@ -376,6 +390,7 @@ extern "C" {
         bool ple_on_disk;     // keep the n-gram hash-embedding table (per_layer_token_embd) on disk: never
                               // mapped or loaded, the rows a batch needs are read from the file (qwen4exp)
         bool ple_direct_io;   // read those rows with O_DIRECT, bypassing the page cache
+        bool dsv41_admission_offload_kqv;
     };
 
     struct llama_sampler_seq_config {
@@ -388,7 +403,7 @@ extern "C" {
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
-        uint32_t n_ubatch;              // physical maximum batch size
+        uint32_t n_ubatch;              // physical maximum batch size, UINT32_MAX = model default
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)

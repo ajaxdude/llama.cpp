@@ -2545,6 +2545,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_DEEPSEEK41:
             {
+                if (params.type_k != this->params.dsv41_admission_type_k ||
+                        cparams.offload_kqv != this->params.dsv41_admission_offload_kqv) {
+                    throw std::runtime_error(format(
+                            "DeepSeek V4.1 memory parameters differ from admission: "
+                            "type_k=%s, admitted_type_k=%s, offload_kqv=%s, admitted_offload_kqv=%s",
+                            ggml_type_name(params.type_k),
+                            ggml_type_name(this->params.dsv41_admission_type_k),
+                            cparams.offload_kqv ? "true" : "false",
+                            this->params.dsv41_admission_offload_kqv ? "true" : "false"));
+                }
                 const auto & model_dsv41 = static_cast<const llama_model_deepseek41 &>(*this);
                 res = new llama_memory_dsv41(
                         *this,
@@ -2847,6 +2857,18 @@ llama_model_params llama_model_default_params() {
         /*.ple_cache_mb                =*/ 256,
         /*.expert_cache_bytes          =*/ 0,
         /*.expert_cache_slots          =*/ 0,
+        /*.dsv41_memory_soft_bytes     =*/ 116ULL << 30,
+        /*.dsv41_memory_watchdog_bytes =*/ 118ULL << 30,
+        /*.dsv41_memory_hard_bytes     =*/ 120ULL << 30,
+        /*.dsv41_memory_safety_margin_bytes =*/ 2ULL << 30,
+        /*.dsv41_admission_context     =*/ 32768,
+        /*.dsv41_admission_batch       =*/ 2048,
+        /*.dsv41_admission_sequences   =*/ 1,
+        /*.dsv41_admission_ubatch      =*/ 32,
+        /*.dsv41_admission_outputs     =*/ 2048,
+        /*.dsv41_admission_outputs_per_seq =*/ 2048,
+        /*.dsv41_admission_type_k      =*/ GGML_TYPE_F16,
+        /*.dsv41_procfs_root           =*/ "/proc",
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2859,6 +2881,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mtp                    =*/ false,
         /*.ple_on_disk                 =*/ false,
         /*.ple_direct_io               =*/ true,
+        /*.dsv41_admission_offload_kqv =*/ true,
     };
 
     return result;

@@ -6,9 +6,10 @@
 
 #include <array>
 #include <cassert>
-#include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,30 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+void common_fit_context_params_apply_arch_defaults(
+        const char * architecture,
+        const llama_model_params & mparams,
+        llama_context_params & cparams) {
+    if (architecture == nullptr || strcmp(architecture, "deepseek41") != 0) {
+        return;
+    }
+
+    cparams.n_ctx = cparams.n_ctx == 0 ?
+            mparams.dsv41_admission_context :
+            std::min(cparams.n_ctx, mparams.dsv41_admission_context);
+    cparams.n_batch = std::min(cparams.n_batch, mparams.dsv41_admission_batch);
+    cparams.n_seq_max = std::min(cparams.n_seq_max, mparams.dsv41_admission_sequences);
+    cparams.n_ubatch = cparams.n_ubatch == 0 || cparams.n_ubatch == UINT32_MAX ?
+            mparams.dsv41_admission_ubatch :
+            std::min(cparams.n_ubatch, mparams.dsv41_admission_ubatch);
+    cparams.n_outputs_max = cparams.n_outputs_max == 0 ?
+            mparams.dsv41_admission_outputs :
+            std::min(cparams.n_outputs_max, mparams.dsv41_admission_outputs);
+    cparams.n_outputs_max_per_seq = cparams.n_outputs_max_per_seq == 0 ?
+            mparams.dsv41_admission_outputs_per_seq :
+            std::min(cparams.n_outputs_max_per_seq, mparams.dsv41_admission_outputs_per_seq);
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -62,7 +87,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context_params cparams_copy = *cparams;
+    char architecture[128] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0) {
+        common_fit_context_params_apply_arch_defaults(architecture, mparams_copy, cparams_copy);
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams_copy);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);

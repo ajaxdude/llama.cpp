@@ -14,6 +14,14 @@
 struct ggml_tensor;
 struct llama_model;
 
+uint64_t llama_dsv41_measure_model_state_bytes(
+        const llama_model & model,
+        ggml_type type_k,
+        bool offload,
+        uint32_t n_ctx,
+        uint32_t n_seq,
+        uint32_t n_ubatch);
+
 struct llama_dsv41_memory_config {
     uint32_t n_ctx = 0;
     uint32_t n_seq = 0;

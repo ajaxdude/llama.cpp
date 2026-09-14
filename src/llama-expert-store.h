@@ -14,6 +14,8 @@ enum llama_expert_projection {
     LLAMA_EXPERT_PROJECTION_DOWN,
 };
 
+static constexpr size_t LLAMA_EXPERT_STORE_DEFAULT_IO_ALIGNMENT = 4096;
+
 struct llama_expert_store_tensor {
     std::string             name;
     std::string             fname;
@@ -30,7 +32,7 @@ struct llama_expert_store_tensor {
 struct llama_expert_store_params {
     size_t cache_bytes = 0;
     size_t cache_slots = 0;
-    size_t io_alignment = 4096;
+    size_t io_alignment = LLAMA_EXPERT_STORE_DEFAULT_IO_ALIGNMENT;
     bool   direct_io = true;
     bool   allow_buffered_io = false; // opt-in only; page-cache bytes are outside cache_bytes
 };
