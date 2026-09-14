@@ -46,10 +46,12 @@ private:
 struct llama_mmap {
     // list of [first, last) byte ranges within a file
     using ranges = std::vector<std::pair<size_t, size_t>>;
+    using file_advice_override = int (*)(int fd, int advice);
 
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & excluded_ranges = {}, bool strict_exclusion = false);
+               const ranges & excluded_ranges = {}, bool strict_exclusion = false,
+               file_advice_override file_advice = nullptr);
     ~llama_mmap();
 
     size_t size() const;

@@ -485,7 +485,8 @@ struct llama_mmap::impl {
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
     impl(struct llama_file * file, size_t prefetch, bool numa,
-            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -493,13 +494,21 @@ struct llama_mmap::impl {
 #ifdef __linux__
         const bool sequential = llama_mmap::use_sequential_file_advice(strict_exclusion);
         const int file_advice = sequential ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM;
-        const int advice_error = posix_fadvise(fd, 0, 0, file_advice);
+        const int advice_error = file_advice_override ?
+                file_advice_override(fd, file_advice) : posix_fadvise(fd, 0, 0, file_advice);
         if (advice_error) {
+            if (strict_exclusion) {
+                throw std::runtime_error(format(
+                        "posix_fadvise(.., POSIX_FADV_RANDOM) failed for external tensor mapping: %s",
+                        strerror(advice_error)));
+            }
             LLAMA_LOG_WARN("warning: posix_fadvise(.., %s) failed: %s\n",
                     sequential ? "POSIX_FADV_SEQUENTIAL" : "POSIX_FADV_RANDOM", strerror(advice_error));
         }
         // MAP_POPULATE would fault in excluded ranges too
         if (prefetch && excluded_ranges.empty()) { flags |= MAP_POPULATE; }
+#else
+        GGML_UNUSED(file_advice_override);
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
@@ -595,8 +604,10 @@ struct llama_mmap::impl {
     HANDLE hMapping = nullptr;
 
     impl(struct llama_file * file, size_t prefetch, bool numa,
-            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(file_advice_override);
 
         size = file->size();
 
@@ -666,12 +677,14 @@ struct llama_mmap::impl {
     }
 #else
     impl(struct llama_file * file, size_t prefetch, bool numa,
-            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion) {
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(excluded_ranges);
         GGML_UNUSED(strict_exclusion);
+        GGML_UNUSED(file_advice_override);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -689,8 +702,8 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & excluded_ranges, bool strict_exclusion) :
-    pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges, strict_exclusion)) {}
+        const ranges & excluded_ranges, bool strict_exclusion, file_advice_override file_advice) :
+    pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges, strict_exclusion, file_advice)) {}
 llama_mmap::~llama_mmap() = default;
 
 bool llama_mmap::use_sequential_file_advice(bool strict_exclusion) {
