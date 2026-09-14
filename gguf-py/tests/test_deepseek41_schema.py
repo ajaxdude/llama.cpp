@@ -37,6 +37,13 @@ class TestDeepSeek41Schema(unittest.TestCase):
         self.assertNotIn(MODEL_TENSOR.HC_HEAD_BASE, tensors)
         self.assertNotIn(MODEL_TENSOR.HC_HEAD_SCALE, tensors)
 
+    def test_kv_a_norm_does_not_use_deepseek4_tensor_kind(self):
+        tensors = MODEL_TENSORS[MODEL_ARCH.DEEPSEEK41]
+
+        self.assertIn(MODEL_TENSOR.ATTN_KV_A_NORM, tensors)
+        self.assertNotIn(MODEL_TENSOR.ATTN_KV_NORM, tensors)
+        self.assertEqual(TENSOR_NAMES[MODEL_TENSOR.ATTN_KV_A_NORM].format(bid=14), "blk.14.attn_kv_a_norm")
+
 
 if __name__ == "__main__":
     unittest.main()
