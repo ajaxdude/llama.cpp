@@ -38,6 +38,7 @@ from trace_format import (
     TraceError,
     TraceVerifier,
     approval_binding,
+    approved_containment_helper_identity,
     approved_executable_identity,
     approved_runtime_file_identities,
     bind_execution_authorization,
@@ -82,6 +83,16 @@ class InvocationIntegrityError(PreflightError):
         super().__init__(message)
         self.primary_error = primary_error
         self.secondary_errors = tuple(secondary_errors)
+
+
+def exporter_install_trust_evidence(
+        exporter_identity: ExecutableFileReceipt,
+        runtime_identities: list[ExecutableFileReceipt],
+        exporter_policy: dict[str, Any]) -> dict[str, Any]:
+    helper_identity = approved_containment_helper_identity(
+        exporter_policy, label="ds4 exporter")
+    return install_trust_evidence(
+        exporter_identity, runtime_identities, (helper_identity,))
 
 
 def git_output(checkout: Path, *args: str) -> str:
@@ -593,8 +604,8 @@ def main() -> int:
         )
         runtime_identities = approved_runtime_file_identities(
             exporter_policy, label="ds4 exporter")
-        exporter_install_trust = install_trust_evidence(
-            exporter_identity, runtime_identities)
+        exporter_install_trust = exporter_install_trust_evidence(
+            exporter_identity, runtime_identities, exporter_policy)
         exporter_install_trust_sha256 = install_trust_sha256(exporter_install_trust)
         pre_runtime_build = query_runtime_build_attestation(
             exporter,

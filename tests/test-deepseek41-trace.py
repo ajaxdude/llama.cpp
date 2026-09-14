@@ -4368,6 +4368,43 @@ class TraceFormatTests(unittest.TestCase):
                 seen_run_ids=None,
             )
 
+    def test_ds4_install_trust_producer_binds_containment_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            policy, exporter = materialize_ds4_exporter_policy(Path(temp).resolve())
+            with isolated_test_install_trust():
+                exporter_identity = run_ds4.approved_executable_identity(
+                    exporter,
+                    install_root=policy["install_root"],
+                    expected_owner_uid=policy["install_owner_uid"],
+                    expected_path=policy["executable_path"],
+                    expected_sha256=policy["executable_sha256"],
+                    label="ds4 exporter",
+                )
+                runtime_identities = run_ds4.approved_runtime_file_identities(
+                    policy, label="ds4 exporter")
+                trust = run_ds4.exporter_install_trust_evidence(
+                    exporter_identity, runtime_identities, policy)
+                self.assertEqual(
+                    trace.validate_install_trust_evidence(trust, policy),
+                    trust,
+                )
+                self.assertIn(
+                    str(Path(policy["install_root"]) / "bin" / policy["containment_helper"]["filename"]),
+                    {item["path"] for item in trust["files"]},
+                )
+
+                omitted = trace.install_trust_evidence(
+                    exporter_identity, runtime_identities)
+                with self.assertRaisesRegex(
+                        trace.TraceError, "files differ from external approval"):
+                    trace.validate_install_trust_evidence(omitted, policy)
+
+                wrong_helper = copy.deepcopy(policy)
+                wrong_helper["containment_helper"]["sha256"] = "e" * 64
+                with self.assertRaisesRegex(run_ds4.TraceError, "SHA-256 differs"):
+                    run_ds4.exporter_install_trust_evidence(
+                        exporter_identity, runtime_identities, wrong_helper)
+
     def test_install_trust_evidence_rejects_mutability_claims(self) -> None:
         policy = fixture_prompt_builder_policy(b"prompt")
         mutations = {
