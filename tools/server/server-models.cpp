@@ -1550,11 +1550,11 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     }
                 };
                 if (result == "download_finished") {
+                    request_exit();
                     update_download_progress(name, {}, true, true);
-                    request_exit();
                 } else if (result == "download_failed") {
-                    update_download_progress(name, {}, true, false);
                     request_exit();
+                    update_download_progress(name, {}, true, false);
                 } else if (!url.empty()) {
                     common_download_progress p;
                     p.url        = url;
