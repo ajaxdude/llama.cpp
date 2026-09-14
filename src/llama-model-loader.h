@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -48,6 +49,19 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+        }
+
+        llama_tensor_weight(uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+            const int tensor_idx = gguf_find_tensor(gguf_ctx, ggml_get_name(tensor));
+            if (tensor_idx < 0) {
+                throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
+            }
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (data_offset > std::numeric_limits<size_t>::max() - tensor_offset) {
+                throw std::runtime_error(format("tensor '%s' offset overflows", ggml_get_name(tensor)));
+            }
+            offs = data_offset + tensor_offset;
         }
     };
 

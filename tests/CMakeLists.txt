@@ -200,9 +200,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-deepseek41-engram.cpp)
     llama_build_and_test(test-deepseek41-expert.cpp)
     llama_build_and_test(test-expert-store.cpp)
+    llama_build_and_test(test-deepseek41-memory.cpp)
     llama_build_and_test(test-deepseek41-runtime.cpp)
     llama_build_and_test(test-engram.cpp)
     llama_build(test-llama-archs.cpp)
+    llama_test(
+        test-llama-archs
+        NAME test-deepseek41-no-alloc
+        LABEL main
+        ARGS -a deepseek41 -s 1
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")

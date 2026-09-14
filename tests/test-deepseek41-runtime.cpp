@@ -1,5 +1,8 @@
 #include "../src/llama-dsv41.h"
+#include "../src/llama-arch.h"
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -13,6 +16,13 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+
+std::string llama_dsv41_graph_trace_name(const char * trace, uint32_t layer);
+ggml_tensor * llama_dsv41_graph_append_zero_row(ggml_context * ctx, ggml_tensor * tensor);
+ggml_tensor * llama_dsv41_graph_completion_zero(
+        ggml_context * ctx,
+        ggml_tensor * dependency,
+        ggml_type type);
 
 static void check(bool condition, const std::string & message) {
     if (!condition) {
@@ -111,8 +121,9 @@ static void test_hparams() {
     config.engram_primes_size = 24;
     expect_throw([&]() { llama_dsv41_validate_config(config); }, "truncated Engram prime table was accepted");
 
-    const std::string dependency_error = llama_dsv41_runtime_dependency_error();
-    check(dependency_error.find("routed-expert streaming") != std::string::npos, "dependency error omits expert streaming");
+    check(llm_arch_is_hybrid(LLM_ARCH_DEEPSEEK41), "DeepSeek V4.1 must use hybrid context handling");
+    check(!llm_arch_supports_rs_rollback(LLM_ARCH_DEEPSEEK41),
+          "DeepSeek V4.1 must not advertise partial rollback support");
 }
 
 static void test_source_maps() {
@@ -262,6 +273,148 @@ static void test_output_collapse() {
     check(std::abs(result[1] - 6.0f) < 1.0e-6f, "output collapse second value mismatch");
 }
 
+static void test_candidate_graph_selection(uint32_t n_visible, uint32_t n_candidate) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4*1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    check(ctx != nullptr, "failed to create candidate graph context");
+
+    ggml_tensor * scores = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, n_visible, 1);
+    std::fill_n(
+            static_cast<float *>(scores->data),
+            ggml_nelements(scores),
+            std::numeric_limits<float>::infinity());
+    ggml_tensor * block_scores = ggml_pool_1d(
+            ctx, scores, GGML_OP_POOL_MAX, 8, 8, 0);
+    ggml_tensor * final_blocks = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, 1, 1);
+    const int32_t final_block = (int32_t) block_scores->ne[0] - 1;
+    static_cast<int32_t *>(final_blocks->data)[0] = final_block;
+    ggml_tensor * candidate_blocks = llama_dsv41_build_candidate_blocks(
+            ctx, block_scores, final_blocks, n_candidate);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, candidate_blocks);
+    check(
+            ggml_graph_compute_with_ctx(ctx, gf, 1) == GGML_STATUS_SUCCESS,
+            "candidate selection graph execution failed");
+
+    const int32_t * ids = static_cast<const int32_t *>(candidate_blocks->data);
+    std::vector<int32_t> selected(ids, ids + n_candidate);
+    check(selected.front() == final_block, "final candidate block is not first");
+    check(std::count(selected.begin(), selected.end(), final_block) == 1,
+            "final candidate block was not retained exactly once");
+    std::vector<int32_t> unique = selected;
+    std::sort(unique.begin(), unique.end());
+    check(std::adjacent_find(unique.begin(), unique.end()) == unique.end(),
+            "candidate graph selected duplicate blocks");
+    check(std::all_of(unique.begin(), unique.end(), [&](int32_t block) {
+        return block >= 0 && block <= final_block;
+    }), "candidate graph selected an out-of-range block");
+
+    ggml_free(ctx);
+}
+
+static void test_graph_contract() {
+    enum stage {
+        STAGE_ENGRAM,
+        STAGE_ATTN_HC,
+        STAGE_CARRIED_PRE,
+        STAGE_ATTN,
+        STAGE_ATTN_POST,
+        STAGE_FFN_HC,
+        STAGE_ATTN_PRE,
+        STAGE_ROUTED_EXPERTS,
+        STAGE_SHARED_EXPERT,
+        STAGE_FFN_POST,
+        STAGE_CARRY_FFN_PRE,
+    };
+
+    const std::vector<stage> common = {
+        STAGE_ATTN_HC,
+        STAGE_CARRIED_PRE,
+        STAGE_ATTN,
+        STAGE_ATTN_POST,
+        STAGE_FFN_HC,
+        STAGE_ATTN_PRE,
+        STAGE_ROUTED_EXPERTS,
+        STAGE_SHARED_EXPERT,
+        STAGE_FFN_POST,
+        STAGE_CARRY_FFN_PRE,
+    };
+    uint32_t ratio_count[3] = {};
+    uint32_t kv_sources = 0;
+    uint32_t index_sources = 0;
+    uint32_t candidate_sources = 0;
+    std::vector<uint32_t> candidate_trace_layers;
+    for (uint32_t il = 0; il < LLAMA_DSV41_N_LAYER; ++il) {
+        std::vector<stage> stages = common;
+        if (il == 1 || il == 14) {
+            stages.insert(stages.begin(), STAGE_ENGRAM);
+            check(stages[0] == STAGE_ENGRAM && stages[1] == STAGE_ATTN_HC,
+                    "Engram must precede attention HC");
+        }
+        check(stages[stages.size() - 1] == STAGE_CARRY_FFN_PRE,
+                "FFN pre must be carried to the next layer");
+        check(stages[1 + (il == 1 || il == 14)] == STAGE_CARRIED_PRE,
+                "attention must collapse with carried pre");
+        check(stages[5 + (il == 1 || il == 14)] == STAGE_ATTN_PRE,
+                "FFN must collapse with current attention pre");
+        check(stages[7 + (il == 1 || il == 14)] == STAGE_SHARED_EXPERT,
+                "shared expert must be added after routed experts");
+
+        const uint32_t ratio = llama_dsv41_compress_ratio(il);
+        ratio_count[ratio]++;
+        kv_sources += llama_dsv41_kv_source_layer(il) == (int32_t) il;
+        index_sources += llama_dsv41_index_source_layer(il) == (int32_t) il;
+        candidate_sources += il == LLAMA_DSV41_CANDIDATE_SOURCE_LAYER;
+
+        check(
+                llama_dsv41_graph_trace_name("expert.ids", il) ==
+                    "dsv41.trace.expert.ids.l" + std::to_string(il),
+                "expert ID trace name is unstable");
+        check(
+                llama_dsv41_graph_trace_name("expert.weights", il) ==
+                    "dsv41.trace.expert.weights.l" + std::to_string(il),
+                "expert weight trace name is unstable");
+        check(
+                llama_dsv41_graph_trace_name("attn.source", il) ==
+                    "dsv41.trace.attn.source.l" + std::to_string(il),
+                "attention source trace name is unstable");
+        if (il > LLAMA_DSV41_CANDIDATE_SOURCE_LAYER &&
+                llama_dsv41_index_source_layer(il) == (int32_t) il) {
+            candidate_trace_layers.push_back(il);
+            check(
+                    llama_dsv41_graph_trace_name("attn.candidates", il) ==
+                        "dsv41.trace.attn.candidates.l" + std::to_string(il),
+                    "attention candidate trace name is unstable");
+        }
+    }
+    check(ratio_count[0] == 2 && ratio_count[1] == 20 && ratio_count[2] == 18,
+            "ratio 0/1/2 layer counts mismatch");
+    check(kv_sources == 4, "KV source ownership count mismatch");
+    check(index_sources == 8, "index source ownership count mismatch");
+    check(candidate_sources == 1, "candidate source ownership count mismatch");
+    check(candidate_trace_layers == std::vector<uint32_t>({ 24, 28, 32, 36 }),
+            "attention candidate trace layer coverage mismatch");
+    check(
+            llama_dsv41_graph_trace_name("attn.candidate_blocks", 20) ==
+                "dsv41.trace.attn.candidate_blocks.l20",
+            "candidate block trace name is unstable");
+    check(
+            llama_dsv41_graph_trace_name("engram.row_ids", 1) ==
+                "dsv41.trace.engram.row_ids.l1" &&
+            llama_dsv41_graph_trace_name("engram.row_ids", 14) ==
+                "dsv41.trace.engram.row_ids.l14",
+            "Engram row trace names are unstable");
+    check(llama_dsv41_build_layer_plan(39, { 39 }, 1024).collapses_output,
+            "final layer must preserve streams for carried-pre output collapse");
+}
+
 static void test_graph_construction() {
     ggml_init_params params = {
         /*.mem_size   =*/ 4*1024*1024,
@@ -298,6 +451,131 @@ static void test_graph_construction() {
     const float * ordered = static_cast<const float *>(ordered_probs->data);
     check(ordered[0] < ordered[1] && ordered[1] < ordered[2], "shared-softmax segment order mismatch");
 
+    ggml_tensor * f16_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 32, 1);
+    std::vector<float> cache_values(32, 1.0f);
+    ggml_fp32_to_fp16_row(
+            cache_values.data(),
+            static_cast<ggml_fp16_t *>(f16_cache->data),
+            cache_values.size());
+    ggml_tensor * cache_with_sentinel =
+        llama_dsv41_graph_append_zero_row(ctx, f16_cache);
+    ggml_tensor * sentinel_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    static_cast<int32_t *>(sentinel_ids->data)[0] = 1;
+    static_cast<int32_t *>(sentinel_ids->data)[1] = 0;
+    ggml_tensor * sentinel_rows = ggml_get_rows(ctx, cache_with_sentinel, sentinel_ids);
+    ggml_tensor * completion_zero =
+        llama_dsv41_graph_completion_zero(ctx, sentinel_rows, GGML_TYPE_F16);
+    ggml_cgraph * support_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(support_gf, sentinel_rows);
+    ggml_build_forward_expand(support_gf, completion_zero);
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    check(backend != nullptr, "failed to create graph support backend");
+    for (int i = 0; i < ggml_graph_n_nodes(support_gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(support_gf, i);
+        if (node->op == GGML_OP_SCALE) {
+            check(node->src[0]->type == GGML_TYPE_F32,
+                  "DeepSeek V4.1 graph contains a non-F32 SCALE input");
+        }
+        check(ggml_backend_supports_op(backend, node),
+              "CPU backend does not support a DeepSeek V4.1 dependency node");
+    }
+    ggml_backend_free(backend);
+    check(cache_with_sentinel->ne[1] == 2,
+          "compressed cache sentinel row was not allocated");
+    check(ggml_graph_compute_with_ctx(ctx, support_gf, 1) == GGML_STATUS_SUCCESS,
+          "compressed sentinel graph execution failed");
+    for (uint32_t i = 0; i < 32; ++i) {
+        check(ggml_get_f32_1d(sentinel_rows, i) == 0.0f,
+              "compressed sentinel row is not zero");
+        check(ggml_get_f32_1d(sentinel_rows, 32 + i) == 1.0f,
+              "compressed real row changed");
+    }
+
+    ggml_tensor * prior_ring = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, 1, 2);
+    ggml_tensor * current_k = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, 1, 1);
+    ggml_tensor * read_idx = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * write_idx = ggml_new_tensor_1d(
+            ctx, GGML_TYPE_I64, 1);
+    static_cast<float *>(prior_ring->data)[0] = 10.0f;
+    static_cast<float *>(prior_ring->data)[1] = 20.0f;
+    static_cast<float *>(current_k->data)[0] = 30.0f;
+    static_cast<int32_t *>(read_idx->data)[0] = 0;
+    static_cast<int64_t *>(write_idx->data)[0] = 0;
+    ggml_tensor * prior_read = ggml_get_rows(
+            ctx, prior_ring, read_idx);
+    ggml_tensor * attention = ggml_add(
+            ctx, prior_read, current_k);
+    ggml_tensor * completion = ggml_argsort_top_k(
+            ctx, ggml_view_1d(ctx, attention, 1, 0), 1);
+    completion = ggml_scale(
+            ctx, ggml_cast(ctx, completion, GGML_TYPE_F32), 0.0f);
+    ggml_tensor * delayed_k = ggml_add(
+            ctx, current_k, completion);
+    ggml_tensor * ring_update = ggml_set_rows(
+            ctx, prior_ring, delayed_k, write_idx);
+    ggml_cgraph * ring_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(ring_gf, ring_update);
+    check(
+            ggml_graph_compute_with_ctx(ctx, ring_gf, 1) ==
+                GGML_STATUS_SUCCESS,
+            "ordered raw-ring update graph execution failed");
+    check(
+            static_cast<float *>(attention->data)[0] == 40.0f &&
+            static_cast<float *>(prior_ring->data)[0] == 30.0f,
+            "raw-ring write did not wait for the prior-ring read");
+
+    ggml_tensor * selected_ids = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, 3, 2);
+    const int32_t selected_values[] = { 5, 1, 3, 4, 0, 2 };
+    std::memcpy(selected_ids->data, selected_values, sizeof(selected_values));
+    ggml_tensor * selected_order = ggml_argsort(
+            ctx, ggml_cast(ctx, selected_ids, GGML_TYPE_F32),
+            GGML_SORT_ORDER_ASC);
+    ggml_tensor * selected_sorted = ggml_get_rows(
+            ctx, ggml_reshape_3d(ctx, selected_ids, 1, 3, 2),
+            selected_order);
+    selected_sorted = ggml_cont(
+            ctx, ggml_reshape_2d(ctx, selected_sorted, 3, 2));
+    ggml_tensor * routing_probs = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, 6, 2);
+    const float routing_values[] = {
+        10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+        20.0f, 21.0f, 22.0f, 23.0f, 24.0f, 25.0f,
+    };
+    std::memcpy(
+            routing_probs->data, routing_values,
+            sizeof(routing_values));
+    ggml_tensor * selected_weights = ggml_get_rows(
+            ctx,
+            ggml_reshape_3d(ctx, routing_probs, 1, 6, 2),
+            selected_sorted);
+    selected_weights = ggml_cont(
+            ctx, ggml_reshape_2d(ctx, selected_weights, 3, 2));
+    ggml_cgraph * selected_gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(selected_gf, selected_sorted);
+    ggml_build_forward_expand(selected_gf, selected_weights);
+    check(
+            ggml_graph_compute_with_ctx(ctx, selected_gf, 1) ==
+                GGML_STATUS_SUCCESS,
+            "selected ID ordering graph execution failed");
+    const int32_t selected_expected[] = { 1, 3, 5, 0, 2, 4 };
+    check(
+            std::memcmp(
+                selected_sorted->data, selected_expected,
+                sizeof(selected_expected)) == 0,
+            "selected IDs are not accumulated in original ID order");
+    const float selected_weight_expected[] = {
+        11.0f, 13.0f, 15.0f, 20.0f, 22.0f, 24.0f,
+    };
+    check(
+            std::memcmp(
+                selected_weights->data, selected_weight_expected,
+                sizeof(selected_weight_expected)) == 0,
+            "routing weights are not paired with sorted original IDs");
+
     ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 4, 2);
     ggml_tensor * pre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 2);
     ggml_tensor * collapsed = llama_dsv41_build_output_collapse(ctx, residual, pre, 32, 4, 2);
@@ -309,6 +587,18 @@ static void test_graph_construction() {
     ggml_tensor * logits = llama_dsv41_build_output(ctx, residual, pre, output_norm, output, 1.0e-20f, 4);
     check(logits->ne[0] == 64 && logits->ne[1] == 2, "final output graph shape mismatch");
 
+    ggml_tensor * original_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 6, 2);
+    ggml_tensor * slot_ids = ggml_cont(ctx, original_ids);
+    check(ggml_is_contiguous(original_ids), "original expert IDs must be contiguous");
+    check(ggml_is_contiguous(slot_ids) && slot_ids != original_ids,
+            "slot IDs must be a distinct contiguous remap");
+
+    ggml_tensor * routed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+    ggml_tensor * shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+    ggml_tensor * combined = ggml_add(ctx, routed, shared);
+    check(combined->src[0] == routed && combined->src[1] == shared,
+            "shared expert output is not added to routed output");
+
     ggml_tensor * exec_residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 4, 1);
     ggml_tensor * exec_pre = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
     ggml_tensor * exec_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 32);
@@ -317,10 +607,30 @@ static void test_graph_construction() {
     std::fill_n(static_cast<float *>(exec_pre->data), ggml_nelements(exec_pre), 0.25f);
     std::fill_n(static_cast<float *>(exec_norm->data), ggml_nelements(exec_norm), 1.0f);
     std::fill_n(static_cast<float *>(exec_output->data), ggml_nelements(exec_output), 1.0f);
-    ggml_tensor * exec_logits = llama_dsv41_build_output(
-            ctx, exec_residual, exec_pre, exec_norm, exec_output, 1.0e-20f, 4);
+    ggml_tensor * exec_collapse = llama_dsv41_build_output_collapse(
+            ctx, exec_residual, exec_pre, 32, 4, 1);
+    ggml_tensor * exec_norm_input = llama_dsv41_build_output_norm_input(
+            ctx, exec_collapse);
+    check(exec_collapse->type == GGML_TYPE_BF16,
+            "production output collapse is not BF16");
+    check(exec_norm_input->type == GGML_TYPE_F32,
+            "production output RMSNorm input is not F32");
+    ggml_tensor * exec_normalized = ggml_rms_norm(
+            ctx, exec_norm_input, 1.0e-20f);
+    check(exec_normalized->src[0] == exec_norm_input,
+            "production RMSNorm does not consume the F32 collapse");
+    exec_normalized = ggml_mul(ctx, exec_normalized, exec_norm);
+    ggml_tensor * exec_logits = ggml_mul_mat(
+            ctx, exec_output, exec_normalized);
     ggml_cgraph * exec_gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(exec_gf, exec_logits);
+    ggml_backend_t exec_backend = ggml_backend_cpu_init();
+    check(exec_backend != nullptr, "failed to create output graph CPU backend");
+    for (int i = 0; i < ggml_graph_n_nodes(exec_gf); ++i) {
+        check(ggml_backend_supports_op(exec_backend, ggml_graph_node(exec_gf, i)),
+                "CPU backend does not support the production output graph");
+    }
+    ggml_backend_free(exec_backend);
     check(ggml_graph_compute_with_ctx(ctx, exec_gf, 1) == GGML_STATUS_SUCCESS, "final output graph execution failed");
     const float * exec_values = static_cast<const float *>(exec_logits->data);
     check(std::isfinite(exec_values[0]) && std::isfinite(exec_values[1]), "final output graph produced non-finite logits");
@@ -338,6 +648,10 @@ int main() {
     test_raw_ring();
     test_candidates();
     test_output_collapse();
+    test_candidate_graph_selection(24, 1);
+    test_candidate_graph_selection(24, 2);
+    test_candidate_graph_selection(16392, 2048);
+    test_graph_contract();
     test_graph_construction();
     return 0;
 }
