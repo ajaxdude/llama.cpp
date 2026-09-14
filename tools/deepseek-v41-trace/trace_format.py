@@ -1216,6 +1216,7 @@ def _start_linux_native_helper_process(
             helper_argv,
             os.environ if environment is None else environment,
             file_actions=file_actions,
+            setsid=True,
             setsigmask=_all_catchable_signals(),
             setsigdef=_all_catchable_signals(),
         )

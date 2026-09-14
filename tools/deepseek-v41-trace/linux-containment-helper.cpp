@@ -3,6 +3,7 @@
 #endif
 
 #include <cerrno>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -16,14 +17,23 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <grp.h>
+#include <linux/audit.h>
+#include <linux/capability.h>
+#include <linux/filter.h>
 #include <linux/sched.h>
+#include <linux/seccomp.h>
+#include <linux/securebits.h>
 #include <sched.h>
 #include <poll.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -35,6 +45,15 @@
 #endif
 #if !defined(SYS_pidfd_open)
 #define SYS_pidfd_open 434
+#endif
+#if !defined(SYS_seccomp)
+#define SYS_seccomp 317
+#endif
+#if !defined(SECCOMP_RET_KILL_PROCESS)
+#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
+#endif
+#if !defined(PR_SET_PTRACER)
+#define PR_SET_PTRACER 0x59616d61
 #endif
 
 extern char ** environ;
@@ -188,6 +207,14 @@ void set_parent_death(pid_t expected_parent) {
     }
 }
 
+void require_parent_death(pid_t expected_parent) {
+    int parent_signal = 0;
+    if (prctl(PR_GET_PDEATHSIG, &parent_signal) != 0 ||
+            parent_signal != SIGKILL || getppid() != expected_parent) {
+        throw std::runtime_error("containment parent-death binding changed");
+    }
+}
+
 void write_all(int fd, const void * data, size_t size) {
     const char * cursor = static_cast<const char *>(data);
     while (size > 0) {
@@ -228,9 +255,9 @@ void send_packet(int fd, const char * packet) {
     }
 }
 
-void send_pidfd(int fd, int pidfd) {
-    char payload[] = "PREPARED";
-    iovec vector {payload, sizeof(payload) - 1};
+void send_descriptor(int fd, const char * packet, int descriptor) {
+    const size_t packet_size = std::strlen(packet);
+    iovec vector {const_cast<char *>(packet), packet_size};
     alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] {};
     msghdr message {};
     message.msg_iov = &vector;
@@ -241,10 +268,44 @@ void send_pidfd(int fd, int pidfd) {
     header->cmsg_level = SOL_SOCKET;
     header->cmsg_type = SCM_RIGHTS;
     header->cmsg_len = CMSG_LEN(sizeof(int));
-    std::memcpy(CMSG_DATA(header), &pidfd, sizeof(pidfd));
-    if (sendmsg(fd, &message, MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(payload) - 1)) {
-        throw std::runtime_error("cannot send namespace pidfd");
+    std::memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
+    if (sendmsg(fd, &message, MSG_NOSIGNAL) != static_cast<ssize_t>(packet_size)) {
+        throw std::runtime_error("cannot send containment descriptor");
     }
+}
+
+int receive_descriptor(int fd, const char * expected_packet) {
+    char payload[32] {};
+    iovec vector {payload, sizeof(payload)};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] {};
+    msghdr message {};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    const ssize_t size = recvmsg(fd, &message, 0);
+    if (size != static_cast<ssize_t>(std::strlen(expected_packet)) ||
+            std::memcmp(payload, expected_packet, static_cast<size_t>(size)) != 0 ||
+            (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+        throw std::runtime_error("containment descriptor packet is invalid");
+    }
+    cmsghdr * header = CMSG_FIRSTHDR(&message);
+    if (header == nullptr ||
+            header->cmsg_level != SOL_SOCKET ||
+            header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len != CMSG_LEN(sizeof(int)) ||
+            CMSG_NXTHDR(&message, header) != nullptr) {
+        throw std::runtime_error("containment descriptor rights are invalid");
+    }
+    int descriptor = -1;
+    std::memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
+    if (descriptor < 0 || fcntl(descriptor, F_SETFD, FD_CLOEXEC) != 0) {
+        if (descriptor >= 0) {
+            close(descriptor);
+        }
+        throw std::runtime_error("cannot retain containment descriptor");
+    }
+    return descriptor;
 }
 
 bool pidfd_has_exited(int pidfd) {
@@ -264,6 +325,389 @@ int wait_status_exit_code(int status) {
         return 128 + WTERMSIG(status);
     }
     return 125;
+}
+
+void make_isolated_session() {
+    if (setsid() < 0 || getsid(0) != getpid() || getpgrp() != getpid()) {
+        throw std::runtime_error("cannot isolate containment session");
+    }
+}
+
+void protect_namespace_init() {
+    make_isolated_session();
+    if (prctl(PR_SET_DUMPABLE, 0) != 0 ||
+            prctl(PR_SET_PTRACER, 0) != 0 ||
+            prctl(PR_GET_DUMPABLE) != 0) {
+        throw std::runtime_error("cannot protect target namespace init");
+    }
+    require_parent_death(0);
+}
+
+int read_cap_last_cap() {
+    const int fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        throw std::runtime_error("cannot open kernel capability limit");
+    }
+    char buffer[32] {};
+    const ssize_t size = read(fd, buffer, sizeof(buffer) - 1);
+    const int saved_errno = errno;
+    close_checked(fd, "kernel capability limit descriptor");
+    if (size <= 0) {
+        errno = saved_errno;
+        throw std::runtime_error("cannot read kernel capability limit");
+    }
+    char * end = nullptr;
+    errno = 0;
+    const long result = std::strtol(buffer, &end, 10);
+    if (errno != 0 || end == buffer || (*end != '\n' && *end != '\0') ||
+            result < 0 || result > 63) {
+        throw std::runtime_error("kernel capability limit is invalid");
+    }
+    return static_cast<int>(result);
+}
+
+uint32_t seccomp_audit_arch() {
+#if defined(__x86_64__)
+    return AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+    return AUDIT_ARCH_AARCH64;
+#else
+#error "Unsupported Linux architecture for DeepSeek V4.1 containment"
+#endif
+}
+
+void filter_statement(std::vector<sock_filter> & filter, uint16_t code, uint32_t value) {
+    filter.push_back(sock_filter {code, 0, 0, value});
+}
+
+void filter_jump(
+        std::vector<sock_filter> & filter,
+        uint16_t code,
+        uint32_t value,
+        uint8_t on_true,
+        uint8_t on_false) {
+    filter.push_back(sock_filter {code, on_true, on_false, value});
+}
+
+void filter_pid_argument(
+        std::vector<sock_filter> & filter,
+        int syscall_number,
+        unsigned argument,
+        uint32_t denied_result) {
+    filter_statement(filter, BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr));
+    filter_jump(filter, BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(syscall_number), 0, 4);
+    filter_statement(
+        filter,
+        BPF_LD | BPF_W | BPF_ABS,
+        static_cast<uint32_t>(offsetof(seccomp_data, args) + argument * sizeof(uint64_t)));
+    filter_jump(filter, BPF_JMP | BPF_JGE | BPF_K, 0x80000000U, 1, 0);
+    filter_jump(filter, BPF_JMP | BPF_JGT | BPF_K, 1, 1, 0);
+    filter_statement(filter, BPF_RET | BPF_K, denied_result);
+}
+
+int install_target_seccomp_listener() {
+    std::vector<int> denied_syscalls;
+#define DSV41_DENY_SYSCALL(name) denied_syscalls.push_back(__NR_##name)
+#if defined(__NR_ptrace)
+    DSV41_DENY_SYSCALL(ptrace);
+#endif
+#if defined(__NR_process_vm_readv)
+    DSV41_DENY_SYSCALL(process_vm_readv);
+#endif
+#if defined(__NR_process_vm_writev)
+    DSV41_DENY_SYSCALL(process_vm_writev);
+#endif
+#if defined(__NR_pidfd_send_signal)
+    DSV41_DENY_SYSCALL(pidfd_send_signal);
+#endif
+#if defined(__NR_setuid)
+    DSV41_DENY_SYSCALL(setuid);
+#endif
+#if defined(__NR_setgid)
+    DSV41_DENY_SYSCALL(setgid);
+#endif
+#if defined(__NR_setreuid)
+    DSV41_DENY_SYSCALL(setreuid);
+#endif
+#if defined(__NR_setregid)
+    DSV41_DENY_SYSCALL(setregid);
+#endif
+#if defined(__NR_setresuid)
+    DSV41_DENY_SYSCALL(setresuid);
+#endif
+#if defined(__NR_setresgid)
+    DSV41_DENY_SYSCALL(setresgid);
+#endif
+#if defined(__NR_setfsuid)
+    DSV41_DENY_SYSCALL(setfsuid);
+#endif
+#if defined(__NR_setfsgid)
+    DSV41_DENY_SYSCALL(setfsgid);
+#endif
+#if defined(__NR_setgroups)
+    DSV41_DENY_SYSCALL(setgroups);
+#endif
+#if defined(__NR_capset)
+    DSV41_DENY_SYSCALL(capset);
+#endif
+#if defined(__NR_setpgid)
+    DSV41_DENY_SYSCALL(setpgid);
+#endif
+#if defined(__NR_setsid)
+    DSV41_DENY_SYSCALL(setsid);
+#endif
+#if defined(__NR_setns)
+    DSV41_DENY_SYSCALL(setns);
+#endif
+#if defined(__NR_unshare)
+    DSV41_DENY_SYSCALL(unshare);
+#endif
+#undef DSV41_DENY_SYSCALL
+
+    const int denied_prctl[] = {
+        PR_SET_PDEATHSIG,
+        PR_SET_DUMPABLE,
+        PR_SET_PTRACER,
+        PR_SET_SECUREBITS,
+        PR_SET_NO_NEW_PRIVS,
+        PR_CAPBSET_DROP,
+        PR_CAP_AMBIENT,
+    };
+    constexpr uint32_t denied_result = SECCOMP_RET_USER_NOTIF;
+    std::vector<sock_filter> filter;
+    filter_statement(filter, BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch));
+    filter_jump(filter, BPF_JMP | BPF_JEQ | BPF_K, seccomp_audit_arch(), 1, 0);
+    filter_statement(filter, BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+#if defined(__NR_kill)
+    filter_pid_argument(filter, __NR_kill, 0, denied_result);
+#endif
+#if defined(__NR_tkill)
+    filter_pid_argument(filter, __NR_tkill, 0, denied_result);
+#endif
+#if defined(__NR_tgkill)
+    filter_pid_argument(filter, __NR_tgkill, 0, denied_result);
+    filter_pid_argument(filter, __NR_tgkill, 1, denied_result);
+#endif
+#if defined(__NR_rt_sigqueueinfo)
+    filter_pid_argument(filter, __NR_rt_sigqueueinfo, 0, denied_result);
+#endif
+#if defined(__NR_rt_tgsigqueueinfo)
+    filter_pid_argument(filter, __NR_rt_tgsigqueueinfo, 0, denied_result);
+    filter_pid_argument(filter, __NR_rt_tgsigqueueinfo, 1, denied_result);
+#endif
+    filter_statement(filter, BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr));
+    filter_jump(
+        filter,
+        BPF_JMP | BPF_JEQ | BPF_K,
+        __NR_prctl,
+        0,
+        static_cast<uint8_t>(2 + 2 * (sizeof(denied_prctl) / sizeof(denied_prctl[0]))));
+    filter_statement(filter, BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args));
+    for (int operation : denied_prctl) {
+        filter_jump(filter, BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(operation), 0, 1);
+        filter_statement(filter, BPF_RET | BPF_K, denied_result);
+    }
+    filter_statement(filter, BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    filter_statement(filter, BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr));
+    for (int syscall_number : denied_syscalls) {
+        filter_jump(filter, BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(syscall_number), 0, 1);
+        filter_statement(filter, BPF_RET | BPF_K, denied_result);
+    }
+    filter_statement(filter, BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    if (filter.size() > std::numeric_limits<unsigned short>::max()) {
+        throw std::runtime_error("target seccomp filter is too large");
+    }
+    sock_fprog program {
+        static_cast<unsigned short>(filter.size()),
+        filter.data(),
+    };
+    const int listener = static_cast<int>(
+        syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, &program));
+    if (listener < 0 || fcntl(listener, F_SETFD, FD_CLOEXEC) != 0) {
+        if (listener >= 0) {
+            close(listener);
+        }
+        throw std::runtime_error("cannot install target seccomp filter");
+    }
+    return listener;
+}
+
+void require_eperm(long result, const char * label) {
+    if (result != -1 || errno != EPERM) {
+        throw std::runtime_error(std::string("target isolation did not deny ") + label);
+    }
+}
+
+int drop_target_privileges() {
+    constexpr uid_t target_uid = 65534;
+    constexpr gid_t target_gid = 65534;
+    constexpr unsigned long securebits =
+        SECBIT_NOROOT |
+        SECBIT_NOROOT_LOCKED |
+        SECBIT_NO_SETUID_FIXUP |
+        SECBIT_NO_SETUID_FIXUP_LOCKED |
+        SECBIT_KEEP_CAPS_LOCKED |
+        SECBIT_NO_CAP_AMBIENT_RAISE |
+        SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const int cap_last_cap = read_cap_last_cap();
+    if (prctl(PR_SET_SECUREBITS, securebits) != 0 ||
+            setresgid(target_gid, target_gid, target_gid) != 0 ||
+            setresuid(target_uid, target_uid, target_uid) != 0) {
+        throw std::runtime_error("cannot enter target non-root credentials");
+    }
+    for (int capability = 0; capability <= cap_last_cap; ++capability) {
+        if (prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0) {
+            throw std::runtime_error("cannot drop target capability bounding set");
+        }
+    }
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0) {
+        throw std::runtime_error("cannot clear target ambient capabilities");
+    }
+    __user_cap_header_struct header {};
+    header.version = _LINUX_CAPABILITY_VERSION_3;
+    __user_cap_data_struct data[2] {};
+    if (syscall(SYS_capset, &header, data) != 0 ||
+            prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        throw std::runtime_error("cannot clear target capabilities");
+    }
+    __user_cap_data_struct verified[2] {};
+    if (syscall(SYS_capget, &header, verified) != 0) {
+        throw std::runtime_error("cannot verify target capabilities");
+    }
+    for (const __user_cap_data_struct & entry : verified) {
+        if (entry.effective != 0 || entry.permitted != 0 || entry.inheritable != 0) {
+            throw std::runtime_error("target capability sets are not empty");
+        }
+    }
+    for (int capability = 0; capability <= cap_last_cap; ++capability) {
+        if (prctl(PR_CAPBSET_READ, capability, 0, 0, 0) != 0 ||
+                prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, capability, 0, 0) != 0) {
+            throw std::runtime_error("target retained a bounded or ambient capability");
+        }
+    }
+    if (getuid() != target_uid || geteuid() != target_uid ||
+            getgid() != target_gid || getegid() != target_gid ||
+            getgroups(0, nullptr) != 0 ||
+            prctl(PR_GET_SECUREBITS) != static_cast<int>(securebits) ||
+            prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1 ||
+            getsid(0) != getpid() || getpgrp() != getpid()) {
+        throw std::runtime_error("target privilege isolation verification failed");
+    }
+    const int listener = install_target_seccomp_listener();
+    if (prctl(PR_GET_SECCOMP, 0, 0, 0, 0) != SECCOMP_MODE_FILTER) {
+        close(listener);
+        throw std::runtime_error("target seccomp verification failed");
+    }
+    return listener;
+}
+
+void verify_target_attack_denials() {
+    errno = 0;
+    require_eperm(syscall(SYS_ptrace, PTRACE_ATTACH, 1, nullptr, nullptr), "ptrace");
+#if defined(SYS_process_vm_readv)
+    errno = 0;
+    require_eperm(syscall(SYS_process_vm_readv, 1, nullptr, 0, nullptr, 0, 0), "process_vm_readv");
+#endif
+#if defined(SYS_process_vm_writev)
+    errno = 0;
+    require_eperm(syscall(SYS_process_vm_writev, 1, nullptr, 0, nullptr, 0, 0), "process_vm_writev");
+#endif
+    errno = 0;
+    require_eperm(kill(1, SIGSTOP), "namespace init signaling");
+    errno = 0;
+    require_eperm(kill(-getpgrp(), 0), "process-group signaling");
+    if (kill(getpid(), 0) != 0) {
+        throw std::runtime_error("target isolation blocked local signaling");
+    }
+    errno = 0;
+    require_eperm(prctl(PR_SET_PDEATHSIG, 0), "parent-death mutation");
+    errno = 0;
+    require_eperm(setresuid(0, 0, 0), "UID regain");
+    errno = 0;
+    require_eperm(setpgid(0, 0), "process-group mutation");
+    errno = 0;
+    require_eperm(setsid(), "session mutation");
+    __user_cap_header_struct header {};
+    header.version = _LINUX_CAPABILITY_VERSION_3;
+    __user_cap_data_struct data[2] {};
+    errno = 0;
+    require_eperm(syscall(SYS_capset, &header, data), "capability regain");
+}
+
+struct seccomp_notification {
+    bool present;
+    uint64_t id;
+    seccomp_data data;
+};
+
+seccomp_notification receive_seccomp_notification(int listener, bool nonblocking) {
+    seccomp_notif_sizes sizes {};
+    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != 0 ||
+            sizes.seccomp_notif < sizeof(seccomp_notif) ||
+            sizes.seccomp_notif_resp < sizeof(seccomp_notif_resp)) {
+        throw std::runtime_error("cannot query target seccomp notification sizes");
+    }
+    std::vector<uint64_t> request_buffer(
+        (sizes.seccomp_notif + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    seccomp_notif * request = reinterpret_cast<seccomp_notif *>(request_buffer.data());
+    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV, request) != 0) {
+        if (nonblocking && (errno == EAGAIN || errno == ENOENT)) {
+            return seccomp_notification {false, 0, {}};
+        }
+        throw std::runtime_error("cannot receive target seccomp notification");
+    }
+    if (request->flags != 0 ||
+            ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &request->id) != 0) {
+        throw std::runtime_error("target seccomp notification identity is invalid");
+    }
+    return seccomp_notification {true, request->id, request->data};
+}
+
+void deny_seccomp_notification(int listener, const seccomp_notification & notification) {
+    seccomp_notif_resp response {};
+    response.id = notification.id;
+    response.error = -EPERM;
+    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND, &response) != 0) {
+        throw std::runtime_error("cannot deny target seccomp notification");
+    }
+}
+
+seccomp_notification expect_seccomp_notification(
+        int listener,
+        int syscall_number,
+        const char * label) {
+    const seccomp_notification notification = receive_seccomp_notification(listener, false);
+    if (!notification.present || notification.data.nr != syscall_number) {
+        throw std::runtime_error(std::string("unexpected target isolation probe: ") + label);
+    }
+    deny_seccomp_notification(listener, notification);
+    return notification;
+}
+
+void verify_target_isolation_probes(int listener) {
+    expect_seccomp_notification(listener, SYS_ptrace, "ptrace");
+#if defined(SYS_process_vm_readv)
+    expect_seccomp_notification(listener, SYS_process_vm_readv, "process_vm_readv");
+#endif
+#if defined(SYS_process_vm_writev)
+    expect_seccomp_notification(listener, SYS_process_vm_writev, "process_vm_writev");
+#endif
+    seccomp_notification notification = expect_seccomp_notification(listener, SYS_kill, "PID 1 signaling");
+    if (notification.data.args[0] != 1 || notification.data.args[1] != SIGSTOP) {
+        throw std::runtime_error("target PID 1 signal probe is invalid");
+    }
+    notification = expect_seccomp_notification(listener, SYS_kill, "process-group signaling");
+    if (static_cast<int64_t>(notification.data.args[0]) >= 0) {
+        throw std::runtime_error("target process-group signal probe is invalid");
+    }
+    notification = expect_seccomp_notification(listener, SYS_prctl, "parent-death mutation");
+    if (notification.data.args[0] != PR_SET_PDEATHSIG) {
+        throw std::runtime_error("target parent-death probe is invalid");
+    }
+    expect_seccomp_notification(listener, SYS_setresuid, "UID regain");
+    expect_seccomp_notification(listener, SYS_setpgid, "process-group mutation");
+    expect_seccomp_notification(listener, SYS_setsid, "session mutation");
+    expect_seccomp_notification(listener, SYS_capset, "capability regain");
 }
 
 class namespace_owner {
@@ -314,6 +758,79 @@ private:
     bool reaped_ = false;
 };
 
+int wait_for_isolated_target(namespace_owner & target, int listener) {
+    const int flags = fcntl(listener, F_GETFL);
+    if (flags < 0 || fcntl(listener, F_SETFL, flags | O_NONBLOCK) != 0) {
+        throw std::runtime_error("cannot configure target seccomp listener");
+    }
+    pollfd descriptors[2] {
+        {listener, POLLIN, 0},
+        {target.pidfd(), POLLIN, 0},
+    };
+    while (true) {
+        const int result = poll(descriptors, 2, -1);
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error("cannot monitor isolated target");
+        }
+        if ((descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            const seccomp_notification notification = receive_seccomp_notification(listener, true);
+            if (notification.present) {
+                throw std::runtime_error("target attempted a forbidden lifecycle operation");
+            }
+        }
+        if ((descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            const seccomp_notification notification = receive_seccomp_notification(listener, true);
+            if (notification.present) {
+                throw std::runtime_error("target attempted a forbidden lifecycle operation");
+            }
+            return target.wait();
+        }
+    }
+}
+
+[[noreturn]] void run_target_bootstrap(
+        int mapping_fd,
+        int ready_fd,
+        int security_fd,
+        int namespace_ready_fd,
+        const options & config) {
+    try {
+        set_parent_death(1);
+        make_isolated_session();
+        close_checked(namespace_ready_fd, "target namespace readiness descriptor");
+        write_all(ready_fd, "B", 1);
+        char mapped = 0;
+        ssize_t mapped_size;
+        do {
+            mapped_size = read(mapping_fd, &mapped, 1);
+        } while (mapped_size < 0 && errno == EINTR);
+        if (mapped_size != 1 || mapped != 'M') {
+            _exit(125);
+        }
+        close_checked(mapping_fd, "target mapping descriptor");
+        const int listener = drop_target_privileges();
+        send_descriptor(security_fd, "FILTER", listener);
+        close_checked(listener, "target seccomp listener");
+        verify_target_attack_denials();
+        send_packet(security_fd, "VERIFIED");
+        if (receive_packet(security_fd) != "GO") {
+            _exit(125);
+        }
+        close_checked(security_fd, "target security descriptor");
+        require_parent_death(1);
+        close_unneeded_fds(config.keep_fds, ready_fd);
+        write_all(ready_fd, "I", 1);
+        close_checked(ready_fd, "target readiness descriptor");
+        execve(config.exec_path.c_str(), config.target_argv.data(), environ);
+        _exit(127);
+    } catch (...) {
+        _exit(125);
+    }
+}
+
 [[noreturn]] void run_namespace_init(
         int release_fd,
         int ready_fd,
@@ -348,8 +865,8 @@ private:
                 mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
             _exit(125);
         }
+        protect_namespace_init();
         write_all(ready_fd, "R", 1);
-        close_checked(ready_fd, "namespace readiness descriptor");
         char release = 0;
         ssize_t received;
         do {
@@ -359,36 +876,100 @@ private:
             _exit(125);
         }
         close_checked(release_fd, "namespace release descriptor");
-        const pid_t target_pid = fork();
+        if (setgroups(0, nullptr) != 0) {
+            _exit(125);
+        }
+        int target_mapping_pipe[2] {-1, -1};
+        int target_ready_pipe[2] {-1, -1};
+        int target_security[2] {-1, -1};
+        if (pipe2(target_mapping_pipe, O_CLOEXEC) != 0 ||
+                pipe2(target_ready_pipe, O_CLOEXEC) != 0 ||
+                socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, target_security) != 0) {
+            _exit(125);
+        }
+        int target_pidfd = -1;
+        clone_args target_arguments {};
+        target_arguments.flags = CLONE_NEWUSER | CLONE_PIDFD;
+        target_arguments.pidfd = reinterpret_cast<uintptr_t>(&target_pidfd);
+        target_arguments.exit_signal = SIGCHLD;
+        const pid_t target_pid = static_cast<pid_t>(
+            syscall(SYS_clone3, &target_arguments, sizeof(target_arguments)));
         if (target_pid < 0) {
             _exit(125);
         }
         if (target_pid == 0) {
-            for (int signal_number = 1; signal_number < NSIG; ++signal_number) {
-                if (signal_number == SIGKILL || signal_number == SIGSTOP) {
-                    continue;
-                }
-                struct sigaction action {};
-                action.sa_handler = SIG_DFL;
-                sigemptyset(&action.sa_mask);
-                sigaction(signal_number, &action, nullptr);
+            close_checked(target_mapping_pipe[1], "target mapping writer");
+            close_checked(target_ready_pipe[0], "target readiness reader");
+            close_checked(target_security[0], "target security supervisor descriptor");
+            run_target_bootstrap(
+                target_mapping_pipe[0], target_ready_pipe[1],
+                target_security[1], ready_fd, config);
+        }
+        namespace_owner owned_target(target_pid, target_pidfd);
+        close_checked(target_mapping_pipe[0], "namespace target mapping reader");
+        close_checked(target_ready_pipe[1], "namespace target readiness writer");
+        close_checked(target_security[1], "namespace target security descriptor");
+        char target_ready = 0;
+        ssize_t target_ready_size;
+        do {
+            target_ready_size = read(target_ready_pipe[0], &target_ready, 1);
+        } while (target_ready_size < 0 && errno == EINTR);
+        if (target_ready_size != 1 || target_ready != 'B') {
+            _exit(125);
+        }
+        const std::string target_process_path = "/proc/" + std::to_string(target_pid);
+        const int target_process_directory = open(
+            target_process_path.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (target_process_directory < 0 || pidfd_has_exited(target_pidfd)) {
+            _exit(125);
+        }
+        write_mapping_file(target_process_directory, "setgroups", "deny\n");
+        write_mapping_file(target_process_directory, "uid_map", "65534 0 1\n");
+        write_mapping_file(target_process_directory, "gid_map", "65534 0 1\n");
+        close_checked(target_process_directory, "target process directory");
+        write_all(target_mapping_pipe[1], "M", 1);
+        close_checked(target_mapping_pipe[1], "namespace target mapping writer");
+        const int target_listener = receive_descriptor(target_security[0], "FILTER");
+        verify_target_isolation_probes(target_listener);
+        if (receive_packet(target_security[0]) != "VERIFIED") {
+            _exit(125);
+        }
+        require_parent_death(0);
+        if (prctl(PR_GET_DUMPABLE) != 0 ||
+                getsid(0) != getpid() || getpgrp() != getpid()) {
+            _exit(125);
+        }
+        send_packet(target_security[0], "GO");
+        close_checked(target_security[0], "namespace target security supervisor descriptor");
+        do {
+            target_ready_size = read(target_ready_pipe[0], &target_ready, 1);
+        } while (target_ready_size < 0 && errno == EINTR);
+        close_checked(target_ready_pipe[0], "namespace target readiness reader");
+        require_parent_death(0);
+        if (prctl(PR_GET_DUMPABLE) != 0 ||
+                getsid(0) != getpid() || getpgrp() != getpid() ||
+                target_ready_size != 1 || target_ready != 'I') {
+            _exit(125);
+        }
+        write_all(ready_fd, "I", 1);
+        const int target_status = wait_for_isolated_target(owned_target, target_listener);
+        close_checked(target_listener, "namespace target seccomp listener");
+        owned_target.close_pidfd();
+        if (kill(-1, SIGKILL) != 0 && errno != ESRCH) {
+            _exit(125);
+        }
+        while (true) {
+            const pid_t reaped = waitpid(-1, nullptr, 0);
+            if (reaped > 0 || (reaped < 0 && errno == EINTR)) {
+                continue;
             }
-            sigset_t empty;
-            sigemptyset(&empty);
-            sigprocmask(SIG_SETMASK, &empty, nullptr);
-            close_unneeded_fds(config.keep_fds, -1);
-            execve(config.exec_path.c_str(), config.target_argv.data(), environ);
-            _exit(127);
-        }
-        int target_status = 0;
-        while (waitpid(target_pid, &target_status, 0) < 0) {
-            if (errno != EINTR) {
-                _exit(125);
+            if (reaped < 0 && errno == ECHILD) {
+                break;
             }
+            _exit(125);
         }
-        kill(-1, SIGKILL);
-        while (waitpid(-1, nullptr, 0) >= 0 || errno == EINTR) {
-        }
+        write_all(ready_fd, "C", 1);
+        close_checked(ready_fd, "namespace readiness descriptor");
         _exit(wait_status_exit_code(target_status));
     } catch (...) {
         _exit(125);
@@ -492,19 +1073,31 @@ int run_linux_helper(options config) {
     do {
         ready_size = read(ready_pipe[0], &ready, 1);
     } while (ready_size < 0 && errno == EINTR);
-    close_checked(ready_pipe[0], "helper readiness reader");
     close_checked(helper_pidfd, "helper self pidfd");
     if (ready_size != 1 || ready != 'R') {
         throw std::runtime_error("target PID namespace setup did not complete");
     }
-    send_pidfd(config.protocol_fd, owned_namespace.pidfd());
+    send_descriptor(config.protocol_fd, "PREPARED", owned_namespace.pidfd());
     if (receive_packet(config.protocol_fd) != "EXEC") {
         throw std::runtime_error("containment EXEC packet is invalid");
     }
     write_all(release_pipe[1], "X", 1);
     close_checked(release_pipe[1], "helper release writer");
+    do {
+        ready_size = read(ready_pipe[0], &ready, 1);
+    } while (ready_size < 0 && errno == EINTR);
+    if (ready_size != 1 || ready != 'I') {
+        throw std::runtime_error("target privilege isolation did not complete");
+    }
     send_packet(config.protocol_fd, "RELEASED");
     const int status = owned_namespace.wait();
+    do {
+        ready_size = read(ready_pipe[0], &ready, 1);
+    } while (ready_size < 0 && errno == EINTR);
+    close_checked(ready_pipe[0], "helper readiness reader");
+    if (ready_size != 1 || ready != 'C') {
+        throw std::runtime_error("target namespace teardown did not complete");
+    }
     owned_namespace.close_pidfd();
     send_packet(config.protocol_fd, "COMPLETE");
     return wait_status_exit_code(status);

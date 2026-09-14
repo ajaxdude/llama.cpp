@@ -2433,6 +2433,7 @@ class TraceFormatTests(unittest.TestCase):
             Path(__file__).parents[1] /
             "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
+        helper_main = helper_source[helper_source.index("int run_linux_helper"):]
         self.assertNotIn("os.fork", start_source + spawn_source)
         self.assertIn("os.posix_spawn", spawn_source)
         self.assertLess(spawn_source.index("os.posix_spawn"), spawn_source.index("_linux_open_pidfd"))
@@ -2441,17 +2442,17 @@ class TraceFormatTests(unittest.TestCase):
         for flag in ("CLONE_NEWUSER", "CLONE_NEWPID", "CLONE_NEWNS", "CLONE_PIDFD"):
             self.assertIn(flag, helper_source)
         self.assertLess(
-            helper_source.index("namespace_owner owned_namespace"),
-            helper_source.index('"uid_map"'),
+            helper_main.index("namespace_owner owned_namespace"),
+            helper_main.index('"uid_map"'),
         )
         self.assertIn('"uid_map"', helper_source)
         self.assertIn('mount("proc", "/proc", "proc"', helper_source)
         self.assertLess(
             helper_source.index("target PID namespace did not bind helper lifetime"),
-            helper_source.index("send_pidfd(config.protocol_fd"),
+            helper_source.index('send_descriptor(config.protocol_fd, \"PREPARED\"'),
         )
         self.assertLess(
-            helper_source.index("send_pidfd(config.protocol_fd"),
+            helper_source.index('send_descriptor(config.protocol_fd, \"PREPARED\"'),
             helper_source.index('!= \"EXEC\"'),
         )
 
@@ -2481,10 +2482,104 @@ class TraceFormatTests(unittest.TestCase):
         ).read_text(encoding="ascii")
         self.assertIn("setsigmask=_all_catchable_signals()", spawn_source)
         self.assertIn("setsigdef=_all_catchable_signals()", spawn_source)
+        self.assertIn("setsid=True", spawn_source)
         self.assertIn("require_initial_signal_state();", helper_source)
         self.assertLess(
             helper_source.index("require_initial_signal_state();"),
             helper_source.index('send_packet(config.protocol_fd, \"READY\")'),
+        )
+
+    def test_linux_native_helper_source_isolates_target_privileges_before_exec(self) -> None:
+        helper_source = (
+            Path(__file__).parents[1] /
+            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+        ).read_text(encoding="ascii")
+        bootstrap_start = helper_source.index("[[noreturn]] void run_target_bootstrap")
+        init_start = helper_source.index("[[noreturn]] void run_namespace_init")
+        bootstrap_source = helper_source[bootstrap_start:init_start]
+        init_source = helper_source[init_start:helper_source.index("int run_linux_helper")]
+        self.assertLess(
+            bootstrap_source.index("set_parent_death(1);"),
+            bootstrap_source.index("make_isolated_session();"),
+        )
+        self.assertLess(
+            bootstrap_source.index("make_isolated_session();"),
+            bootstrap_source.index("drop_target_privileges();"),
+        )
+        self.assertLess(
+            bootstrap_source.index("drop_target_privileges();"),
+            bootstrap_source.index("execve("),
+        )
+        self.assertLess(
+            bootstrap_source.index('send_descriptor(security_fd, \"FILTER\", listener);'),
+            bootstrap_source.index("verify_target_attack_denials();"),
+        )
+        self.assertLess(
+            bootstrap_source.index("verify_target_attack_denials();"),
+            bootstrap_source.index('send_packet(security_fd, \"VERIFIED\");'),
+        )
+        self.assertLess(
+            bootstrap_source.index('receive_packet(security_fd) != \"GO\"'),
+            bootstrap_source.index("execve("),
+        )
+        for required in (
+                "PR_SET_DUMPABLE",
+                "PR_SET_PTRACER",
+                "PR_SET_SECUREBITS",
+                "SECBIT_NOROOT_LOCKED",
+                "SECBIT_NO_SETUID_FIXUP_LOCKED",
+                "SECBIT_KEEP_CAPS_LOCKED",
+                "SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED",
+                "PR_CAPBSET_DROP",
+                "PR_CAP_AMBIENT_CLEAR_ALL",
+                "SYS_capset",
+                "PR_SET_NO_NEW_PRIVS",
+                "SECCOMP_RET_USER_NOTIF",
+                "SECCOMP_FILTER_FLAG_NEW_LISTENER",
+                "SECCOMP_IOCTL_NOTIF_RECV",
+                "target attempted a forbidden lifecycle operation",
+                "__NR_ptrace",
+                "__NR_process_vm_readv",
+                "__NR_process_vm_writev",
+                "__NR_kill",
+                "__NR_setresuid",
+                "__NR_setpgid",
+                "__NR_setsid"):
+            self.assertIn(required, helper_source)
+        self.assertIn("target_arguments.flags = CLONE_NEWUSER | CLONE_PIDFD;", helper_source)
+        self.assertIn('"65534 0 1\\n"', helper_source)
+        self.assertLess(
+            helper_source.index("protect_namespace_init();"),
+            helper_source.index('write_all(ready_fd, \"R\", 1);'),
+        )
+        self.assertLess(
+            init_source.index('target_ready != \'I\''),
+            init_source.index('write_all(ready_fd, \"I\", 1);'),
+        )
+        self.assertLess(
+            init_source.index('receive_descriptor(target_security[0], \"FILTER\")'),
+            init_source.index("verify_target_isolation_probes(target_listener);"),
+        )
+        self.assertLess(
+            init_source.index("verify_target_isolation_probes(target_listener);"),
+            init_source.index('send_packet(target_security[0], \"GO\");'),
+        )
+        self.assertLess(
+            init_source.index('write_all(ready_fd, \"I\", 1);'),
+            init_source.index("wait_for_isolated_target(owned_target, target_listener)"),
+        )
+        self.assertLess(
+            init_source.index('write_all(ready_fd, \"C\", 1);'),
+            init_source.index("_exit(wait_status_exit_code(target_status));"),
+        )
+        helper_main = helper_source[helper_source.index("int run_linux_helper"):]
+        self.assertLess(
+            helper_main.index("owned_namespace.wait();"),
+            helper_main.index("target namespace teardown did not complete"),
+        )
+        self.assertLess(
+            helper_main.index("target namespace teardown did not complete"),
+            helper_main.index('send_packet(config.protocol_fd, \"COMPLETE\");'),
         )
 
     def test_linux_native_helper_without_pidfd_support_fails_before_spawn(self) -> None:
@@ -2725,6 +2820,9 @@ class TraceFormatTests(unittest.TestCase):
         self.assertIn("kill(-1, SIGKILL)", helper_source)
         self.assertIn("getppid() != expected_parent", helper_source)
         self.assertIn("getppid() != 0", helper_source)
+        self.assertGreaterEqual(helper_source.count("make_isolated_session();"), 2)
+        self.assertIn("require_parent_death(0);", helper_source)
+        self.assertIn("require_parent_death(1);", helper_source)
 
     @unittest.skipUnless(
         sys.platform == "linux" and os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER"),
@@ -2743,17 +2841,26 @@ class TraceFormatTests(unittest.TestCase):
             listener.listen(2)
             listener.settimeout(10)
             target_source = (
-                "import array,os,socket,sys,time\n"
-                "def report(label):\n"
+                "import array,ctypes,json,os,socket,sys,time\n"
+                "libc=ctypes.CDLL(None,use_errno=True)\n"
+                "def report(label,payload=None):\n"
                 " s=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)\n"
                 " s.connect(sys.argv[1])\n"
                 " fd=os.pidfd_open(os.getpid())\n"
                 " rights=array.array('i',[fd])\n"
-                " s.sendmsg([label.encode('ascii')],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])\n"
+                " data=label if payload is None else label+':'+json.dumps(payload,sort_keys=True)\n"
+                " s.sendmsg([data.encode('ascii')],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])\n"
                 " os.close(fd);s.close()\n"
-                "report('target')\n"
+                "status={line.split(':',1)[0]:line.split(':',1)[1].strip()"
+                " for line in open('/proc/self/status',encoding='ascii') if ':' in line}\n"
+                "state={'uids':list(os.getresuid()),'gids':list(os.getresgid()),'groups':os.getgroups(),"
+                "'sid':os.getsid(0),'pgrp':os.getpgrp(),'pid':os.getpid(),"
+                "'caps':[status[name] for name in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')],"
+                "'no_new_privs':status['NoNewPrivs'],'seccomp':status['Seccomp'],"
+                "'securebits':libc.prctl(27,0,0,0,0)}\n"
+                "report('target',state)\n"
                 "if os.fork()==0:\n"
-                " os.setsid();report('descendant')\n"
+                " time.sleep(.2);report('descendant')\n"
                 " while True: time.sleep(1)\n"
                 "while True: time.sleep(1)\n"
             )
@@ -2770,7 +2877,7 @@ class TraceFormatTests(unittest.TestCase):
                 "'_containment_helper_descriptor':helper_fd,"
                 "'stdout':-3,'stderr':-3}\n"
                 "containment=trace._start_linux_native_helper("
-                "[sys.executable,'-c',sys.argv[2],sys.argv[3]],launch)\n"
+                "[sys.executable,'-c',sys.argv[2],sys.argv[3],str(os.getpgrp())],launch)\n"
                 "while True: time.sleep(1)\n"
             )
             environment = {
@@ -2787,6 +2894,7 @@ class TraceFormatTests(unittest.TestCase):
             pidfds = []
             try:
                 labels = set()
+                target_state = None
                 while len(pidfds) < 2:
                     try:
                         connection, _address = listener.accept()
@@ -2804,9 +2912,22 @@ class TraceFormatTests(unittest.TestCase):
                             if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                                 descriptors.frombytes(content[:descriptors.itemsize])
                         self.assertEqual(len(descriptors), 1)
-                        labels.add(data.decode("ascii"))
+                        decoded = data.decode("ascii")
+                        label, separator, payload = decoded.partition(":")
+                        labels.add(label)
+                        if separator:
+                            target_state = json.loads(payload)
                         pidfds.append(descriptors[0])
                 self.assertEqual(labels, {"target", "descendant"})
+                self.assertEqual(target_state["uids"], [65534] * 3)
+                self.assertEqual(target_state["gids"], [65534] * 3)
+                self.assertEqual(target_state["groups"], [])
+                self.assertEqual(target_state["sid"], target_state["pid"])
+                self.assertEqual(target_state["pgrp"], target_state["pid"])
+                self.assertEqual(target_state["caps"], ["0000000000000000"] * 5)
+                self.assertEqual(target_state["no_new_privs"], "1")
+                self.assertEqual(target_state["seccomp"], "2")
+                self.assertEqual(target_state["securebits"], 239)
                 supervisor.kill()
                 supervisor.wait(timeout=5)
                 deadline = time.monotonic() + 5
@@ -2824,6 +2945,136 @@ class TraceFormatTests(unittest.TestCase):
                     supervisor.kill()
                     supervisor.wait(timeout=5)
                 listener.close()
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER"),
+        "native Linux containment helper was not executed on this host",
+    )
+    def test_linux_native_helper_forbidden_operations_kill_namespace(self) -> None:
+        import array
+        import socket
+
+        helper = Path(os.environ["DSV41_NATIVE_CONTAINMENT_HELPER"]).resolve(strict=True)
+        target_source = (
+            "import array,ctypes,os,socket,sys,time\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "s=socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)\n"
+            "s.connect(sys.argv[1])\n"
+            "fd=os.pidfd_open(os.getpid())\n"
+            "rights=array.array('i',[fd])\n"
+            "s.sendmsg([b'ready'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])\n"
+            "os.close(fd);s.close();time.sleep(.1)\n"
+            "attack=sys.argv[2]\n"
+            "if attack=='ptrace': libc.ptrace(16,1,0,0)\n"
+            "elif attack=='ptrace_poke': libc.ptrace(5,1,0,0)\n"
+            "elif attack=='process_vm_readv': libc.process_vm_readv(1,0,0,0,0,0)\n"
+            "elif attack=='process_vm_writev': libc.process_vm_writev(1,0,0,0,0,0)\n"
+            "elif attack=='pdeathsig': libc.prctl(1,0,0,0,0)\n"
+            "elif attack=='pid1_stop': libc.kill(1,19)\n"
+            "elif attack=='outer_group': libc.kill(-int(sys.argv[3]),0)\n"
+            "elif attack=='setuid': libc.setresuid(0,0,0)\n"
+            "elif attack=='setpgid': libc.setpgid(0,0)\n"
+            "elif attack=='setsid': libc.setsid()\n"
+            "else: raise SystemExit(91)\n"
+            "open(sys.argv[4],'w',encoding='ascii').write('survived')\n"
+            "while True: time.sleep(1)\n"
+        )
+        supervisor_source = (
+            "import os,sys\n"
+            "from pathlib import Path\n"
+            "import trace_format as trace\n"
+            "helper=Path(sys.argv[1])\n"
+            "target=os.open(sys.executable,os.O_RDONLY)\n"
+            "helper_fd=os.open(helper,os.O_RDONLY)\n"
+            "launch={'executable':f'/proc/self/fd/{target}',"
+            "'pass_fds':(target,),"
+            "'_containment_helper_path':f'/proc/self/fd/{helper_fd}',"
+            "'_containment_helper_descriptor':helper_fd,"
+            "'stdout':-3,'stderr':-3}\n"
+            "containment=trace._start_linux_native_helper("
+            "[sys.executable,'-c',sys.argv[2],sys.argv[3],sys.argv[4],"
+            "str(os.getpgrp()),sys.argv[5]],launch)\n"
+            "containment.process.communicate(timeout=10)\n"
+            "raise SystemExit(containment.process.returncode)\n"
+        )
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "tools/deepseek-v41-trace"),
+        }
+        attacks = (
+            "ptrace",
+            "ptrace_poke",
+            "process_vm_readv",
+            "process_vm_writev",
+            "pdeathsig",
+            "pid1_stop",
+            "outer_group",
+            "setuid",
+            "setpgid",
+            "setsid",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for attack in attacks:
+                with self.subTest(attack=attack):
+                    socket_path = root / f"{attack}.sock"
+                    marker = root / f"{attack}.survived"
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    listener.settimeout(10)
+                    supervisor = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            supervisor_source,
+                            str(helper),
+                            target_source,
+                            str(socket_path),
+                            attack,
+                            str(marker),
+                        ],
+                        env=environment,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    target_pidfd = None
+                    try:
+                        try:
+                            connection, _address = listener.accept()
+                        except TimeoutError:
+                            if supervisor.poll() is not None:
+                                stderr = supervisor.stderr.read()
+                                self.skipTest(
+                                    f"native PID namespace unavailable: {stderr.strip()}")
+                            raise
+                        with connection:
+                            descriptors = array.array("i")
+                            data, ancillary, flags, _address = connection.recvmsg(
+                                32, socket.CMSG_SPACE(descriptors.itemsize))
+                            self.assertEqual((data, flags), (b"ready", 0))
+                            for level, kind, content in ancillary:
+                                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                                    descriptors.frombytes(content[:descriptors.itemsize])
+                            self.assertEqual(len(descriptors), 1)
+                            target_pidfd = descriptors[0]
+                        self.assertEqual(supervisor.wait(timeout=10), 125)
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline and not trace._linux_pidfd_has_exited(
+                                target_pidfd):
+                            time.sleep(0.02)
+                        self.assertTrue(trace._linux_pidfd_has_exited(target_pidfd))
+                        self.assertFalse(marker.exists())
+                    finally:
+                        if target_pidfd is not None:
+                            if not trace._linux_pidfd_has_exited(target_pidfd):
+                                trace._linux_signal_pidfd(target_pidfd, trace.signal.SIGKILL)
+                            os.close(target_pidfd)
+                        if supervisor.poll() is None:
+                            supervisor.kill()
+                            supervisor.wait(timeout=5)
+                        listener.close()
 
     def test_linux_native_helper_stream_close_reports_every_failure(self) -> None:
         protocol = mock.Mock()
