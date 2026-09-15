@@ -1511,7 +1511,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "version",
         })
         self.assertEqual(plan["format"], "dsv41-integration-plan")
-        self.assertEqual(plan["version"], 3)
+        self.assertEqual(plan["version"], 4)
 
         correctness = plan["runtime_successor"]
         self.assertEqual(correctness["repository"], "halo-box/strix-llama.cpp")
@@ -1595,18 +1595,44 @@ class IntegrationPlanTests(unittest.TestCase):
             "reason": "terminal stop after root/input creation; cause not established",
             "status": "incomplete",
         })
-        self.assertEqual(validation["next_native_candidate"], {
+        self.assertEqual(validation["latest_native_attempt"], {
+            "admission": "fail",
+            "admission_exit_code": 4,
+            "admission_receipt_sha256": "578f9239c03c0988fb830783de94a955b5e71fed3dff917140f33b5329c9c6c2",
             "attempt": "A08",
             "authentication": "human-sudo-v-after-explicit-release",
-            "authorization": "not-authorized",
+            "authorization": "consumed-once",
             "boundary_addendum_sha256": "fbe7cede264c7926e50019238d63098d2b1030b741829cb5ed8e6d51df087496",
+            "cleanup_observation": {
+                "a08_paths": "absent",
+                "containers": 0,
+                "llama_swap": "inactive",
+                "port_18080": "free",
+                "processes": 0,
+                "proxy": "inactive",
+                "swap": 0,
+                "brainrouter": "inactive",
+            },
             "contract_sha256": "166791a250b9fa7970b680a865a3317d4843edbd3c0b789a33df3091d448ba26",
+            "executor_release": "issued",
+            "failure": "LLAMA_SWAP_STATE=inactive",
+            "host_release": "released-but-degraded-unavailable",
             "rootless_feasibility": {
                 "report_sha256": "98a941861d93ce7ccafc76824c609d495fa7cb032c74b1b13006e8a9f711bb31",
                 "status": "rejected-by-existing-trust-contract",
             },
             "scope": "model-free-build-install-trace-containment-only",
+            "service_restoration_authorization": "none",
             "source_revision": correctness["revision"],
+            "stages": {
+                "authentication": "not-started",
+                "build": "not-started",
+                "launcher": "not-started",
+                "tests": "not-started",
+                "transfer": "not-started",
+            },
+            "status": "terminal-no-retry",
+            "terminal_receipt_sha256": "0801db5ddfff9dfb396173790b8ab1f6e26713a2ce12a748776dab9f8a425879",
         })
         self.assertEqual(validation["model_free"], {
             "focused_ctests": {"passed": 10, "total": 10},
