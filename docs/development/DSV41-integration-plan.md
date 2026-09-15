@@ -31,6 +31,8 @@ Any replacement GGUF must be converted from the original safetensors at source r
 
 This provenance requirement is pending a generated conversion artifact; it is not attributed to the current converter pin by documentation alone. The conversion gate requires the model-free conversion and sparse-manifest suites from the pinned DS4 reference: `tests/test_deepseek41_conversion.py`, `tests/test_deepseek41_manifest.py`, `test-linux-memory`, `test-engram`, `test-deepseek41-gguf`, `test-frontends`, and `test-session-state`. These tests are release inputs, not substitutes for the generated-GGUF schema fixture or later inference correctness.
 
+The exact DS4 model-free suite at `9139e2ae` is currently incomplete: 6 of 8 requested commands passed on Darwin. `make -C gguf-tools libds4quants.so` failed because Darwin exposes `libds4quants.dylib`; the portable `quants-shared` target passed. The no-argument manifest command failed because `--hf-dir` is mandatory, so no model-free manifest pass is claimed. The immutable command-log manifest is SHA-256 `74d353e6f36f4d67ae113db74a0b87aeea10ef5864964c73b93b935b2f57aaeb`. No model weights, conversion, inference, server, or Strix access occurred.
+
 ## Reference support boundary
 
 The pinned DS4 documentation supports V4.1 Metal text and vision from `bd66c402070042bf0a79ad6ece8242de4c93680c` and CUDA Q2 text SSD from `a04f46fa423e45712c8c7e430eff422479f314a3`. It documents no V4.1 ROCm, pipeline, or speculative/DSpark support.

@@ -1641,6 +1641,33 @@ class IntegrationPlanTests(unittest.TestCase):
             "make test-frontends",
             "make test-session-state",
         ])
+        self.assertEqual(reference["model_free_suite_evidence"], {
+            "executed": 8,
+            "failed": 2,
+            "failures": [
+                {
+                    "classification": "darwin-target-mismatch",
+                    "command": "make -C gguf-tools libds4quants.so",
+                    "exit_code": 2,
+                    "portable_command": "make -C gguf-tools quants-shared",
+                    "portable_status": "pass",
+                },
+                {
+                    "classification": "missing-required-hf-dir",
+                    "command": "python3 tests/test_deepseek41_manifest.py",
+                    "exit_code": 2,
+                    "model_free_replacement": "pending",
+                },
+            ],
+            "logs_manifest_sha256": "74d353e6f36f4d67ae113db74a0b87aeea10ef5864964c73b93b935b2f57aaeb",
+            "model_backed": False,
+            "passed": 6,
+            "platform": "Darwin",
+            "revision": reference["revision"],
+            "status": "incomplete",
+            "strix_access": False,
+            "unavailable": 0,
+        })
         support = reference["documented_backend_support"]
         self.assertEqual(support["metal"], {
             "introduced_revision": "bd66c402070042bf0a79ad6ece8242de4c93680c",
