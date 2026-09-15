@@ -1494,6 +1494,82 @@ def replace_event_blob(
     )
 
 
+class IntegrationPlanTests(unittest.TestCase):
+    def test_external_pins_and_nvme_profile_are_exact(self) -> None:
+        root = Path(__file__).parents[1]
+        plan = json.loads((TRACE_DIR / "integration-plan.json").read_text(encoding="ascii"))
+        self.assertEqual(set(plan), {
+            "conversion_schema_pin",
+            "exporter_dependency",
+            "format",
+            "published_model",
+            "runtime_successor",
+            "runtime_profile",
+            "version",
+        })
+        self.assertEqual(plan["format"], "dsv41-integration-plan")
+        self.assertEqual(plan["version"], 1)
+
+        correctness = plan["runtime_successor"]
+        self.assertEqual(correctness["repository"], "halo-box/strix-llama.cpp")
+        self.assertEqual(correctness["pull_request"], 59)
+        for key in ("revision", "tree", "parent", "stable_patch_id"):
+            value = correctness[key]
+            self.assertEqual(len(value), 40)
+            int(value, 16)
+        self.assertEqual(len(correctness["diff_sha256"]), 64)
+        int(correctness["diff_sha256"], 16)
+        self.assertEqual(correctness["native_validation"], "pending-current-head")
+
+        conversion = plan["conversion_schema_pin"]
+        self.assertEqual(conversion, {
+            "estimated_output_gib": {"Q2_K": 246.3, "Q3_K_M": 323.4},
+            "pull_request": 28696,
+            "repository": "ggml-org/llama.cpp",
+            "revision": "b12818a24407175d941e9299e7b5fb7874a654d9",
+            "runtime_included": False,
+            "scope": "conversion-only",
+        })
+        self.assertEqual(plan["exporter_dependency"], {
+            "branch": "deepseek-v41-exporter-v2",
+            "contract_revision": "ba24c1f0291554177d41d685de11a091b9fdfb40",
+            "model_free_tests": 29,
+            "repository": "ds4gguf",
+            "revision": "650c4c937b06b90b7a06dec5d6bbe4fd1ba82d55",
+            "tree": "b0b9596ddfb7147ce13e4c016fd0fa4ff06af288",
+        })
+
+        model = plan["published_model"]
+        self.assertEqual(model["sha256"], trace.MODEL_SHA256)
+        self.assertEqual(model["byte_count"], 365713686528)
+        self.assertEqual(model["canonical_path"], "/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf")
+        self.assertIs(model["preserve_unchanged"], True)
+
+        profile = plan["runtime_profile"]
+        self.assertEqual(profile["required_storage"], "nvme")
+        self.assertEqual(profile["required_architecture"], "gfx1151")
+        self.assertEqual(profile["watchdog_soft_gib"], 116)
+        self.assertEqual(profile["watchdog_emergency_gib"], 118)
+        self.assertEqual(profile["arguments"], [
+            "-c", "32768", "-b", "2048", "-ub", "32", "-np", "1",
+            "-ngl", "99", "-dev", "ROCm0",
+            "--expert-cache-slots", "192", "--expert-cache-mib", "72900",
+        ])
+        self.assertEqual(profile["engram_storage"], "gguf-extents-uncached-aligned-reads")
+        self.assertEqual(profile["expert_storage"], "gguf-extents-direct-io-no-buffered-fallback")
+
+        model_source = (root / "src/models/deepseek41.cpp").read_text(encoding="utf-8")
+        engram_source = (root / "src/llama-engram.cpp").read_text(encoding="utf-8")
+        engram_header = (root / "src/llama-engram.h").read_text(encoding="utf-8")
+        self.assertIn("LLM_TENSOR_ENGRAM_EMBD", model_source)
+        self.assertIn("TENSOR_SKIP", model_source)
+        self.assertIn("expert_params.direct_io = true;", model_source)
+        self.assertIn("expert_params.allow_buffered_io = false;", model_source)
+        self.assertIn("llama_bounded_file file;", engram_source)
+        self.assertIn("file(fname, { true, true })", engram_source)
+        self.assertIn("The table is never mapped or cached.", engram_header)
+
+
 class TraceFormatTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

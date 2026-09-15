@@ -1,0 +1,66 @@
+{
+  "conversion_schema_pin": {
+    "estimated_output_gib": {
+      "Q2_K": 246.3,
+      "Q3_K_M": 323.4
+    },
+    "pull_request": 28696,
+    "repository": "ggml-org/llama.cpp",
+    "revision": "b12818a24407175d941e9299e7b5fb7874a654d9",
+    "runtime_included": false,
+    "scope": "conversion-only"
+  },
+  "runtime_successor": {
+    "diff_sha256": "f37f7a98fa1088ebcc923f32797d58b0bc23295bc582257a043bf6c7712896e0",
+    "native_validation": "pending-current-head",
+    "parent": "1df161dce6650300cda386524f7853d192a061e8",
+    "pull_request": 59,
+    "repository": "halo-box/strix-llama.cpp",
+    "revision": "10824396c1ba3f90f64e400dddd8436b7e3a0394",
+    "stable_patch_id": "25b7e7154e1e5ad11dbed8c0a4e49137284809c5",
+    "tree": "51d8bf952459efdcf8a2008c2cb1a8a83624374d"
+  },
+  "exporter_dependency": {
+    "branch": "deepseek-v41-exporter-v2",
+    "contract_revision": "ba24c1f0291554177d41d685de11a091b9fdfb40",
+    "model_free_tests": 29,
+    "repository": "ds4gguf",
+    "revision": "650c4c937b06b90b7a06dec5d6bbe4fd1ba82d55",
+    "tree": "b0b9596ddfb7147ce13e4c016fd0fa4ff06af288"
+  },
+  "format": "dsv41-integration-plan",
+  "published_model": {
+    "byte_count": 365713686528,
+    "canonical_path": "/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf",
+    "preserve_unchanged": true,
+    "sha256": "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
+  },
+  "runtime_profile": {
+    "arguments": [
+      "-c",
+      "32768",
+      "-b",
+      "2048",
+      "-ub",
+      "32",
+      "-np",
+      "1",
+      "-ngl",
+      "99",
+      "-dev",
+      "ROCm0",
+      "--expert-cache-slots",
+      "192",
+      "--expert-cache-mib",
+      "72900"
+    ],
+    "engram_storage": "gguf-extents-uncached-aligned-reads",
+    "expert_storage": "gguf-extents-direct-io-no-buffered-fallback",
+    "required_architecture": "gfx1151",
+    "required_storage": "nvme",
+    "swap_policy": "zero-configured-swap-or-kernel-enforced-cgroup-v2-no-swap",
+    "watchdog_emergency_gib": 118,
+    "watchdog_soft_gib": 116
+  },
+  "version": 1
+}
