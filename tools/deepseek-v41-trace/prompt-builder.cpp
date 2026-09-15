@@ -27,6 +27,8 @@ extern "C" {
 #include <string>
 #include <vector>
 
+extern "C" void dsv41_llama_common_runtime_anchor();
+
 #if defined(__linux__)
 #include <dlfcn.h>
 #include <link.h>
@@ -96,6 +98,16 @@ static fs::path module_path(const void * address) {
         throw std::runtime_error("cannot identify loaded runtime module");
     }
     return canonical_path(info.dli_fname, "loaded runtime module");
+}
+
+static const void * llama_common_runtime_address() {
+    dlerror();
+    void * address = dlsym(RTLD_DEFAULT, "dsv41_llama_common_runtime_anchor");
+    const char * error = dlerror();
+    if (error != nullptr || address == nullptr) {
+        throw std::runtime_error("cannot resolve llama-common runtime anchor");
+    }
+    return address;
 }
 
 static bool is_project_runtime_library(const fs::path & path) {
@@ -226,7 +238,7 @@ static json runtime_libraries_json(const fs::path & executable) {
         throw std::runtime_error("loaded runtime component set differs from the receipt");
     }
     const std::array<std::pair<const char *, fs::path>, 3> fixed_roles = {{
-        {"llama-common", module_path(function_address(&common_init))},
+        {"llama-common", module_path(llama_common_runtime_address())},
         {"llama", module_path(function_address(&llama_model_load_from_file))},
         {"ggml-base", module_path(function_address(&ggml_init))},
     }};

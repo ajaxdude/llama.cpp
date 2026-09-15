@@ -37,6 +37,8 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+extern "C" void dsv41_llama_common_runtime_anchor();
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <tlhelp32.h>
@@ -188,6 +190,20 @@ static fs::path module_path(const void * address) {
 template <typename T>
 static const void * function_address(T function) {
     return reinterpret_cast<const void *>(reinterpret_cast<uintptr_t>(function));
+}
+
+static const void * llama_common_runtime_address() {
+#if defined(_WIN32)
+    return function_address(&dsv41_llama_common_runtime_anchor);
+#else
+    dlerror();
+    void * address = dlsym(RTLD_DEFAULT, "dsv41_llama_common_runtime_anchor");
+    const char * error = dlerror();
+    if (error != nullptr || address == nullptr) {
+        throw std::runtime_error("cannot resolve llama-common runtime anchor");
+    }
+    return address;
+#endif
 }
 
 static bool is_project_runtime_library(const fs::path & path) {
@@ -485,7 +501,7 @@ static json runtime_libraries_json(
         }
     }
 
-    const fs::path build_info_module = module_path(function_address(&common_init));
+    const fs::path build_info_module = module_path(llama_common_runtime_address());
     const fs::path llama_module = module_path(function_address(&llama_model_load_from_file));
     const fs::path ggml_module = module_path(function_address(&ggml_init));
     const fs::path selected_backend_module = module_path(selected_backend);

@@ -21,6 +21,7 @@ if(NOT DSV41_BUILD_REVISION_RESULT EQUAL 0 OR
     message(FATAL_ERROR "DeepSeek V4.1 trace exporter requires the exact Git revision")
 endif()
 set(DSV41_RECEIPT_TARGETS llama-common llama ggml ggml-base)
+target_sources(llama-common PRIVATE runtime-anchor.cpp)
 set(DSV41_BACKEND_TARGETS ${GGML_AVAILABLE_BACKENDS})
 list(SORT DSV41_BACKEND_TARGETS)
 foreach(backend IN LISTS DSV41_BACKEND_TARGETS)
