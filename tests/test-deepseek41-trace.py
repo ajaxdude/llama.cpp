@@ -1511,7 +1511,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "version",
         })
         self.assertEqual(plan["format"], "dsv41-integration-plan")
-        self.assertEqual(plan["version"], 4)
+        self.assertEqual(plan["version"], 5)
 
         correctness = plan["runtime_successor"]
         self.assertEqual(correctness["repository"], "halo-box/strix-llama.cpp")
@@ -1603,7 +1603,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "authentication": "human-sudo-v-after-explicit-release",
             "authorization": "consumed-once",
             "boundary_addendum_sha256": "fbe7cede264c7926e50019238d63098d2b1030b741829cb5ed8e6d51df087496",
-            "cleanup_observation": {
+            "admission_observation": {
                 "a08_paths": "absent",
                 "containers": 0,
                 "llama_swap": "inactive",
@@ -1616,13 +1616,25 @@ class IntegrationPlanTests(unittest.TestCase):
             "contract_sha256": "166791a250b9fa7970b680a865a3317d4843edbd3c0b789a33df3091d448ba26",
             "executor_release": "issued",
             "failure": "LLAMA_SWAP_STATE=inactive",
-            "host_release": "released-but-degraded-unavailable",
+            "host_release": "released-clean-unassigned",
             "rootless_feasibility": {
                 "report_sha256": "98a941861d93ce7ccafc76824c609d495fa7cb032c74b1b13006e8a9f711bb31",
                 "status": "rejected-by-existing-trust-contract",
             },
             "scope": "model-free-build-install-trace-containment-only",
-            "service_restoration_authorization": "none",
+            "service_remediation": {
+                "mutation": "none",
+                "precheck_sha256": "947bea28786f2ba828f467f0fdf33a2769acc069dd8246c38f5eaee24f6aa831",
+                "receipt_sha256": "1112c065d01b5d72f202afb23db1f10614f2c88e963325053c5c94d20982d47d",
+                "required_successor_check": "systemctl --user",
+                "root_cause": "admission checked nonexistent system units instead of configured user units",
+                "services": {
+                    "brainrouter": "loaded-enabled-active-running",
+                    "llama_swap": "loaded-enabled-active-running",
+                    "proxy": "loaded-enabled-active-running",
+                },
+                "status": "verified",
+            },
             "source_revision": correctness["revision"],
             "stages": {
                 "authentication": "not-started",
