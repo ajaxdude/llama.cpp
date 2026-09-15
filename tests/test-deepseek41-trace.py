@@ -1505,10 +1505,12 @@ class IntegrationPlanTests(unittest.TestCase):
             "published_model",
             "runtime_successor",
             "runtime_profile",
+            "schema_alignment",
+            "validation_acceptance",
             "version",
         })
         self.assertEqual(plan["format"], "dsv41-integration-plan")
-        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["version"], 2)
 
         correctness = plan["runtime_successor"]
         self.assertEqual(correctness["repository"], "halo-box/strix-llama.cpp")
@@ -1530,6 +1532,65 @@ class IntegrationPlanTests(unittest.TestCase):
             "runtime_included": False,
             "scope": "conversion-only",
         })
+
+        alignment = plan["schema_alignment"]
+        self.assertEqual(alignment["status"], "blocked")
+        self.assertEqual(alignment["converter_revision"], conversion["revision"])
+        self.assertEqual(alignment["runtime_revision"], correctness["revision"])
+        self.assertEqual(alignment["release_gate"], "requires-compatible-converter-or-runtime-adapter")
+        blockers = {blocker["id"]: blocker for blocker in alignment["blockers"]}
+        self.assertEqual(set(blockers), {
+            "runtime-metadata-namespace",
+            "missing-engram-runtime-metadata",
+            "engram-primes-element-type",
+            "engram-tensor-names",
+        })
+        self.assertEqual(blockers["missing-engram-runtime-metadata"]["converter_missing"], [
+            "deepseek41.engram.encoding",
+            "deepseek41.engram.rows",
+            "deepseek41.engram.compressed_vocab_size",
+        ])
+        self.assertEqual(blockers["engram-primes-element-type"], {
+            "converter_element_type": "uint64",
+            "effect": "runtime reports a wrong array element type",
+            "id": "engram-primes-element-type",
+            "key": "deepseek41.engram.primes",
+            "runtime_element_type": "uint32",
+        })
+        self.assertEqual(blockers["engram-tensor-names"]["converter_to_runtime"], {
+            "blk.{bid}.engram_k.weight": "blk.{bid}.engram_k_norm.weight",
+            "blk.{bid}.engram_q.weight": "blk.{bid}.engram_q_norm.weight",
+            "blk.{bid}.engram_wkv.weight": "blk.{bid}.engram_kv.weight",
+        })
+        self.assertEqual(alignment["compatible_contract"], {
+            "metadata_keys": [
+                "deepseek41.engram.layer_ids",
+                "deepseek41.engram.pad_id",
+                "deepseek41.engram.token_map",
+                "deepseek41.engram.multipliers",
+            ],
+            "tensor_names": ["blk.{bid}.engram_embd.weight"],
+        })
+        for digest in alignment["evidence_sha256"].values():
+            self.assertEqual(len(digest), 64)
+            int(digest, 16)
+
+        validation = plan["validation_acceptance"]
+        self.assertEqual(validation["status"], "model-free-pass-native-incomplete")
+        self.assertEqual(validation["model_backed"], "not-started")
+        self.assertEqual(validation["native_current_head"], {
+            "admission": "pass",
+            "attempt": "A07",
+            "launcher": "not-started",
+            "reason": "terminal stop after root/input creation; cause not established",
+            "status": "incomplete",
+        })
+        self.assertEqual(validation["model_free"], {
+            "focused_ctests": {"passed": 10, "total": 10},
+            "trace_python": {"passed": 179, "skipped": 6},
+            "watchdog_python": {"passed": 38, "skipped": 8},
+        })
+
         self.assertEqual(plan["exporter_dependency"], {
             "branch": "deepseek-v41-exporter-v2",
             "contract_revision": "ba24c1f0291554177d41d685de11a091b9fdfb40",
@@ -1559,8 +1620,18 @@ class IntegrationPlanTests(unittest.TestCase):
         self.assertEqual(profile["expert_storage"], "gguf-extents-direct-io-no-buffered-fallback")
 
         model_source = (root / "src/models/deepseek41.cpp").read_text(encoding="utf-8")
+        dsv41_header = (root / "src/llama-dsv41.h").read_text(encoding="utf-8")
+        schema_source = (root / "tests/test-deepseek41-schema.cpp").read_text(encoding="utf-8")
         engram_source = (root / "src/llama-engram.cpp").read_text(encoding="utf-8")
         engram_header = (root / "src/llama-engram.h").read_text(encoding="utf-8")
+        self.assertIn('"deepseek41.config"', schema_source)
+        self.assertIn('"deepseek41.engram.encoding"', schema_source)
+        self.assertIn('"deepseek41.engram.rows"', schema_source)
+        self.assertIn('"deepseek41.engram.compressed_vocab_size"', schema_source)
+        self.assertIn("std::vector<uint32_t> engram_primes;", dsv41_header)
+        self.assertIn('tn(LLM_TENSOR_ENGRAM_Q_NORM, "weight", il)', model_source)
+        self.assertIn('tn(LLM_TENSOR_ENGRAM_K_NORM, "weight", il)', model_source)
+        self.assertIn('tn(LLM_TENSOR_ENGRAM_KV, "weight", il)', model_source)
         self.assertIn("LLM_TENSOR_ENGRAM_EMBD", model_source)
         self.assertIn("TENSOR_SKIP", model_source)
         self.assertIn("expert_params.direct_io = true;", model_source)

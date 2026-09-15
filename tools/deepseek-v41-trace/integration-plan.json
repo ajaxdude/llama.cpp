@@ -20,6 +20,100 @@
     "stable_patch_id": "8740292077a119d1991ca1d222d5e025bb5d61e7",
     "tree": "4618dc0283cc537b9f1cf18e931615a45959fed9"
   },
+  "schema_alignment": {
+    "blockers": [
+      {
+        "converter_keys": [
+          "deepseek41.context_length",
+          "deepseek41.embedding_length",
+          "deepseek41.block_count",
+          "deepseek41.attention.head_count"
+        ],
+        "effect": "runtime fails at the first required key, deepseek41.config",
+        "id": "runtime-metadata-namespace",
+        "runtime_keys": [
+          "deepseek41.config",
+          "deepseek41.max_position_embeddings",
+          "deepseek41.hidden_size",
+          "deepseek41.num_hidden_layers",
+          "deepseek41.num_attention_heads"
+        ]
+      },
+      {
+        "converter_missing": [
+          "deepseek41.engram.encoding",
+          "deepseek41.engram.rows",
+          "deepseek41.engram.compressed_vocab_size"
+        ],
+        "effect": "runtime rejects the Engram layout before tensor allocation",
+        "id": "missing-engram-runtime-metadata"
+      },
+      {
+        "converter_element_type": "uint64",
+        "effect": "runtime reports a wrong array element type",
+        "id": "engram-primes-element-type",
+        "key": "deepseek41.engram.primes",
+        "runtime_element_type": "uint32"
+      },
+      {
+        "converter_to_runtime": {
+          "blk.{bid}.engram_k.weight": "blk.{bid}.engram_k_norm.weight",
+          "blk.{bid}.engram_q.weight": "blk.{bid}.engram_q_norm.weight",
+          "blk.{bid}.engram_wkv.weight": "blk.{bid}.engram_kv.weight"
+        },
+        "effect": "runtime cannot resolve three required Engram tensors",
+        "id": "engram-tensor-names"
+      }
+    ],
+    "compatible_contract": {
+      "metadata_keys": [
+        "deepseek41.engram.layer_ids",
+        "deepseek41.engram.pad_id",
+        "deepseek41.engram.token_map",
+        "deepseek41.engram.multipliers"
+      ],
+      "tensor_names": [
+        "blk.{bid}.engram_embd.weight"
+      ]
+    },
+    "converter_revision": "b12818a24407175d941e9299e7b5fb7874a654d9",
+    "evidence_sha256": {
+      "converter_constants": "3ebc6b6729f181e6d0862de96fc9eb911b3ff6cd89690b019d0555cd8f731313",
+      "converter_deepseek": "5bd8005b7037efdb102b167c666d35c070e008d198066077af8778bedddf510f",
+      "runtime_constants": "444b2878e1d039fa9302181602b579cd353d273667150b782fcdaea523369637",
+      "runtime_deepseek41": "e0e1e08b5a3870fc7bc97c09f4cf47785cfcdb936c080ee8078ddc2e98710228",
+      "runtime_dsv41_header": "5bb4b50ea7f512c3a11e0417dd9a9ddd2eeb91e443065c0180b6c8e77ba97cc2",
+      "runtime_model_loader": "31dc29864751c94080f470c6ca755457414441094ab221352bad00f1df83a808"
+    },
+    "release_gate": "requires-compatible-converter-or-runtime-adapter",
+    "runtime_revision": "013bfa15b80f7dbc7760c4dd7202efbbcf74a952",
+    "status": "blocked"
+  },
+  "validation_acceptance": {
+    "model_backed": "not-started",
+    "model_free": {
+      "focused_ctests": {
+        "passed": 10,
+        "total": 10
+      },
+      "trace_python": {
+        "passed": 179,
+        "skipped": 6
+      },
+      "watchdog_python": {
+        "passed": 38,
+        "skipped": 8
+      }
+    },
+    "native_current_head": {
+      "admission": "pass",
+      "attempt": "A07",
+      "launcher": "not-started",
+      "reason": "terminal stop after root/input creation; cause not established",
+      "status": "incomplete"
+    },
+    "status": "model-free-pass-native-incomplete"
+  },
   "exporter_dependency": {
     "branch": "deepseek-v41-exporter-v2",
     "contract_revision": "ba24c1f0291554177d41d685de11a091b9fdfb40",
@@ -62,5 +156,5 @@
     "watchdog_emergency_gib": 118,
     "watchdog_soft_gib": 116
   },
-  "version": 1
+  "version": 2
 }

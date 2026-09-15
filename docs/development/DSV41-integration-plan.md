@@ -11,6 +11,19 @@ The machine-readable release input is `tools/deepseek-v41-trace/integration-plan
 
 The conversion PR reports estimated complete outputs of 246.3 GiB for Q2_K and 323.4 GiB for Q3_K_M. Neither fits a 128 GiB unified-memory machine as a fully resident model. End-to-end usability combines the converter half with the runtime half. Runtime viability therefore depends on the separate lossless file-backed Engram and routed-expert paths, not on a smaller conversion estimate.
 
+## Schema alignment status
+
+The exact pinned converter and runtime are not yet compatible. This is a release blocker, independent of native execution:
+
+| Surface | Converter `b12818a` | Runtime `013bfa15` | Result |
+|---|---|---|---|
+| Core metadata | Standard GGUF names such as `deepseek41.context_length` and `deepseek41.embedding_length` | Requires custom names beginning with `deepseek41.config`, `deepseek41.max_position_embeddings`, and `deepseek41.hidden_size` | Runtime fails at the first required key |
+| Engram layout | Does not write `engram.encoding`, `engram.rows`, or `engram.compressed_vocab_size` | Requires all three before allocation | Runtime rejects the layout |
+| Engram primes | Writes a `UINT64` array | Reads a `uint32_t` array and rejects other element types | Type mismatch |
+| Engram tensors | Writes `engram_q`, `engram_k`, and `engram_wkv` | Requires `engram_q_norm`, `engram_k_norm`, and `engram_kv` | Three tensors cannot be resolved |
+
+The exact matches are `engram.layer_ids`, `engram.pad_id`, `engram.token_map`, `engram.multipliers`, and `engram_embd.weight`. These partial matches are insufficient. Final integration requires either a converter update that emits the runtime contract or a reviewed runtime compatibility adapter. Native validation cannot override this schema gate.
+
 ## NVMe runtime profile
 
 The published GGUF is the backing store for both offload paths:
@@ -34,10 +47,11 @@ Run it only inside the repository watchdog with 116 GiB soft and 118 GiB emergen
 
 1. Verify the conversion dependency and tensor metadata without using its runtime.
 2. Build exporter-v2 twice from the pinned ds4 source and require identical package evidence.
-3. Require the PR59 current-head native model-free packet to pass all three selectors, trace host/install CTests, and its zero-skip marker.
-4. Merge PR59 normally. Do not rebase or rewrite its preserved input.
-5. Rebuild the combined integration head and rerun the focused admission, schema, Engram, expert, memory, runtime, no-allocation, trace, trace-host, and trace-install tests.
-6. Relock exporter-v2 to the immutable integrated head and rerun its exact contract suite.
-7. Only after an explicit host release, run the unchanged published GGUF under the watchdog and preserve all commands, hashes, logs, and cleanup evidence.
+3. Resolve the converter/runtime schema blockers listed above and add an exact generated-GGUF schema fixture.
+4. Require the PR59 current-head native model-free packet to pass all three selectors, trace host/install CTests, and its zero-skip marker.
+5. Merge PR59 normally. Do not rebase or rewrite its preserved input.
+6. Rebuild the combined integration head and rerun the focused admission, schema, Engram, expert, memory, runtime, no-allocation, trace, trace-host, and trace-install tests.
+7. Relock exporter-v2 to the immutable integrated head and rerun its exact contract suite.
+8. Only after an explicit host release, run the unchanged published GGUF under the watchdog and preserve all commands, hashes, logs, and cleanup evidence.
 
-Until gate 3 passes, model-backed status is `INCOMPLETE`. No performance claim is authorized by model-free validation.
+Current acceptance is `MODEL_FREE_PASS_NATIVE_INCOMPLETE`: local trace, watchdog, and focused CTests pass, but A07 stopped during privileged preparation before the launcher. Until the schema gate and native closure both pass, model-backed status is `INCOMPLETE`. No performance claim is authorized by model-free validation.
