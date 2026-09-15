@@ -1067,42 +1067,45 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
         });
 
-        std::thread stopping_thread([&]() {
-            // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
-            auto is_stopping = [this, &name]() {
-                return this->stopping_models.find(name) != this->stopping_models.end();
-            };
-            {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                this->cv_stop.wait(lk, [&]() {
-                    return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-            // child crashed or finished on its own, skip graceful shutdown sequence
-            if (child_proc->stopped.load(std::memory_order_acquire)) {
-                return;
-            }
-            SRV_INF("stopping model instance name=%s\n", name.c_str());
-            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-            fflush(stdin_file);
-            int64_t start_time = ggml_time_ms();
-            while (true) {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
+        std::thread stopping_thread;
+        if (child_mode != SERVER_CHILD_MODE_DOWNLOAD) {
+            stopping_thread = std::thread([&]() {
+                // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
+                auto is_stopping = [this, &name]() {
+                    return this->stopping_models.find(name) != this->stopping_models.end();
+                };
+                {
+                    std::unique_lock<std::mutex> lk(this->mutex);
+                    this->cv_stop.wait(lk, [&]() {
+                        return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
+                    });
+                }
+                // child crashed or finished on its own, skip graceful shutdown sequence
+                if (child_proc->stopped.load(std::memory_order_acquire)) {
                     return;
                 }
-                int64_t elapsed = ggml_time_ms() - start_time;
-                if (elapsed >= stop_timeout * 1000) {
-                    lk.unlock();
-                    SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
-                    child_proc->terminate();
-                    return;
+                SRV_INF("stopping model instance name=%s\n", name.c_str());
+                fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
+                fflush(stdin_file);
+                int64_t start_time = ggml_time_ms();
+                while (true) {
+                    std::unique_lock<std::mutex> lk(this->mutex);
+                    if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    int64_t elapsed = ggml_time_ms() - start_time;
+                    if (elapsed >= stop_timeout * 1000) {
+                        lk.unlock();
+                        SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
+                        child_proc->terminate();
+                        return;
+                    }
+                    this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
+                        return !is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
+                    });
                 }
-                this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
-                    return !is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-        });
+            });
+        }
 
         // we reach here when the child process exits (stdout EOF)
         // note: we cannot join() prior to this point because it will close stdin_file
