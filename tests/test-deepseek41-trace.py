@@ -1503,6 +1503,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "exporter_dependency",
             "format",
             "published_model",
+            "reference_support",
             "runtime_successor",
             "runtime_profile",
             "schema_alignment",
@@ -1510,7 +1511,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "version",
         })
         self.assertEqual(plan["format"], "dsv41-integration-plan")
-        self.assertEqual(plan["version"], 2)
+        self.assertEqual(plan["version"], 3)
 
         correctness = plan["runtime_successor"]
         self.assertEqual(correctness["repository"], "halo-box/strix-llama.cpp")
@@ -1526,6 +1527,15 @@ class IntegrationPlanTests(unittest.TestCase):
         conversion = plan["conversion_schema_pin"]
         self.assertEqual(conversion, {
             "estimated_output_gib": {"Q2_K": 246.3, "Q3_K_M": 323.4},
+            "provenance_requirements": {
+                "bootstrap_gguf_requantization": "forbidden",
+                "engram_placement": "gguf-tail-disk-only",
+                "engram_scales": "preserve-native-fp8",
+                "engram_values": "preserve-native-fp8",
+                "source_input": "original-safetensors",
+                "source_model_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+                "status": "pending-generated-artifact",
+            },
             "pull_request": 28696,
             "repository": "ggml-org/llama.cpp",
             "revision": "b12818a24407175d941e9299e7b5fb7874a654d9",
@@ -1585,6 +1595,14 @@ class IntegrationPlanTests(unittest.TestCase):
             "reason": "terminal stop after root/input creation; cause not established",
             "status": "incomplete",
         })
+        self.assertEqual(validation["next_native_candidate"], {
+            "attempt": "A08",
+            "authorization": "not-authorized",
+            "boundary_addendum_sha256": "fbe7cede264c7926e50019238d63098d2b1030b741829cb5ed8e6d51df087496",
+            "contract_sha256": "166791a250b9fa7970b680a865a3317d4843edbd3c0b789a33df3091d448ba26",
+            "scope": "model-free-build-install-trace-containment-only",
+            "source_revision": correctness["revision"],
+        })
         self.assertEqual(validation["model_free"], {
             "focused_ctests": {"passed": 10, "total": 10},
             "trace_python": {"passed": 179, "skipped": 6},
@@ -1606,6 +1624,46 @@ class IntegrationPlanTests(unittest.TestCase):
         self.assertEqual(model["canonical_path"], "/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf")
         self.assertIs(model["preserve_unchanged"], True)
 
+        reference = plan["reference_support"]
+        self.assertEqual(reference["repository"], "antirez/ds4")
+        self.assertEqual(reference["revision"], "9139e2ae58a41503968a500f36f75895c1ba63fc")
+        self.assertEqual(reference["tree"], "f29629bbdfe659bb4e307902cf4a172d76e9256a")
+        self.assertEqual(reference["review_artifact"], {
+            "byte_count": 25603,
+            "sha256": "c3f0694874941d0397dcfcd2151b4a53e0ba1ada183048ffa209a1355a71a0d1",
+        })
+        self.assertEqual(reference["required_model_free_suite"], [
+            "python3 tests/test_deepseek41_conversion.py",
+            "python3 tests/test_deepseek41_manifest.py",
+            "make test-linux-memory",
+            "make test-engram",
+            "make test-deepseek41-gguf",
+            "make test-frontends",
+            "make test-session-state",
+        ])
+        support = reference["documented_backend_support"]
+        self.assertEqual(support["metal"], {
+            "introduced_revision": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+            "scope": "v4.1-text-and-vision",
+            "status": "supported",
+        })
+        self.assertEqual(support["cuda"], {
+            "introduced_revision": "a04f46fa423e45712c8c7e430eff422479f314a3",
+            "scope": "v4.1-q2-text-ssd",
+            "status": "supported",
+        })
+        for unsupported in ("rocm", "pipeline", "speculative_dspark"):
+            self.assertEqual(support[unsupported]["status"], "unsupported")
+
+        candidate = reference["candidate_constraints"]
+        self.assertEqual(candidate["backend"], "ROCm")
+        self.assertEqual(candidate["status"], "experimental-native-incomplete")
+        self.assertIs(candidate["release_eligible"], False)
+        self.assertEqual(candidate["performance_evidence"], "none")
+        for unsupported in ("pipeline_parallel", "speculative_decoding", "dspark"):
+            with self.subTest(unsupported=unsupported):
+                self.assertIs(candidate[unsupported], False)
+
         profile = plan["runtime_profile"]
         self.assertEqual(profile["required_storage"], "nvme")
         self.assertEqual(profile["required_architecture"], "gfx1151")
@@ -1618,6 +1676,20 @@ class IntegrationPlanTests(unittest.TestCase):
         ])
         self.assertEqual(profile["engram_storage"], "gguf-extents-uncached-aligned-reads")
         self.assertEqual(profile["expert_storage"], "gguf-extents-direct-io-no-buffered-fallback")
+        self.assertEqual(profile["resource_budgets"], {
+            "admission": "engram-staging-plus-expert-cache-plus-dense-state-workspace-and-safety-margin",
+            "engram": {
+                "documented_approximate_disk_gib": 189,
+                "full_table_residency": "forbidden",
+                "runtime": "disk-only-row-reads",
+                "staging": "separately-accounted",
+            },
+            "routed_expert_cache": {
+                "mib": 72900,
+                "runtime": "memory-resident-cache",
+                "slots": 192,
+            },
+        })
 
         model_source = (root / "src/models/deepseek41.cpp").read_text(encoding="utf-8")
         dsv41_header = (root / "src/llama-dsv41.h").read_text(encoding="utf-8")

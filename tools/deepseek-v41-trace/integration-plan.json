@@ -4,6 +4,15 @@
       "Q2_K": 246.3,
       "Q3_K_M": 323.4
     },
+    "provenance_requirements": {
+      "bootstrap_gguf_requantization": "forbidden",
+      "engram_placement": "gguf-tail-disk-only",
+      "engram_scales": "preserve-native-fp8",
+      "engram_values": "preserve-native-fp8",
+      "source_input": "original-safetensors",
+      "source_model_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+      "status": "pending-generated-artifact"
+    },
     "pull_request": 28696,
     "repository": "ggml-org/llama.cpp",
     "revision": "b12818a24407175d941e9299e7b5fb7874a654d9",
@@ -112,6 +121,14 @@
       "reason": "terminal stop after root/input creation; cause not established",
       "status": "incomplete"
     },
+    "next_native_candidate": {
+      "attempt": "A08",
+      "authorization": "not-authorized",
+      "boundary_addendum_sha256": "fbe7cede264c7926e50019238d63098d2b1030b741829cb5ed8e6d51df087496",
+      "contract_sha256": "166791a250b9fa7970b680a865a3317d4843edbd3c0b789a33df3091d448ba26",
+      "scope": "model-free-build-install-trace-containment-only",
+      "source_revision": "013bfa15b80f7dbc7760c4dd7202efbbcf74a952"
+    },
     "status": "model-free-pass-native-incomplete"
   },
   "exporter_dependency": {
@@ -128,6 +145,54 @@
     "canonical_path": "/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf",
     "preserve_unchanged": true,
     "sha256": "1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42"
+  },
+  "reference_support": {
+    "candidate_constraints": {
+      "backend": "ROCm",
+      "dspark": false,
+      "performance_evidence": "none",
+      "pipeline_parallel": false,
+      "release_eligible": false,
+      "speculative_decoding": false,
+      "status": "experimental-native-incomplete"
+    },
+    "documented_backend_support": {
+      "cuda": {
+        "introduced_revision": "a04f46fa423e45712c8c7e430eff422479f314a3",
+        "scope": "v4.1-q2-text-ssd",
+        "status": "supported"
+      },
+      "metal": {
+        "introduced_revision": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+        "scope": "v4.1-text-and-vision",
+        "status": "supported"
+      },
+      "pipeline": {
+        "status": "unsupported"
+      },
+      "rocm": {
+        "status": "unsupported"
+      },
+      "speculative_dspark": {
+        "status": "unsupported"
+      }
+    },
+    "required_model_free_suite": [
+      "python3 tests/test_deepseek41_conversion.py",
+      "python3 tests/test_deepseek41_manifest.py",
+      "make test-linux-memory",
+      "make test-engram",
+      "make test-deepseek41-gguf",
+      "make test-frontends",
+      "make test-session-state"
+    ],
+    "review_artifact": {
+      "byte_count": 25603,
+      "sha256": "c3f0694874941d0397dcfcd2151b4a53e0ba1ada183048ffa209a1355a71a0d1"
+    },
+    "revision": "9139e2ae58a41503968a500f36f75895c1ba63fc",
+    "repository": "antirez/ds4",
+    "tree": "f29629bbdfe659bb4e307902cf4a172d76e9256a"
   },
   "runtime_profile": {
     "arguments": [
@@ -150,11 +215,25 @@
     ],
     "engram_storage": "gguf-extents-uncached-aligned-reads",
     "expert_storage": "gguf-extents-direct-io-no-buffered-fallback",
+    "resource_budgets": {
+      "admission": "engram-staging-plus-expert-cache-plus-dense-state-workspace-and-safety-margin",
+      "engram": {
+        "documented_approximate_disk_gib": 189,
+        "full_table_residency": "forbidden",
+        "runtime": "disk-only-row-reads",
+        "staging": "separately-accounted"
+      },
+      "routed_expert_cache": {
+        "mib": 72900,
+        "runtime": "memory-resident-cache",
+        "slots": 192
+      }
+    },
     "required_architecture": "gfx1151",
     "required_storage": "nvme",
     "swap_policy": "zero-configured-swap-or-kernel-enforced-cgroup-v2-no-swap",
     "watchdog_emergency_gib": 118,
     "watchdog_soft_gib": 116
   },
-  "version": 2
+  "version": 3
 }
