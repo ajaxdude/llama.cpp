@@ -129,7 +129,7 @@
       "scope": "model-free-build-install-trace-containment-only",
       "source_revision": "013bfa15b80f7dbc7760c4dd7202efbbcf74a952"
     },
-    "status": "model-free-pass-native-incomplete"
+    "status": "local-model-free-pass-reference-incomplete-native-incomplete"
   },
   "exporter_dependency": {
     "branch": "deepseek-v41-exporter-v2",
@@ -178,33 +178,38 @@
       }
     },
     "model_free_suite_evidence": {
+      "analysis_docs_sha256": "5465ab6ae0ebfe1b663e668e14117f176305c0d1cec4e6365c297f42fdbab21c",
+      "blocked": 1,
+      "blocked_commands": [
+        {
+          "classification": "blocked-by-required-model-metadata",
+          "command": "python3 tests/test_deepseek41_manifest.py",
+          "exit_code": 2,
+          "reason": "requires a real model configuration, index, shards, and valid safetensors payload extents"
+        }
+      ],
+      "complete_evidence_sha256": "4c18dfec321a159e9c2b42bb4c04981dbd44a047aa73f2f0445217adfbd52bc5",
       "executed": 8,
-      "failed": 2,
+      "failed": 1,
       "failures": [
         {
           "classification": "darwin-target-mismatch",
           "command": "make -C gguf-tools libds4quants.so",
           "exit_code": 2,
-          "portable_command": "make -C gguf-tools quants-shared",
-          "portable_status": "pass"
-        },
-        {
-          "classification": "missing-required-hf-dir",
-          "command": "python3 tests/test_deepseek41_manifest.py",
-          "exit_code": 2,
-          "model_free_replacement": "pending"
+          "platform_equivalent_command": "make -C gguf-tools libds4quants.dylib",
+          "platform_equivalent_status": "pass"
         }
       ],
-      "logs_manifest_sha256": "74d353e6f36f4d67ae113db74a0b87aeea10ef5864964c73b93b935b2f57aaeb",
+      "logs_manifest_sha256": "6f75cc8ca6921cba19b99b92c6321eafb12cb40fecf468b01b2118869bbf7a92",
       "model_backed": false,
       "passed": 6,
       "platform": "Darwin",
       "revision": "9139e2ae58a41503968a500f36f75895c1ba63fc",
-      "status": "incomplete",
+      "status": "incomplete-model-metadata-blocked",
       "strix_access": false,
       "unavailable": 0
     },
-    "required_model_free_suite": [
+    "requested_reference_suite": [
       "python3 tests/test_deepseek41_conversion.py",
       "python3 tests/test_deepseek41_manifest.py",
       "make test-linux-memory",

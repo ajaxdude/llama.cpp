@@ -1586,7 +1586,7 @@ class IntegrationPlanTests(unittest.TestCase):
             int(digest, 16)
 
         validation = plan["validation_acceptance"]
-        self.assertEqual(validation["status"], "model-free-pass-native-incomplete")
+        self.assertEqual(validation["status"], "local-model-free-pass-reference-incomplete-native-incomplete")
         self.assertEqual(validation["model_backed"], "not-started")
         self.assertEqual(validation["native_current_head"], {
             "admission": "pass",
@@ -1632,7 +1632,7 @@ class IntegrationPlanTests(unittest.TestCase):
             "byte_count": 25603,
             "sha256": "c3f0694874941d0397dcfcd2151b4a53e0ba1ada183048ffa209a1355a71a0d1",
         })
-        self.assertEqual(reference["required_model_free_suite"], [
+        self.assertEqual(reference["requested_reference_suite"], [
             "python3 tests/test_deepseek41_conversion.py",
             "python3 tests/test_deepseek41_manifest.py",
             "make test-linux-memory",
@@ -1642,29 +1642,34 @@ class IntegrationPlanTests(unittest.TestCase):
             "make test-session-state",
         ])
         self.assertEqual(reference["model_free_suite_evidence"], {
+            "analysis_docs_sha256": "5465ab6ae0ebfe1b663e668e14117f176305c0d1cec4e6365c297f42fdbab21c",
+            "blocked": 1,
+            "blocked_commands": [
+                {
+                    "classification": "blocked-by-required-model-metadata",
+                    "command": "python3 tests/test_deepseek41_manifest.py",
+                    "exit_code": 2,
+                    "reason": "requires a real model configuration, index, shards, and valid safetensors payload extents",
+                },
+            ],
+            "complete_evidence_sha256": "4c18dfec321a159e9c2b42bb4c04981dbd44a047aa73f2f0445217adfbd52bc5",
             "executed": 8,
-            "failed": 2,
+            "failed": 1,
             "failures": [
                 {
                     "classification": "darwin-target-mismatch",
                     "command": "make -C gguf-tools libds4quants.so",
                     "exit_code": 2,
-                    "portable_command": "make -C gguf-tools quants-shared",
-                    "portable_status": "pass",
-                },
-                {
-                    "classification": "missing-required-hf-dir",
-                    "command": "python3 tests/test_deepseek41_manifest.py",
-                    "exit_code": 2,
-                    "model_free_replacement": "pending",
+                    "platform_equivalent_command": "make -C gguf-tools libds4quants.dylib",
+                    "platform_equivalent_status": "pass",
                 },
             ],
-            "logs_manifest_sha256": "74d353e6f36f4d67ae113db74a0b87aeea10ef5864964c73b93b935b2f57aaeb",
+            "logs_manifest_sha256": "6f75cc8ca6921cba19b99b92c6321eafb12cb40fecf468b01b2118869bbf7a92",
             "model_backed": False,
             "passed": 6,
             "platform": "Darwin",
             "revision": reference["revision"],
-            "status": "incomplete",
+            "status": "incomplete-model-metadata-blocked",
             "strix_access": False,
             "unavailable": 0,
         })
