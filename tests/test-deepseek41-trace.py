@@ -1597,9 +1597,14 @@ class IntegrationPlanTests(unittest.TestCase):
         })
         self.assertEqual(validation["next_native_candidate"], {
             "attempt": "A08",
+            "authentication": "human-sudo-v-after-explicit-release",
             "authorization": "not-authorized",
             "boundary_addendum_sha256": "fbe7cede264c7926e50019238d63098d2b1030b741829cb5ed8e6d51df087496",
             "contract_sha256": "166791a250b9fa7970b680a865a3317d4843edbd3c0b789a33df3091d448ba26",
+            "rootless_feasibility": {
+                "report_sha256": "98a941861d93ce7ccafc76824c609d495fa7cb032c74b1b13006e8a9f711bb31",
+                "status": "rejected-by-existing-trust-contract",
+            },
             "scope": "model-free-build-install-trace-containment-only",
             "source_revision": correctness["revision"],
         })
