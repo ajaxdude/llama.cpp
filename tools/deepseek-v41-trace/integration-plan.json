@@ -11,14 +11,14 @@
     "scope": "conversion-only"
   },
   "runtime_successor": {
-    "diff_sha256": "f37f7a98fa1088ebcc923f32797d58b0bc23295bc582257a043bf6c7712896e0",
+    "diff_sha256": "a80745be57642ce52bac30ae735125aadcd92c80cc435ebf166d529d927931aa",
     "native_validation": "pending-current-head",
-    "parent": "1df161dce6650300cda386524f7853d192a061e8",
+    "parent": "10824396c1ba3f90f64e400dddd8436b7e3a0394",
     "pull_request": 59,
     "repository": "halo-box/strix-llama.cpp",
-    "revision": "10824396c1ba3f90f64e400dddd8436b7e3a0394",
-    "stable_patch_id": "25b7e7154e1e5ad11dbed8c0a4e49137284809c5",
-    "tree": "51d8bf952459efdcf8a2008c2cb1a8a83624374d"
+    "revision": "013bfa15b80f7dbc7760c4dd7202efbbcf74a952",
+    "stable_patch_id": "8740292077a119d1991ca1d222d5e025bb5d61e7",
+    "tree": "4618dc0283cc537b9f1cf18e931615a45959fed9"
   },
   "exporter_dependency": {
     "branch": "deepseek-v41-exporter-v2",

@@ -5,7 +5,7 @@ The machine-readable release input is `tools/deepseek-v41-trace/integration-plan
 ## Dependency boundaries
 
 - `ggml-org/llama.cpp#28696` at `b12818a24407175d941e9299e7b5fb7874a654d9` is the conversion and GGUF schema half. It does not provide runtime execution and is not a merge dependency of PR59.
-- `halo-box/strix-llama.cpp#59` at `10824396c1ba3f90f64e400dddd8436b7e3a0394` is the complementary runtime correctness half. Its successor commit remains external to this branch until the current head passes the sealed native model-free closure.
+- `halo-box/strix-llama.cpp#59` at `013bfa15b80f7dbc7760c4dd7202efbbcf74a952` is the complementary runtime correctness half. Its successor commit remains external to this branch until the current head passes the sealed native model-free closure.
 - The ds4 exporter-v2 package is pinned at `650c4c937b06b90b7a06dec5d6bbe4fd1ba82d55` on branch `deepseek-v41-exporter-v2`. Its contract lock still targets the current integration head and must be regenerated after the final PR59 merge.
 - The published GGUF remains `/mnt/models/DeepSeek-V4.1-Flash-Q2.gguf`, 365713686528 bytes, SHA-256 `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`. Conversion experiments must use a separate output and must not replace or modify this file.
 
